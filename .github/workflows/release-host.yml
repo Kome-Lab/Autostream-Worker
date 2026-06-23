@@ -1,0 +1,91 @@
+﻿name: Host Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v1.2.3"
+        required: true
+        type: string
+      push_release:
+        description: "Attach artifacts to a GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release-host:
+    name: Build Linux host artifacts
+    runs-on: ubuntu-latest
+    env:
+      SERVICE_NAME: worker
+      ARTIFACT_PREFIX: autostream-worker
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+            push_release="true"
+          else
+            version="${{ inputs.version }}"
+            push_release="${{ inputs.push_release }}"
+          fi
+          if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version must look like v1.2.3; got ${version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "push_release=${push_release}" >> "${GITHUB_OUTPUT}"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Package linux artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          rm -rf staging artifacts
+          mkdir -p staging artifacts
+          for arch in amd64 arm64; do
+            artifact="${ARTIFACT_PREFIX}_${version}_linux_${arch}"
+            root="staging/${artifact}"
+            mkdir -p "${root}/bin" "${root}/systemd"
+            GOOS=linux GOARCH="${arch}" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${root}/bin/${SERVICE_NAME}" ./cmd/worker
+            cp .env.example "${root}/.env.example"
+            cp systemd/*.service.example "${root}/systemd/"
+            cp release/README.install.md "${root}/README.install.md"
+            (cd "${root}" && find . -type f -print0 | sort -z | xargs -0 sha256sum > checksums.txt)
+            tar -C staging -czf "artifacts/${artifact}.tar.gz" "${artifact}"
+            sha256sum "artifacts/${artifact}.tar.gz" > "artifacts/${artifact}.tar.gz.sha256"
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: host-release-dry-run
+          path: artifacts/*
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.push_release == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.version }}
+          files: artifacts/*
+
+

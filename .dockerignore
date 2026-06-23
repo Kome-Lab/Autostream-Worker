@@ -1,0 +1,7 @@
+.git
+bin
+coverage.out
+node_modules
+dist
+.env
+*.log

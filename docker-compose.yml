@@ -1,0 +1,19 @@
+services:
+  worker:
+    build: .
+    env_file: .env.example
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mariadb
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_DATABASE: autostream_worker
+      MARIADB_USER: autostream
+      MARIADB_PASSWORD: example_password_change_me
+      MARIADB_ROOT_PASSWORD: example_root_password_change_me
+    volumes:
+      - mariadb:/var/lib/mysql
+volumes:
+  mariadb:
