@@ -3,7 +3,7 @@
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]*"
   workflow_dispatch:
     inputs:
       version:
@@ -45,6 +45,10 @@ jobs:
           else
             version="${{ inputs.version }}"
             push_release="${{ inputs.push_release }}"
+          fi
+          if [[ "${version}" =~ ^v\. ]]; then
+            echo "Version must look like v1.2.3, not ${version}. Remove the dot after v." >&2
+            exit 1
           fi
           if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Version must look like v1.2.3; got ${version}" >&2
