@@ -1,14 +1,9 @@
 services:
   worker:
     environment:
-      SERVICE_ID: worker-local-01
-      SERVICE_NAME: Worker Local
-      SERVICE_PUBLIC_URL: http://host.docker.internal:8084
+      AUTOSTREAM_NODE_CONFIG: /etc/autostream-node/config.yml
       SERVICE_VERSION: 0.1.0-local
-      CONTROL_PANEL_URL: http://host.docker.internal:8080
-      CONTROL_PANEL_TOKEN: ${AUTOSTREAM_LOCAL_WORKER_TOKEN:?AUTOSTREAM_LOCAL_WORKER_TOKEN is required}
       CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC: 5
-      SERVICE_CONTROL_TOKEN_SHA256: 133dd58081fce1840b7eabfb72582af6a8413e8b9dab2845ee7e0ce4f86f3a38
       ENCODER_RECORDER_URL: http://host.docker.internal:8081
       ENCODER_RECORDER_TOKEN: dev-only-worker-events-token
       OBSERVABILITY_URL: http://host.docker.internal:8082
@@ -17,3 +12,5 @@ services:
       TZ: Asia/Tokyo
     ports: !override
       - "8084:8080"
+    volumes: !override
+      - ./config/autostream-node.yml:/etc/autostream-node/config.yml:ro

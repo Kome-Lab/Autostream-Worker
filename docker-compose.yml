@@ -2,18 +2,9 @@ services:
   worker:
     build: .
     env_file: .env.example
+    environment:
+      AUTOSTREAM_NODE_CONFIG: /etc/autostream-node/config.yml
     ports:
       - "8080:8080"
-    depends_on:
-      - mariadb
-  mariadb:
-    image: mariadb:11
-    environment:
-      MARIADB_DATABASE: autostream_worker
-      MARIADB_USER: autostream
-      MARIADB_PASSWORD: example_password_change_me
-      MARIADB_ROOT_PASSWORD: example_root_password_change_me
     volumes:
-      - mariadb:/var/lib/mysql
-volumes:
-  mariadb:
+      - ./config/autostream-node.yml:/etc/autostream-node/config.yml:ro
