@@ -10,7 +10,6 @@ import (
 	"github.com/example/autostream-worker/internal/control"
 	"github.com/example/autostream-worker/internal/encoder"
 	"github.com/example/autostream-worker/internal/events"
-	"github.com/example/autostream-worker/internal/observability"
 )
 
 type StreamContext struct {
@@ -44,7 +43,7 @@ type Status struct {
 
 type Manager struct {
 	publisher    encoder.Publisher
-	reporter     observability.Client
+	reporter     Reporter
 	mu           sync.Mutex
 	current      StreamContext
 	defaults     ProfileDefaults
@@ -56,7 +55,12 @@ type Manager struct {
 	maxEvents    int
 }
 
-func NewManager(publisher encoder.Publisher, reporter observability.Client) *Manager {
+type Reporter interface {
+	Event(ctx context.Context, streamID, name, status string, attributes map[string]any) error
+	Metric(ctx context.Context, streamID, name, status string, value float64, attributes map[string]any) error
+}
+
+func NewManager(publisher encoder.Publisher, reporter Reporter) *Manager {
 	if publisher == nil {
 		publisher = encoder.NoopPublisher{}
 	}
@@ -344,14 +348,14 @@ func (m *Manager) streamAssignedLocked(streamID string) bool {
 }
 
 func (m *Manager) report(ctx context.Context, streamID, name, status string, attrs map[string]any) {
-	if !m.reporter.Enabled() {
+	if m.reporter == nil {
 		return
 	}
 	_ = m.reporter.Event(ctx, streamID, name, status, attrs)
 }
 
 func (m *Manager) metric(ctx context.Context, streamID, name, status string, value float64, attrs map[string]any) {
-	if !m.reporter.Enabled() {
+	if m.reporter == nil {
 		return
 	}
 	_ = m.reporter.Metric(ctx, streamID, name, status, value, attrs)

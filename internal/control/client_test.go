@@ -58,6 +58,33 @@ func TestHeartbeatPostsStatus(t *testing.T) {
 	}
 }
 
+func TestReportSignalPostsViaControlPanel(t *testing.T) {
+	var gotAuth string
+	var got Signal
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services/observability/signals" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "node-token", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: server.URL}}
+	if err := client.Metric(t.Context(), "stream-01", "worker.event_send_failures_total", "warning", 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer node-token" {
+		t.Fatalf("unexpected auth header: %q", gotAuth)
+	}
+	if got.Type != "metric" || got.Name != "worker.event_send_failures_total" || got.Value == nil || *got.Value != 1 {
+		t.Fatalf("unexpected signal: %#v", got)
+	}
+}
+
 func TestRuntimeConfigFetchesScopedServiceConfig(t *testing.T) {
 	var gotAuth string
 	var gotQuery string

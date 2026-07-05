@@ -47,6 +47,16 @@ type Heartbeat struct {
 	Metrics         map[string]float64 `json:"metrics,omitempty"`
 }
 
+type Signal struct {
+	Type       string         `json:"type"`
+	Name       string         `json:"name"`
+	StreamID   string         `json:"stream_id,omitempty"`
+	Status     string         `json:"status,omitempty"`
+	Value      *float64       `json:"value,omitempty"`
+	Attributes map[string]any `json:"attributes,omitempty"`
+	Timestamp  time.Time      `json:"timestamp"`
+}
+
 type RuntimeConfig struct {
 	Service     RegisteredService           `json:"service"`
 	Assignments []StreamServiceAssignment   `json:"assignments"`
@@ -175,6 +185,24 @@ func (c Client) HeartbeatWithMetrics(ctx context.Context, status, currentStreamI
 		status = "online"
 	}
 	return c.post(ctx, "/services/heartbeat", Heartbeat{ServiceID: c.Config.ServiceID, Status: status, CurrentStreamID: currentStreamID, Metrics: metrics})
+}
+
+func (c Client) Event(ctx context.Context, streamID, name, status string, attributes map[string]any) error {
+	return c.ReportSignal(ctx, Signal{Type: "event", Name: name, StreamID: streamID, Status: status, Attributes: attributes})
+}
+
+func (c Client) Metric(ctx context.Context, streamID, name, status string, value float64, attributes map[string]any) error {
+	return c.ReportSignal(ctx, Signal{Type: "metric", Name: name, StreamID: streamID, Status: status, Value: &value, Attributes: attributes})
+}
+
+func (c Client) ReportSignal(ctx context.Context, signal Signal) error {
+	if strings.TrimSpace(signal.Type) == "" || strings.TrimSpace(signal.Name) == "" {
+		return errors.New("signal type and name are required")
+	}
+	if signal.Timestamp.IsZero() {
+		signal.Timestamp = time.Now().UTC()
+	}
+	return c.post(ctx, "/services/observability/signals", signal)
 }
 
 func (c Client) RuntimeConfig(ctx context.Context) (RuntimeConfig, error) {

@@ -27,10 +27,9 @@ func main() {
 		addr = "127.0.0.1:8080"
 	}
 	publisher := buildPublisher()
-	reporter := observability.NewClientFromEnv()
-	manager := jobs.NewManager(publisher, reporter)
 
 	controlClient := control.Client{Config: control.ConfigFromEnv()}
+	manager := jobs.NewManager(publisher, buildReporter(controlClient))
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
 		if err := controlClient.Register(ctx); err != nil {
 			if requireControlPanelRuntimeConfig() {
@@ -130,4 +129,15 @@ func buildPublisher() encoder.Publisher {
 		log.Printf("static encoder route is incomplete; job-scoped encoder URL and signed ingest token will be preferred")
 	}
 	return encoder.Client{Config: cfg}
+}
+
+func buildReporter(controlClient control.Client) jobs.Reporter {
+	obs := observability.NewClientFromEnv()
+	if obs.Enabled() {
+		return obs
+	}
+	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
+		return controlClient
+	}
+	return nil
 }
