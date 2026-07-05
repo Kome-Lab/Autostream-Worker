@@ -59,6 +59,10 @@ func loadNodeAgentConfig(path string) (nodeAgentConfig, error) {
 	if err != nil {
 		return nodeAgentConfig{}, err
 	}
+	return parseNodeAgentConfig(body)
+}
+
+func parseNodeAgentConfig(body []byte) (nodeAgentConfig, error) {
 	var cfg nodeAgentConfig
 	section := ""
 	scanner := bufio.NewScanner(strings.NewReader(string(body)))
