@@ -71,7 +71,8 @@ jobs:
             artifact="${ARTIFACT_PREFIX}_${version}_linux_${arch}"
             root="staging/${artifact}"
             mkdir -p "${root}/bin" "${root}/systemd"
-            GOOS=linux GOARCH="${arch}" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${root}/bin/${SERVICE_NAME}" ./cmd/worker
+            GOOS=linux GOARCH="${arch}" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${root}/bin/${ARTIFACT_PREFIX}" ./cmd/worker
+            cp "${root}/bin/${ARTIFACT_PREFIX}" "${root}/bin/${SERVICE_NAME}"
             cp .env.example "${root}/.env.example"
             cp systemd/*.service.example "${root}/systemd/"
             cp release/README.install.md "${root}/README.install.md"
