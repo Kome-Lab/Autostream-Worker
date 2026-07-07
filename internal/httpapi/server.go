@@ -59,6 +59,9 @@ func (v TokenVerifier) Verify(header string) bool {
 	if v.PlainToken != "" {
 		return subtle.ConstantTimeCompare([]byte(token), []byte(v.PlainToken)) == 1
 	}
+	if runtimeToken := control.NodeRuntimeTokenFromEnv(); runtimeToken != "" {
+		return subtle.ConstantTimeCompare([]byte(token), []byte(runtimeToken)) == 1
+	}
 	if !allowControlPanelTokenFallback() {
 		return false
 	}

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -202,6 +204,20 @@ func TestTokenVerifierFromEnvAllowsControlPanelTokenFallbackOutsideProduction(t 
 	}
 }
 
+func TestTokenVerifierReadsNodeRuntimeTokenAfterStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
+	t.Setenv("CONTROL_PANEL_TOKEN", "")
+	verifier := TokenVerifierFromEnv()
+	if verifier.Verify("Bearer runtime-secret") {
+		t.Fatal("runtime token should not verify before config exists")
+	}
+	writeNodeConfigForVerifierTest(t, path, "worker")
+	if !verifier.Verify("Bearer runtime-secret") {
+		t.Fatal("runtime token should verify after config is written")
+	}
+}
+
 func TestErrorDoesNotEchoBearerToken(t *testing.T) {
 	server := httptest.NewServer(NewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "secret-token"}))
 	defer server.Close()
@@ -223,5 +239,26 @@ func TestErrorDoesNotEchoBearerToken(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "secret-token") {
 		t.Fatalf("token leaked in response: %s", buf.String())
+	}
+}
+
+func writeNodeConfigForVerifierTest(t *testing.T, path, nodeType string) {
+	t.Helper()
+	body := `panel:
+  url: "https://panel.example.jp"
+node:
+  id: "worker-01"
+  name: "Worker 01"
+  type: "` + nodeType + `"
+api:
+  host: "worker.example.jp"
+  port: 8443
+  ssl_enabled: true
+auth:
+  token_id: "token-id"
+  token: "runtime-secret"
+`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -22,12 +22,15 @@ type nodeAgentConfig struct {
 }
 
 func applyNodeConfigFromEnv(cfg *Config, expectedType string) {
-	path := strings.TrimSpace(os.Getenv("AUTOSTREAM_NODE_CONFIG"))
+	path := NodeConfigPathFromEnv()
 	if path == "" {
 		return
 	}
 	nodeCfg, err := loadNodeAgentConfig(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
 		cfg.ConfigError = fmt.Sprintf("AUTOSTREAM_NODE_CONFIG: %v", err)
 		return
 	}
@@ -42,8 +45,21 @@ func applyNodeConfigFromEnv(cfg *Config, expectedType string) {
 	cfg.ServicePublicURL = nodeAPIURL(nodeCfg.APIHost, nodeCfg.APIPort, nodeCfg.APISSLEnabled)
 }
 
+func NodeConfigPathFromEnv() string {
+	return strings.TrimSpace(os.Getenv("AUTOSTREAM_NODE_CONFIG"))
+}
+
+func NodeConfigPendingFromEnv() bool {
+	path := NodeConfigPathFromEnv()
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return os.IsNotExist(err)
+}
+
 func NodeRuntimeTokenFromEnv() string {
-	path := strings.TrimSpace(os.Getenv("AUTOSTREAM_NODE_CONFIG"))
+	path := NodeConfigPathFromEnv()
 	if path == "" {
 		return ""
 	}

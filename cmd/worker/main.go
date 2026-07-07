@@ -62,12 +62,18 @@ func main() {
 			log.Printf("control panel heartbeat failed: %v", err)
 		})
 	} else if requireControlPanelRuntimeConfig() {
-		log.Fatal("CONTROL_PANEL_URL and CONTROL_PANEL_TOKEN are required in this environment")
+		if control.NodeConfigPendingFromEnv() {
+			log.Printf("node config pending: waiting for %s", control.NodeConfigPathFromEnv())
+		} else if strings.TrimSpace(controlClient.Config.ConfigError) != "" {
+			log.Fatalf("node config invalid: %v", controlClient.Config.ConfigError)
+		} else {
+			log.Fatal("CONTROL_PANEL_URL and CONTROL_PANEL_TOKEN are required in this environment")
+		}
 	}
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.NewServerWithRuntimeConfig(control.ServiceType, manager, httpapi.TokenVerifierFromEnv(), controlClient.RuntimeConfig),
+		Handler:           httpapi.NewServerWithRuntimeConfig(control.ServiceType, manager, httpapi.TokenVerifierFromEnv(), controlRuntimeConfigFromEnv),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -98,6 +104,10 @@ func main() {
 			}
 		}
 	}
+}
+
+func controlRuntimeConfigFromEnv(ctx context.Context) (control.RuntimeConfig, error) {
+	return control.Client{Config: control.ConfigFromEnv()}.RuntimeConfig(ctx)
 }
 
 func logRuntimeConfig(ctx context.Context, client control.Client) (control.RuntimeConfig, bool) {
