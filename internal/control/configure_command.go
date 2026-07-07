@@ -10,13 +10,19 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const maxConfigureResponseBytes = 1 << 20
+const nodeConfigDirMode = 0o750
+const nodeConfigFileMode = 0o640
+const nodeConfigSecureDir = "/etc/autostream-worker"
+const nodeConfigServiceGroup = "autostream"
 
 type configureAPIResponse struct {
 	ConfigYML        string `json:"config_yml"`
@@ -34,7 +40,7 @@ func RunConfigureCommand(args []string, expectedType string, stdout io.Writer) e
 	panelURL := fs.String("panel-url", "", "Control Panel base URL")
 	configureToken := fs.String("token", "", "one-time Configure Token")
 	nodeID := fs.String("node", "", "Node ID")
-	configPath := fs.String("config", "/etc/autostream-node/config.yml", "path to write config.yml")
+	configPath := fs.String("config", "/etc/autostream-worker/config.yml", "path to write config.yml")
 	timeout := fs.Duration("timeout", 15*time.Second, "configure request timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -147,8 +153,11 @@ func readLimitedConfigureBody(reader io.Reader) ([]byte, error) {
 func writeNodeConfigFile(path string, body []byte) error {
 	cleanPath := filepath.Clean(strings.TrimSpace(path))
 	dir := filepath.Dir(cleanPath)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := os.MkdirAll(dir, nodeConfigDirMode); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
+	}
+	if err := secureNodeConfigDir(dir); err != nil {
+		return err
 	}
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(cleanPath)+".tmp-*")
 	if err != nil {
@@ -161,9 +170,13 @@ func writeNodeConfigFile(path string, body []byte) error {
 			_ = os.Remove(tmpName)
 		}
 	}()
-	if err := tmp.Chmod(0o640); err != nil {
+	if err := tmp.Chmod(nodeConfigFileMode); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("chmod temp config: %w", err)
+	}
+	if err := secureNodeConfigFile(tmpName); err != nil {
+		_ = tmp.Close()
+		return err
 	}
 	if _, err := tmp.Write(body); err != nil {
 		_ = tmp.Close()
@@ -177,15 +190,64 @@ func writeNodeConfigFile(path string, body []byte) error {
 			_ = os.Remove(cleanPath)
 			if retryErr := os.Rename(tmpName, cleanPath); retryErr == nil {
 				keepTemp = true
-				_ = os.Chmod(cleanPath, 0o640)
+				_ = secureNodeConfigFile(cleanPath)
 				return nil
 			}
 		}
 		return fmt.Errorf("install config: %w", err)
 	}
 	keepTemp = true
-	if err := os.Chmod(cleanPath, 0o640); err != nil {
+	if err := secureNodeConfigFile(cleanPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func secureNodeConfigDir(path string) error {
+	if !shouldApplyAutostreamNodeOwnership(path) {
+		return nil
+	}
+	if err := chownRootAutostream(path); err != nil {
+		return fmt.Errorf("secure config directory: %w", err)
+	}
+	if err := os.Chmod(path, nodeConfigDirMode); err != nil {
+		return fmt.Errorf("chmod config directory: %w", err)
+	}
+	return nil
+}
+
+func secureNodeConfigFile(path string) error {
+	if shouldApplyAutostreamNodeOwnership(path) {
+		if err := chownRootAutostream(path); err != nil {
+			return fmt.Errorf("secure config file: %w", err)
+		}
+	}
+	if err := os.Chmod(path, nodeConfigFileMode); err != nil {
 		return fmt.Errorf("chmod config: %w", err)
+	}
+	return nil
+}
+
+func shouldApplyAutostreamNodeOwnership(path string) bool {
+	if runtime.GOOS == "windows" || os.Geteuid() != 0 {
+		return false
+	}
+	cleanPath := filepath.Clean(path)
+	secureDir := filepath.Clean(nodeConfigSecureDir)
+	return cleanPath == secureDir || strings.HasPrefix(cleanPath, secureDir+string(os.PathSeparator))
+}
+
+func chownRootAutostream(path string) error {
+	group, err := user.LookupGroup(nodeConfigServiceGroup)
+	if err != nil {
+		return fmt.Errorf("lookup group %q: %w", nodeConfigServiceGroup, err)
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil {
+		return fmt.Errorf("parse group %q gid %q: %w", nodeConfigServiceGroup, group.Gid, err)
+	}
+	if err := os.Chown(path, 0, gid); err != nil {
+		return fmt.Errorf("chown root:%s: %w", nodeConfigServiceGroup, err)
 	}
 	return nil
 }

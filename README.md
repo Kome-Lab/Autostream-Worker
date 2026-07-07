@@ -14,7 +14,7 @@ video layer stream は MVP 後の後続タスクです。
 ## 主な環境変数
 
 ```text
-AUTOSTREAM_NODE_CONFIG=/etc/autostream-node/config.yml
+AUTOSTREAM_NODE_CONFIG=/etc/autostream-worker/config.yml
 AUTOSTREAM_ENV=production
 AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG=true
 TZ=Asia/Tokyo

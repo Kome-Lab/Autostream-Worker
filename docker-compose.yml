@@ -3,8 +3,8 @@ services:
     build: .
     env_file: .env.example
     environment:
-      AUTOSTREAM_NODE_CONFIG: /etc/autostream-node/config.yml
+      AUTOSTREAM_NODE_CONFIG: /etc/autostream-worker/config.yml
     ports:
       - "8080:8080"
     volumes:
-      - ./config/autostream-node.yml:/etc/autostream-node/config.yml:ro
+      - ./config/config.yml:/etc/autostream-worker/config.yml:ro

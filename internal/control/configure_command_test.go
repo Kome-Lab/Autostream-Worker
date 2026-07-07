@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -32,6 +33,15 @@ func TestRunConfigureCommandWritesNodeConfig(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `id: "worker-01"`) || strings.Contains(string(body), "configure-token") {
 		t.Fatalf("unexpected config body: %s", body)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != nodeConfigFileMode {
+			t.Fatalf("config mode = %v, want %v", got, nodeConfigFileMode)
+		}
 	}
 	if !strings.Contains(out.String(), "configure succeeded: wrote") || !strings.Contains(out.String(), "worker-01") {
 		t.Fatalf("missing success output: %s", out.String())

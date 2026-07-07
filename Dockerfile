@@ -11,6 +11,6 @@ RUN go build -o /out/autostream-worker -ldflags="-s -w -X github.com/example/aut
 FROM gcr.io/distroless/base-debian13
 COPY --from=build /out/autostream-worker /usr/local/bin/autostream-worker
 COPY --from=build /out/autostream-worker /usr/local/bin/worker
-ENV AUTOSTREAM_NODE_CONFIG=/etc/autostream-node/config.yml
+ENV AUTOSTREAM_NODE_CONFIG=/etc/autostream-worker/config.yml
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/autostream-worker"]
