@@ -78,7 +78,7 @@ func RunConfigureCommand(args []string, expectedType string, stdout io.Writer) e
 		return err
 	}
 	if stdout != nil {
-		fmt.Fprintf(stdout, "wrote %s for node %s (%s)\n", filepath.Clean(*configPath), nodeCfg.NodeID, nodeCfg.NodeType)
+		fmt.Fprintf(stdout, "configure succeeded: wrote %s for node %s (%s)\n", filepath.Clean(*configPath), nodeCfg.NodeID, nodeCfg.NodeType)
 	}
 	return nil
 }

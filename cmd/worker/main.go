@@ -17,9 +17,14 @@ import (
 	"github.com/example/autostream-worker/internal/httpapi"
 	"github.com/example/autostream-worker/internal/jobs"
 	"github.com/example/autostream-worker/internal/observability"
+	"github.com/example/autostream-worker/internal/version"
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
+		fmt.Printf("autostream-worker %s\ncommit: %s\nbuild_date: %s\n", version.Current(), version.Commit, version.BuildDate)
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "configure" {
 		if err := control.RunConfigureCommand(os.Args[2:], control.ServiceType, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "configure failed: %v\n", err)
