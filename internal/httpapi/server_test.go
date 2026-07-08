@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,15 @@ import (
 	"github.com/example/autostream-worker/internal/jobs"
 	"github.com/example/autostream-worker/internal/observability"
 )
+
+type capturePublisher struct {
+	events []encoder.Event
+}
+
+func (p *capturePublisher) Publish(ctx context.Context, event encoder.Event) error {
+	p.events = append(p.events, event)
+	return nil
+}
 
 func TestProtectedEndpointsRejectMissingToken(t *testing.T) {
 	server := httptest.NewServer(NewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "expected"}))
@@ -60,6 +70,54 @@ func TestStartAndGenerateCurrentTimeEvent(t *testing.T) {
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusAccepted {
 		t.Fatalf("expected event 202, got %d", res.StatusCode)
+	}
+}
+
+func TestDiscordChatOverlayEventIsAcceptedAndForwarded(t *testing.T) {
+	publisher := &capturePublisher{}
+	server := httptest.NewServer(NewServer("worker", jobs.NewManager(publisher, observability.Client{}), TokenVerifier{PlainToken: "expected"}))
+	defer server.Close()
+
+	post := func(path, body string) *http.Response {
+		req, err := http.NewRequest(http.MethodPost, server.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer expected")
+		req.Header.Set("Content-Type", "application/json")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	res := post("/jobs/start", `{"stream_id":"stream-01","stream_name":"Chat Test"}`)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected start 202, got %d", res.StatusCode)
+	}
+
+	res = post("/streams/stream-01/events/overlay", `{"type":"overlay.discord_chat","payload":{"message_id":"msg-01","user_id":"user-01","display_name":"alice","text":"こんにちは","text_channel_id":"text-01","created_at":"2026-07-01T12:00:00Z"}}`)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusAccepted {
+		var body bytes.Buffer
+		_, _ = body.ReadFrom(res.Body)
+		t.Fatalf("expected discord chat overlay 202, got %d body=%s", res.StatusCode, body.String())
+	}
+	var response encoder.Event
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Type != "overlay.discord_chat" || response.Payload["text_channel_id"] != "text-01" {
+		t.Fatalf("unexpected response event: %#v", response)
+	}
+	if len(publisher.events) != 1 {
+		t.Fatalf("expected one forwarded event, got %#v", publisher.events)
+	}
+	forwarded := publisher.events[0]
+	if forwarded.Type != "overlay.discord_chat" || forwarded.StreamID != "stream-01" || forwarded.Payload["message_id"] != "msg-01" || forwarded.Payload["user_id"] != "user-01" || forwarded.Payload["display_name"] != "alice" || forwarded.Payload["text"] != "こんにちは" || forwarded.Payload["text_channel_id"] != "text-01" || forwarded.Payload["created_at"] != "2026-07-01T12:00:00Z" {
+		t.Fatalf("discord chat overlay was not forwarded intact: %#v", forwarded)
 	}
 }
 

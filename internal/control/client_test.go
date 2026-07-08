@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,9 @@ func TestRegisterPostsServiceRegistration(t *testing.T) {
 	if gotAuth != "Bearer secret-token" || got.ServiceType != ServiceType || got.Capabilities["overlay_events"] != true {
 		t.Fatalf("unexpected registration: auth=%q body=%#v", gotAuth, got)
 	}
+	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH {
+		t.Fatalf("registration did not include runtime platform: %#v", got)
+	}
 }
 
 func TestHeartbeatPostsStatus(t *testing.T) {
@@ -52,6 +56,9 @@ func TestHeartbeatPostsStatus(t *testing.T) {
 	}
 	if got.Status != "online" || got.CurrentStreamID != "stream-01" {
 		t.Fatalf("unexpected heartbeat: %#v", got)
+	}
+	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH || got.Capabilities["job_endpoint"] != true {
+		t.Fatalf("heartbeat did not include platform/capabilities: %#v", got)
 	}
 	if got.Metrics["worker.scene_updates_total"] != 2 {
 		t.Fatalf("unexpected heartbeat metrics: %#v", got.Metrics)

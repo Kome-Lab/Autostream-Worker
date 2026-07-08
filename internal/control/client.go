@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -40,6 +41,9 @@ type Registration struct {
 	PublicURL    string         `json:"public_url"`
 	Version      string         `json:"version"`
 	Capabilities map[string]any `json:"capabilities"`
+	Hostname     string         `json:"hostname,omitempty"`
+	OS           string         `json:"os,omitempty"`
+	Arch         string         `json:"arch,omitempty"`
 }
 
 type Heartbeat struct {
@@ -47,6 +51,10 @@ type Heartbeat struct {
 	Status          string             `json:"status"`
 	CurrentStreamID string             `json:"current_stream_id,omitempty"`
 	Version         string             `json:"version,omitempty"`
+	Capabilities    map[string]any     `json:"capabilities,omitempty"`
+	Hostname        string             `json:"hostname,omitempty"`
+	OS              string             `json:"os,omitempty"`
+	Arch            string             `json:"arch,omitempty"`
 	Metrics         map[string]float64 `json:"metrics,omitempty"`
 }
 
@@ -159,22 +167,37 @@ func isLocalDevHost(host string) bool {
 	return normalized == "localhost" || normalized == "127.0.0.1" || normalized == "host.docker.internal"
 }
 
+func serviceCapabilities() map[string]any {
+	return map[string]any{
+		"overlay_events":      true,
+		"caption_events":      true,
+		"participant_state":   true,
+		"active_speaker":      true,
+		"current_time_events": true,
+		"health_endpoint":     true,
+		"job_endpoint":        true,
+	}
+}
+
+func reportHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(hostname)
+}
+
 func (c Client) Register(ctx context.Context) error {
 	body := Registration{
-		ServiceID:   c.Config.ServiceID,
-		ServiceType: ServiceType,
-		ServiceName: c.Config.ServiceName,
-		PublicURL:   c.Config.ServicePublicURL,
-		Version:     c.Config.Version,
-		Capabilities: map[string]any{
-			"overlay_events":      true,
-			"caption_events":      true,
-			"participant_state":   true,
-			"active_speaker":      true,
-			"current_time_events": true,
-			"health_endpoint":     true,
-			"job_endpoint":        true,
-		},
+		ServiceID:    c.Config.ServiceID,
+		ServiceType:  ServiceType,
+		ServiceName:  c.Config.ServiceName,
+		PublicURL:    c.Config.ServicePublicURL,
+		Version:      c.Config.Version,
+		Capabilities: serviceCapabilities(),
+		Hostname:     reportHostname(),
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
 	}
 	return c.post(ctx, "/services/register", body)
 }
@@ -187,7 +210,17 @@ func (c Client) HeartbeatWithMetrics(ctx context.Context, status, currentStreamI
 	if status == "" {
 		status = "online"
 	}
-	return c.post(ctx, "/services/heartbeat", Heartbeat{ServiceID: c.Config.ServiceID, Status: status, CurrentStreamID: currentStreamID, Version: c.Config.Version, Metrics: metrics})
+	return c.post(ctx, "/services/heartbeat", Heartbeat{
+		ServiceID:       c.Config.ServiceID,
+		Status:          status,
+		CurrentStreamID: currentStreamID,
+		Version:         c.Config.Version,
+		Capabilities:    serviceCapabilities(),
+		Hostname:        reportHostname(),
+		OS:              runtime.GOOS,
+		Arch:            runtime.GOARCH,
+		Metrics:         metrics,
+	})
 }
 
 func (c Client) Event(ctx context.Context, streamID, name, status string, attributes map[string]any) error {

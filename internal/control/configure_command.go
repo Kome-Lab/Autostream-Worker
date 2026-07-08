@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/example/autostream-worker/internal/version"
 )
 
 const maxConfigureResponseBytes = 1 << 20
@@ -90,7 +92,7 @@ func RunConfigureCommand(args []string, expectedType string, stdout io.Writer) e
 }
 
 func fetchNodeConfig(ctx context.Context, panelURL, nodeID, configureToken string, timeout time.Duration) (string, error) {
-	payload, err := json.Marshal(map[string]string{"nodeId": nodeID, "configureToken": configureToken})
+	payload, err := json.Marshal(configureRequestPayload(nodeID, configureToken))
 	if err != nil {
 		return "", err
 	}
@@ -136,6 +138,25 @@ func fetchNodeConfig(ctx context.Context, panelURL, nodeID, configureToken strin
 		return "", errors.New("control panel configure response did not include config_yml")
 	}
 	return configYML + "\n", nil
+}
+
+func configureRequestPayload(nodeID, configureToken string) map[string]string {
+	return map[string]string{
+		"nodeId":         nodeID,
+		"configureToken": configureToken,
+		"version":        version.Current(),
+		"hostname":       configureHostname(),
+		"os":             runtime.GOOS,
+		"arch":           runtime.GOARCH,
+	}
+}
+
+func configureHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(hostname)
 }
 
 func readLimitedConfigureBody(reader io.Reader) ([]byte, error) {

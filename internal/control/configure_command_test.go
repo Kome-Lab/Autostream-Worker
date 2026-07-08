@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,13 @@ func TestRunConfigureCommandWritesNodeConfig(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/node-agent/configure" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["os"] != runtime.GOOS || payload["arch"] != runtime.GOARCH || payload["version"] == "" {
+			t.Fatalf("configure request did not include runtime platform: %#v", payload)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"config_yml":"panel:\n  url: \"https://panel.example.jp\"\nnode:\n  id: \"worker-01\"\n  name: \"Worker 01\"\n  type: \"worker\"\napi:\n  host: \"worker.example.jp\"\n  port: 8443\n  ssl_enabled: true\nauth:\n  token_id: \"runtime-token-id\"\n  token: \"runtime-token\"\n"}`))
