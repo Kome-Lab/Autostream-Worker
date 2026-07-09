@@ -15,6 +15,7 @@ import (
 	"github.com/example/autostream-worker/internal/control"
 	"github.com/example/autostream-worker/internal/encoder"
 	"github.com/example/autostream-worker/internal/events"
+	"github.com/example/autostream-worker/internal/ingesttoken"
 	"github.com/example/autostream-worker/internal/jobs"
 	"github.com/example/autostream-worker/internal/observability"
 )
@@ -28,12 +29,13 @@ type Status struct {
 }
 
 type TokenVerifier struct {
-	PlainToken string
-	SHA256Hex  string
+	PlainToken            string
+	SHA256Hex             string
+	IngestTokenSigningKey string
 }
 
 func TokenVerifierFromEnv() TokenVerifier {
-	verifier := TokenVerifier{PlainToken: os.Getenv("SERVICE_CONTROL_TOKEN"), SHA256Hex: os.Getenv("SERVICE_CONTROL_TOKEN_SHA256")}
+	verifier := TokenVerifier{PlainToken: os.Getenv("SERVICE_CONTROL_TOKEN"), SHA256Hex: os.Getenv("SERVICE_CONTROL_TOKEN_SHA256"), IngestTokenSigningKey: os.Getenv("AUTOSTREAM_STREAM_INGEST_SIGNING_KEY")}
 	if verifier.PlainToken == "" && verifier.SHA256Hex == "" {
 		if token := control.NodeRuntimeTokenFromEnv(); token != "" {
 			sum := sha256.Sum256([]byte(token))
@@ -67,6 +69,30 @@ func (v TokenVerifier) Verify(header string) bool {
 	}
 	fallback := os.Getenv("CONTROL_PANEL_TOKEN")
 	return fallback != "" && subtle.ConstantTimeCompare([]byte(token), []byte(fallback)) == 1
+}
+
+func (v TokenVerifier) VerifyWorkerEvents(header, streamID string) bool {
+	if v.Verify(header) {
+		return true
+	}
+	token := bearerToken(header)
+	if token == "" || !ingesttoken.IsSigned(token) || strings.TrimSpace(v.IngestTokenSigningKey) == "" {
+		return false
+	}
+	_, err := ingesttoken.Verify(v.IngestTokenSigningKey, token, ingesttoken.Expected{
+		StreamID:    streamID,
+		ServiceType: "discord_bot",
+		Purpose:     "worker_events",
+		Audience:    "worker",
+	})
+	return err == nil
+}
+
+func bearerToken(header string) string {
+	if !strings.HasPrefix(header, "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
 }
 
 func allowControlPanelTokenFallback() bool {
@@ -191,7 +217,7 @@ func (s Server) recentEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) currentTimeEvent(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	if !s.authorizedWorkerEvents(r, r.PathValue("id")) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "missing_or_invalid_service_token"})
 		return
 	}
@@ -200,7 +226,7 @@ func (s Server) currentTimeEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) captionEvent(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	if !s.authorizedWorkerEvents(r, r.PathValue("id")) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "missing_or_invalid_service_token"})
 		return
 	}
@@ -217,7 +243,7 @@ func (s Server) captionEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) participantsEvent(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	if !s.authorizedWorkerEvents(r, r.PathValue("id")) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "missing_or_invalid_service_token"})
 		return
 	}
@@ -233,7 +259,7 @@ func (s Server) participantsEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) activeSpeakerEvent(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	if !s.authorizedWorkerEvents(r, r.PathValue("id")) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "missing_or_invalid_service_token"})
 		return
 	}
@@ -250,7 +276,7 @@ func (s Server) activeSpeakerEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) customOverlayEvent(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	if !s.authorizedWorkerEvents(r, r.PathValue("id")) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "missing_or_invalid_service_token"})
 		return
 	}
@@ -268,6 +294,10 @@ func (s Server) customOverlayEvent(w http.ResponseWriter, r *http.Request) {
 
 func (s Server) authorized(r *http.Request) bool {
 	return s.verifier.Verify(r.Header.Get("Authorization"))
+}
+
+func (s Server) authorizedWorkerEvents(r *http.Request, streamID string) bool {
+	return s.verifier.VerifyWorkerEvents(r.Header.Get("Authorization"), streamID)
 }
 
 func decodeJSON(r *http.Request, value any) error {

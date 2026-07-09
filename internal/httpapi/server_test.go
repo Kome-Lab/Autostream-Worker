@@ -13,9 +13,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/example/autostream-worker/internal/control"
 	"github.com/example/autostream-worker/internal/encoder"
+	"github.com/example/autostream-worker/internal/ingesttoken"
 	"github.com/example/autostream-worker/internal/jobs"
 	"github.com/example/autostream-worker/internal/observability"
 )
@@ -118,6 +120,86 @@ func TestDiscordChatOverlayEventIsAcceptedAndForwarded(t *testing.T) {
 	forwarded := publisher.events[0]
 	if forwarded.Type != "overlay.discord_chat" || forwarded.StreamID != "stream-01" || forwarded.Payload["message_id"] != "msg-01" || forwarded.Payload["user_id"] != "user-01" || forwarded.Payload["display_name"] != "alice" || forwarded.Payload["text"] != "こんにちは" || forwarded.Payload["text_channel_id"] != "text-01" || forwarded.Payload["created_at"] != "2026-07-01T12:00:00Z" {
 		t.Fatalf("discord chat overlay was not forwarded intact: %#v", forwarded)
+	}
+}
+
+func TestWorkerEventEndpointAcceptsSignedDiscordBotToken(t *testing.T) {
+	const signingKey = "test-signing-key"
+	publisher := &capturePublisher{}
+	manager := jobs.NewManager(publisher, observability.Client{})
+	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{PlainToken: "expected", IngestTokenSigningKey: signingKey}))
+	defer server.Close()
+
+	startReq, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", strings.NewReader(`{"stream_id":"stream-01","stream_name":"Chat Test"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startReq.Header.Set("Authorization", "Bearer expected")
+	startReq.Header.Set("Content-Type", "application/json")
+	startRes, err := http.DefaultClient.Do(startReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer startRes.Body.Close()
+	if startRes.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected start 202, got %d", startRes.StatusCode)
+	}
+
+	token, err := ingesttoken.Issue(signingKey, ingesttoken.Claims{
+		StreamID:    "stream-01",
+		ServiceID:   "discord-01",
+		ServiceType: "discord_bot",
+		Purpose:     "worker_events",
+		Audience:    "worker",
+		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventReq, err := http.NewRequest(http.MethodPost, server.URL+"/streams/stream-01/events/overlay", strings.NewReader(`{"type":"overlay.discord_chat","payload":{"message_id":"msg-01","user_id":"user-01","text":"hello"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventReq.Header.Set("Authorization", "Bearer "+token)
+	eventReq.Header.Set("Content-Type", "application/json")
+	eventRes, err := http.DefaultClient.Do(eventReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eventRes.Body.Close()
+	if eventRes.StatusCode != http.StatusAccepted {
+		var body bytes.Buffer
+		_, _ = body.ReadFrom(eventRes.Body)
+		t.Fatalf("expected signed worker event 202, got %d body=%s", eventRes.StatusCode, body.String())
+	}
+	if len(publisher.events) != 1 || publisher.events[0].Type != "overlay.discord_chat" {
+		t.Fatalf("signed worker event was not published: %#v", publisher.events)
+	}
+
+	wrongStreamToken, err := ingesttoken.Issue(signingKey, ingesttoken.Claims{
+		StreamID:    "stream-02",
+		ServiceID:   "discord-01",
+		ServiceType: "discord_bot",
+		Purpose:     "worker_events",
+		Audience:    "worker",
+		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectReq, err := http.NewRequest(http.MethodPost, server.URL+"/streams/stream-01/events/overlay", strings.NewReader(`{"type":"overlay.discord_chat","payload":{"message_id":"msg-02"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectReq.Header.Set("Authorization", "Bearer "+wrongStreamToken)
+	rejectReq.Header.Set("Content-Type", "application/json")
+	rejectRes, err := http.DefaultClient.Do(rejectReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rejectRes.Body.Close()
+	if rejectRes.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected wrong stream token 401, got %d", rejectRes.StatusCode)
 	}
 }
 
