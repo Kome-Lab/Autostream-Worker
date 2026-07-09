@@ -1,0 +1,112 @@
+package control
+
+import (
+	"math"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+)
+
+var processStartedAt = time.Now()
+
+func NodeHostMetrics() map[string]float64 {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	return mergeFloatMetrics(
+		map[string]float64{
+			"node.cpu_count":                 float64(runtime.NumCPU()),
+			"process.goroutines":             float64(runtime.NumGoroutine()),
+			"process.heap_alloc_bytes":       float64(mem.HeapAlloc),
+			"process.heap_sys_bytes":         float64(mem.HeapSys),
+			"process.heap_objects":           float64(mem.HeapObjects),
+			"process.uptime_seconds":         time.Since(processStartedAt).Seconds(),
+			"process.gc_pause_seconds_total": float64(mem.PauseTotalNs) / 1e9,
+		},
+		procMemInfoMetrics(),
+		procLoadMetrics(),
+		filesystemMetrics(),
+	)
+}
+
+func mergeFloatMetrics(inputs ...map[string]float64) map[string]float64 {
+	out := make(map[string]float64)
+	for _, input := range inputs {
+		for key, value := range input {
+			key = strings.TrimSpace(key)
+			if key == "" || math.IsNaN(value) || math.IsInf(value, 0) {
+				continue
+			}
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func procMemInfoMetrics() map[string]float64 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return nil
+	}
+	values := make(map[string]float64)
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		parsed, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			continue
+		}
+		bytes := parsed * 1024
+		switch strings.TrimSuffix(fields[0], ":") {
+		case "MemTotal":
+			values["node.memory.total_bytes"] = bytes
+		case "MemFree":
+			values["node.memory.free_bytes"] = bytes
+		case "MemAvailable":
+			values["node.memory.available_bytes"] = bytes
+		case "Buffers":
+			values["node.memory.buffers_bytes"] = bytes
+		case "Cached":
+			values["node.memory.cached_bytes"] = bytes
+		}
+	}
+	total := values["node.memory.total_bytes"]
+	if total > 0 {
+		available := values["node.memory.available_bytes"]
+		if available <= 0 {
+			available = values["node.memory.free_bytes"]
+		}
+		used := total - available
+		if used >= 0 {
+			values["node.memory.used_bytes"] = used
+			values["node.memory.used_percent"] = used / total * 100
+		}
+	}
+	return values
+}
+
+func procLoadMetrics() map[string]float64 {
+	data, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return nil
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 3 {
+		return nil
+	}
+	keys := []string{"node.load1", "node.load5", "node.load15"}
+	out := make(map[string]float64, len(keys))
+	for i, key := range keys {
+		value, err := strconv.ParseFloat(fields[i], 64)
+		if err == nil {
+			out[key] = value
+		}
+	}
+	return out
+}

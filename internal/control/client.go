@@ -219,7 +219,7 @@ func (c Client) HeartbeatWithMetrics(ctx context.Context, status, currentStreamI
 		Hostname:        reportHostname(),
 		OS:              runtime.GOOS,
 		Arch:            runtime.GOARCH,
-		Metrics:         metrics,
+		Metrics:         mergeFloatMetrics(NodeHostMetrics(), metrics),
 	})
 }
 

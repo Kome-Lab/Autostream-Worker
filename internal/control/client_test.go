@@ -63,6 +63,9 @@ func TestHeartbeatPostsStatus(t *testing.T) {
 	if got.Metrics["worker.scene_updates_total"] != 2 {
 		t.Fatalf("unexpected heartbeat metrics: %#v", got.Metrics)
 	}
+	if got.Metrics["node.cpu_count"] <= 0 || got.Metrics["process.heap_alloc_bytes"] <= 0 || got.Metrics["process.uptime_seconds"] < 0 {
+		t.Fatalf("heartbeat did not include host/process metrics: %#v", got.Metrics)
+	}
 }
 
 func TestReportSignalPostsViaControlPanel(t *testing.T) {
