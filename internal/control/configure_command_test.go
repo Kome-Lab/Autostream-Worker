@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/example/autostream-worker/internal/version"
 )
 
 func TestRunConfigureCommandWritesNodeConfig(t *testing.T) {
@@ -21,7 +23,7 @@ func TestRunConfigureCommandWritesNodeConfig(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if payload["os"] != runtime.GOOS || payload["arch"] != runtime.GOARCH || payload["version"] == "" {
+		if payload["os"] != runtime.GOOS || payload["arch"] != runtime.GOARCH || payload["version"] == "" || payload["commit"] != version.Commit || payload["build_date"] != version.BuildDate {
 			t.Fatalf("configure request did not include runtime platform: %#v", payload)
 		}
 		w.Header().Set("Content-Type", "application/json")

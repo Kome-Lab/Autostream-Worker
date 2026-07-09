@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/example/autostream-worker/internal/version"
 )
 
 func TestRegisterPostsServiceRegistration(t *testing.T) {
@@ -35,6 +37,9 @@ func TestRegisterPostsServiceRegistration(t *testing.T) {
 	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH {
 		t.Fatalf("registration did not include runtime platform: %#v", got)
 	}
+	if got.Commit != version.Commit || got.BuildDate != version.BuildDate {
+		t.Fatalf("registration did not include build metadata: %#v", got)
+	}
 }
 
 func TestHeartbeatPostsStatus(t *testing.T) {
@@ -59,6 +64,9 @@ func TestHeartbeatPostsStatus(t *testing.T) {
 	}
 	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH || got.Capabilities["job_endpoint"] != true {
 		t.Fatalf("heartbeat did not include platform/capabilities: %#v", got)
+	}
+	if got.Commit != version.Commit || got.BuildDate != version.BuildDate {
+		t.Fatalf("heartbeat did not include build metadata: %#v", got)
 	}
 	if got.Metrics["worker.scene_updates_total"] != 2 {
 		t.Fatalf("unexpected heartbeat metrics: %#v", got.Metrics)

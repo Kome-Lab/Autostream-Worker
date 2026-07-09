@@ -6,10 +6,21 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 var processStartedAt = time.Now()
+var networkSampleState = struct {
+	sync.Mutex
+	previous *networkSample
+}{}
+
+type networkSample struct {
+	at time.Time
+	rx float64
+	tx float64
+}
 
 func NodeHostMetrics() map[string]float64 {
 	var mem runtime.MemStats
@@ -27,6 +38,7 @@ func NodeHostMetrics() map[string]float64 {
 		procMemInfoMetrics(),
 		procLoadMetrics(),
 		filesystemMetrics(),
+		networkMetrics(),
 	)
 }
 
@@ -108,5 +120,38 @@ func procLoadMetrics() map[string]float64 {
 			out[key] = value
 		}
 	}
+	return out
+}
+
+func networkMetrics() map[string]float64 {
+	counters := networkByteCounters()
+	if counters == nil {
+		return nil
+	}
+	rx := counters["rx"]
+	tx := counters["tx"]
+	now := time.Now()
+	out := map[string]float64{
+		"node.network.rx_bytes_total": rx,
+		"node.network.tx_bytes_total": tx,
+	}
+	networkSampleState.Lock()
+	defer networkSampleState.Unlock()
+	if previous := networkSampleState.previous; previous != nil {
+		elapsed := now.Sub(previous.at).Seconds()
+		if elapsed > 0 {
+			rxPerSec := (rx - previous.rx) / elapsed
+			txPerSec := (tx - previous.tx) / elapsed
+			if rxPerSec >= 0 {
+				out["node.network.rx_bytes_per_sec"] = rxPerSec
+				out["node.network.rx_kbps"] = rxPerSec * 8 / 1000
+			}
+			if txPerSec >= 0 {
+				out["node.network.tx_bytes_per_sec"] = txPerSec
+				out["node.network.tx_kbps"] = txPerSec * 8 / 1000
+			}
+		}
+	}
+	networkSampleState.previous = &networkSample{at: now, rx: rx, tx: tx}
 	return out
 }

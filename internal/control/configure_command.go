@@ -145,6 +145,8 @@ func configureRequestPayload(nodeID, configureToken string) map[string]string {
 		"nodeId":         nodeID,
 		"configureToken": configureToken,
 		"version":        version.Current(),
+		"commit":         version.Commit,
+		"build_date":     version.BuildDate,
 		"hostname":       configureHostname(),
 		"os":             runtime.GOOS,
 		"arch":           runtime.GOARCH,
