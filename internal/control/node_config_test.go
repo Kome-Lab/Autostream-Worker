@@ -19,6 +19,10 @@ func TestConfigFromEnvUsesNodeConfig(t *testing.T) {
 	if got := NodeRuntimeTokenFromEnv(); got != "runtime-secret" {
 		t.Fatalf("runtime token = %q", got)
 	}
+	t.Setenv("AUTOSTREAM_STREAM_INGEST_SIGNING_KEY", "legacy-env-signing-key")
+	if got := StreamIngestSigningKey(); got != "node-config-signing-key" {
+		t.Fatalf("stream ingest signing key = %q", got)
+	}
 }
 
 func TestConfigFromEnvRejectsWrongNodeType(t *testing.T) {
@@ -45,6 +49,10 @@ func TestConfigFromEnvTreatsMissingNodeConfigAsPending(t *testing.T) {
 	if got := NodeRuntimeTokenFromEnv(); got != "" {
 		t.Fatalf("runtime token = %q, want empty", got)
 	}
+	t.Setenv("AUTOSTREAM_STREAM_INGEST_SIGNING_KEY", "legacy-env-signing-key")
+	if got := StreamIngestSigningKey(); got != "legacy-env-signing-key" {
+		t.Fatalf("legacy stream ingest signing key fallback = %q", got)
+	}
 }
 
 func writeNodeConfigForTest(t *testing.T, nodeType string) string {
@@ -63,6 +71,8 @@ api:
 auth:
   token_id: "token-id"
   token: "runtime-secret"
+stream_ingest:
+  signing_key: "node-config-signing-key"
 `
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)

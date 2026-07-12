@@ -356,6 +356,13 @@ func TestTokenVerifierReadsNodeRuntimeTokenAfterStartup(t *testing.T) {
 	if !verifier.Verify("Bearer runtime-secret") {
 		t.Fatal("runtime token should verify after config is written")
 	}
+	signedToken, err := ingesttoken.Issue("node-config-signing-key", ingesttoken.Claims{StreamID: "stream-01", ServiceID: "discord-bot-01", ServiceType: "discord_bot", Purpose: "worker_events", Audience: "worker", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verifier.VerifyWorkerEvents("Bearer "+signedToken, "stream-01") {
+		t.Fatal("stream ingest signing key should be reloaded from node config")
+	}
 }
 
 func TestErrorDoesNotEchoBearerToken(t *testing.T) {
@@ -397,6 +404,8 @@ api:
 auth:
   token_id: "token-id"
   token: "runtime-secret"
+stream_ingest:
+  signing_key: "node-config-signing-key"
 `
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)

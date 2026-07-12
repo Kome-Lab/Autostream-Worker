@@ -35,7 +35,7 @@ type TokenVerifier struct {
 }
 
 func TokenVerifierFromEnv() TokenVerifier {
-	verifier := TokenVerifier{PlainToken: os.Getenv("SERVICE_CONTROL_TOKEN"), SHA256Hex: os.Getenv("SERVICE_CONTROL_TOKEN_SHA256"), IngestTokenSigningKey: os.Getenv("AUTOSTREAM_STREAM_INGEST_SIGNING_KEY")}
+	verifier := TokenVerifier{PlainToken: os.Getenv("SERVICE_CONTROL_TOKEN"), SHA256Hex: os.Getenv("SERVICE_CONTROL_TOKEN_SHA256"), IngestTokenSigningKey: control.StreamIngestSigningKey()}
 	if verifier.PlainToken == "" && verifier.SHA256Hex == "" {
 		if token := control.NodeRuntimeTokenFromEnv(); token != "" {
 			sum := sha256.Sum256([]byte(token))
@@ -76,10 +76,14 @@ func (v TokenVerifier) VerifyWorkerEvents(header, streamID string) bool {
 		return true
 	}
 	token := bearerToken(header)
-	if token == "" || !ingesttoken.IsSigned(token) || strings.TrimSpace(v.IngestTokenSigningKey) == "" {
+	signingKey := strings.TrimSpace(v.IngestTokenSigningKey)
+	if signingKey == "" {
+		signingKey = control.StreamIngestSigningKey()
+	}
+	if token == "" || !ingesttoken.IsSigned(token) || signingKey == "" {
 		return false
 	}
-	_, err := ingesttoken.Verify(v.IngestTokenSigningKey, token, ingesttoken.Expected{
+	_, err := ingesttoken.Verify(signingKey, token, ingesttoken.Expected{
 		StreamID:    streamID,
 		ServiceType: "discord_bot",
 		Purpose:     "worker_events",

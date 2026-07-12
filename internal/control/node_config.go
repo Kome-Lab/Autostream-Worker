@@ -11,14 +11,15 @@ import (
 )
 
 type nodeAgentConfig struct {
-	PanelURL      string
-	NodeID        string
-	NodeName      string
-	NodeType      string
-	APIHost       string
-	APIPort       int
-	APISSLEnabled bool
-	Token         string
+	PanelURL               string
+	NodeID                 string
+	NodeName               string
+	NodeType               string
+	APIHost                string
+	APIPort                int
+	APISSLEnabled          bool
+	Token                  string
+	StreamIngestSigningKey string
 }
 
 func applyNodeConfigFromEnv(cfg *Config, expectedType string) {
@@ -70,6 +71,17 @@ func NodeRuntimeTokenFromEnv() string {
 	return cfg.Token
 }
 
+func StreamIngestSigningKey() string {
+	path := NodeConfigPathFromEnv()
+	if path != "" {
+		cfg, err := loadNodeAgentConfig(path)
+		if err == nil && strings.TrimSpace(cfg.StreamIngestSigningKey) != "" {
+			return strings.TrimSpace(cfg.StreamIngestSigningKey)
+		}
+	}
+	return strings.TrimSpace(os.Getenv("AUTOSTREAM_STREAM_INGEST_SIGNING_KEY"))
+}
+
 func loadNodeAgentConfig(path string) (nodeAgentConfig, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -115,6 +127,8 @@ func parseNodeAgentConfig(body []byte) (nodeAgentConfig, error) {
 			cfg.APISSLEnabled = strings.EqualFold(value, "true")
 		case "auth.token":
 			cfg.Token = value
+		case "stream_ingest.signing_key":
+			cfg.StreamIngestSigningKey = value
 		}
 	}
 	if err := scanner.Err(); err != nil {
