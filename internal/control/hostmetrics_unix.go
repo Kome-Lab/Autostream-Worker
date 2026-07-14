@@ -9,6 +9,14 @@ import (
 	"syscall"
 )
 
+func cpuTimeCounters() *cpuTimes {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return nil
+	}
+	return parseProcStatCPUTimes(string(data))
+}
+
 func filesystemMetrics() map[string]float64 {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs("/", &stat); err != nil {

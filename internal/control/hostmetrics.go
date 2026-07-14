@@ -11,6 +11,10 @@ import (
 )
 
 var processStartedAt = time.Now()
+var cpuSampleState = struct {
+	sync.Mutex
+	previous *cpuTimes
+}{}
 var networkSampleState = struct {
 	sync.Mutex
 	previous *networkSample
@@ -20,6 +24,11 @@ type networkSample struct {
 	at time.Time
 	rx float64
 	tx float64
+}
+
+type cpuTimes struct {
+	total uint64
+	idle  uint64
 }
 
 func NodeHostMetrics() map[string]float64 {
@@ -35,11 +44,75 @@ func NodeHostMetrics() map[string]float64 {
 			"process.uptime_seconds":         time.Since(processStartedAt).Seconds(),
 			"process.gc_pause_seconds_total": float64(mem.PauseTotalNs) / 1e9,
 		},
+		cpuMetrics(),
 		procMemInfoMetrics(),
 		procLoadMetrics(),
 		filesystemMetrics(),
 		networkMetrics(),
 	)
+}
+
+func cpuMetrics() map[string]float64 {
+	cpuSampleState.Lock()
+	defer cpuSampleState.Unlock()
+	current := cpuTimeCounters()
+	if current == nil {
+		return nil
+	}
+	previous := cpuSampleState.previous
+	cpuSampleState.previous = current
+	if previous == nil {
+		return nil
+	}
+	usedPercent, ok := cpuUsedPercent(*previous, *current)
+	if !ok {
+		return nil
+	}
+	return map[string]float64{"node.cpu.used_percent": usedPercent}
+}
+
+func cpuUsedPercent(previous, current cpuTimes) (float64, bool) {
+	if current.total <= previous.total || current.idle < previous.idle {
+		return 0, false
+	}
+	totalDelta := current.total - previous.total
+	idleDelta := current.idle - previous.idle
+	if idleDelta > totalDelta {
+		return 0, false
+	}
+	return float64(totalDelta-idleDelta) / float64(totalDelta) * 100, true
+}
+
+func parseProcStatCPUTimes(data string) *cpuTimes {
+	for _, line := range strings.Split(data, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[0] != "cpu" {
+			continue
+		}
+		limit := len(fields)
+		if limit > 9 {
+			limit = 9
+		}
+		values := make([]uint64, 0, limit-1)
+		var total uint64
+		for _, field := range fields[1:limit] {
+			value, err := strconv.ParseUint(field, 10, 64)
+			if err != nil {
+				return nil
+			}
+			values = append(values, value)
+			total += value
+		}
+		idle := values[3]
+		if len(values) > 4 {
+			idle += values[4]
+		}
+		if total == 0 || idle > total {
+			return nil
+		}
+		return &cpuTimes{total: total, idle: idle}
+	}
+	return nil
 }
 
 func mergeFloatMetrics(inputs ...map[string]float64) map[string]float64 {
