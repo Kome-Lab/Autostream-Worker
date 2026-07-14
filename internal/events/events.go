@@ -22,6 +22,10 @@ func CaptionEvent(streamID, text, speakerUserID string, now time.Time) OverlayEv
 	return newEvent(streamID, "caption.telop", map[string]any{"text": text, "speaker_user_id": speakerUserID}, now)
 }
 
+func FinalCaptionEvent(streamID, text, speakerUserID string, now time.Time) OverlayEvent {
+	return newEvent(streamID, "caption.final", map[string]any{"text": text, "speaker_user_id": speakerUserID}, now)
+}
+
 func ParticipantListEvent(streamID string, participants []Participant, now time.Time) OverlayEvent {
 	payloadParticipants := make([]map[string]any, 0, len(participants))
 	for _, participant := range participants {

@@ -18,6 +18,13 @@ func TestCurrentTimeEvent(t *testing.T) {
 	}
 }
 
+func TestFinalCaptionEvent(t *testing.T) {
+	ev := FinalCaptionEvent("s1", "確定字幕", "user-01", time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC))
+	if ev.Type != "caption.final" || ev.Payload["text"] != "確定字幕" || ev.Payload["speaker_user_id"] != "user-01" {
+		t.Fatalf("unexpected final caption event: %#v", ev)
+	}
+}
+
 func TestParticipantListEvent(t *testing.T) {
 	ev := ParticipantListEvent("s1", []Participant{{UserID: "u1", DisplayName: "alice", Speaking: true}}, time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC))
 	if ev.Type != "overlay.participants" {

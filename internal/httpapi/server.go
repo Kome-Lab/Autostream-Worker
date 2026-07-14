@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/example/autostream-worker/internal/control"
+	"github.com/example/autostream-worker/internal/deepgram"
 	"github.com/example/autostream-worker/internal/encoder"
 	"github.com/example/autostream-worker/internal/events"
 	"github.com/example/autostream-worker/internal/ingesttoken"
@@ -26,6 +29,23 @@ type Status struct {
 	Status      string      `json:"status"`
 	CheckedAt   time.Time   `json:"checked_at"`
 	Worker      jobs.Status `json:"worker"`
+}
+
+const maxCaptionAudioBodyBytes int64 = 1 << 20
+
+type discordOpusIngestRequest struct {
+	StreamID string                    `json:"stream_id"`
+	Source   string                    `json:"source"`
+	Packets  []discordOpusIngestPacket `json:"packets"`
+}
+
+type discordOpusIngestPacket struct {
+	SSRC       *uint32    `json:"ssrc"`
+	UserID     string     `json:"user_id,omitempty"`
+	Sequence   *uint16    `json:"sequence"`
+	Timestamp  *uint64    `json:"timestamp"`
+	ReceivedAt *time.Time `json:"received_at"`
+	OpusBase64 string     `json:"opus_base64"`
 }
 
 type TokenVerifier struct {
@@ -92,6 +112,24 @@ func (v TokenVerifier) VerifyWorkerEvents(header, streamID string) bool {
 	return err == nil
 }
 
+func (v TokenVerifier) VerifyCaptionAudio(header, streamID string) bool {
+	token := bearerToken(header)
+	signingKey := strings.TrimSpace(v.IngestTokenSigningKey)
+	if signingKey == "" {
+		signingKey = control.StreamIngestSigningKey()
+	}
+	if token == "" || !ingesttoken.IsSigned(token) || signingKey == "" {
+		return false
+	}
+	_, err := ingesttoken.Verify(signingKey, token, ingesttoken.Expected{
+		StreamID:    streamID,
+		ServiceType: "discord_bot",
+		Purpose:     "caption_audio",
+		Audience:    "worker",
+	})
+	return err == nil
+}
+
 func bearerToken(header string) string {
 	if !strings.HasPrefix(header, "Bearer ") {
 		return ""
@@ -145,6 +183,7 @@ func NewServerWithRuntimeConfig(serviceType string, manager *jobs.Manager, verif
 	mux.HandleFunc("POST /heartbeat", server.heartbeat)
 	mux.HandleFunc("POST /jobs/start", server.startJob)
 	mux.HandleFunc("POST /jobs/{id}/stop", server.stopJob)
+	mux.HandleFunc("POST /streams/{id}/audio/opus", server.captionAudio)
 	mux.HandleFunc("GET /streams/{id}/events", server.recentEvents)
 	mux.HandleFunc("POST /streams/{id}/events/current-time", server.currentTimeEvent)
 	mux.HandleFunc("POST /streams/{id}/events/caption", server.captionEvent)
@@ -205,6 +244,64 @@ func (s Server) stopJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stopped"})
+}
+
+func (s Server) captionAudio(w http.ResponseWriter, r *http.Request) {
+	streamID := r.PathValue("id")
+	if !s.authorizedCaptionAudio(r, streamID) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "missing_or_invalid_service_token"})
+		return
+	}
+	var req discordOpusIngestRequest
+	if err := decodeJSONLimited(w, r, &req, maxCaptionAudioBodyBytes); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"code": "payload_too_large"})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
+		return
+	}
+	if strings.TrimSpace(req.StreamID) == "" || strings.TrimSpace(req.Source) == "" || len(req.Packets) == 0 || len(req.Packets) > 100 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_audio_payload"})
+		return
+	}
+	if req.StreamID != streamID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "stream_id_mismatch"})
+		return
+	}
+	packets := make([]deepgram.AudioPacket, 0, len(req.Packets))
+	for _, packet := range req.Packets {
+		if packet.SSRC == nil || packet.Sequence == nil || packet.Timestamp == nil || packet.ReceivedAt == nil || packet.ReceivedAt.IsZero() || packet.OpusBase64 == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_audio_payload"})
+			return
+		}
+		opus, err := base64.StdEncoding.Strict().DecodeString(packet.OpusBase64)
+		if err != nil || len(opus) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_audio_payload"})
+			return
+		}
+		packets = append(packets, deepgram.AudioPacket{
+			SSRC:       *packet.SSRC,
+			UserID:     strings.TrimSpace(packet.UserID),
+			Sequence:   *packet.Sequence,
+			Timestamp:  *packet.Timestamp,
+			ReceivedAt: packet.ReceivedAt.UTC(),
+			Opus:       opus,
+		})
+	}
+	if err := s.manager.IngestCaptionAudio(r.Context(), streamID, packets); err != nil {
+		switch {
+		case errors.Is(err, jobs.ErrCaptionNotConfigured):
+			writeJSON(w, http.StatusConflict, map[string]string{"code": "caption_audio_disabled"})
+		case errors.Is(err, jobs.ErrCaptionAudioUnavailable):
+			writeJSON(w, http.StatusBadGateway, map[string]string{"code": "caption_provider_unavailable"})
+		default:
+			writeRequestError(w, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "packet_count": len(packets)})
 }
 
 func (s Server) recentEvents(w http.ResponseWriter, r *http.Request) {
@@ -304,11 +401,33 @@ func (s Server) authorizedWorkerEvents(r *http.Request, streamID string) bool {
 	return s.verifier.VerifyWorkerEvents(r.Header.Get("Authorization"), streamID)
 }
 
+func (s Server) authorizedCaptionAudio(r *http.Request, streamID string) bool {
+	return s.verifier.VerifyCaptionAudio(r.Header.Get("Authorization"), streamID)
+}
+
 func decodeJSON(r *http.Request, value any) error {
 	defer r.Body.Close()
 	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(value)
+}
+
+func decodeJSONLimited(w http.ResponseWriter, r *http.Request, value any, limit int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return nil
 }
 
 func writeEventResult(w http.ResponseWriter, event events.OverlayEvent, err error) {
@@ -320,6 +439,20 @@ func writeEventResult(w http.ResponseWriter, event events.OverlayEvent, err erro
 }
 
 func writeRequestError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, jobs.ErrCaptionProfileInvalid):
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "caption_profile_invalid", "message": "selected caption profile is invalid"})
+		return
+	case errors.Is(err, jobs.ErrCaptionRuntimeUnavailable):
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "caption_runtime_unavailable", "message": "caption runtime initialization failed"})
+		return
+	case errors.Is(err, jobs.ErrCaptionNotConfigured):
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "caption_audio_disabled"})
+		return
+	case errors.Is(err, jobs.ErrCaptionAudioUnavailable):
+		writeJSON(w, http.StatusBadGateway, map[string]string{"code": "caption_provider_unavailable"})
+		return
+	}
 	status := http.StatusConflict
 	code := "invalid_stream_state"
 	if strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "must start") {

@@ -78,6 +78,12 @@ type RuntimeConfig struct {
 	Profiles    map[string][]RuntimeProfile `json:"profiles"`
 }
 
+type RuntimeSecret struct {
+	SecretName   string `json:"secret_name"`
+	Value        string `json:"value"`
+	ExpiresInSec int    `json:"expires_in_sec"`
+}
+
 type RegisteredService struct {
 	ServiceID       string         `json:"service_id"`
 	ServiceType     string         `json:"service_type"`
@@ -173,13 +179,15 @@ func isLocalDevHost(host string) bool {
 
 func serviceCapabilities() map[string]any {
 	return map[string]any{
-		"overlay_events":      true,
-		"caption_events":      true,
-		"participant_state":   true,
-		"active_speaker":      true,
-		"current_time_events": true,
-		"health_endpoint":     true,
-		"job_endpoint":        true,
+		"overlay_events":         true,
+		"caption_events":         true,
+		"caption_audio_ingest":   true,
+		"deepgram_transcription": true,
+		"participant_state":      true,
+		"active_speaker":         true,
+		"current_time_events":    true,
+		"health_endpoint":        true,
+		"job_endpoint":           true,
 	}
 }
 
@@ -258,6 +266,30 @@ func (c Client) RuntimeConfig(ctx context.Context) (RuntimeConfig, error) {
 	return cfg, nil
 }
 
+func (c Client) ResolveRuntimeSecret(ctx context.Context, streamID, secretName string) (RuntimeSecret, error) {
+	streamID = strings.TrimSpace(streamID)
+	secretName = strings.TrimSpace(secretName)
+	if streamID == "" {
+		return RuntimeSecret{}, errors.New("stream id is required")
+	}
+	if secretName == "" {
+		return RuntimeSecret{}, errors.New("secret name is required")
+	}
+	var secret RuntimeSecret
+	if err := c.postDecode(ctx, "/services/runtime-secrets/resolve", map[string]string{
+		"service_id":  c.Config.ServiceID,
+		"stream_id":   streamID,
+		"secret_name": secretName,
+	}, &secret); err != nil {
+		return RuntimeSecret{}, err
+	}
+	if secret.SecretName != secretName || strings.TrimSpace(secret.Value) == "" || secret.ExpiresInSec <= 0 {
+		secret.Value = ""
+		return RuntimeSecret{}, errors.New("control panel returned an invalid runtime secret")
+	}
+	return secret, nil
+}
+
 func (c Client) RunHeartbeatLoop(ctx context.Context, currentStreamID func() string, onError func(error)) {
 	c.RunHeartbeatLoopWithMetrics(ctx, currentStreamID, nil, onError)
 }
@@ -312,6 +344,10 @@ func (c Client) get(ctx context.Context, endpoint string, out any) error {
 }
 
 func (c Client) post(ctx context.Context, endpoint string, payload any) error {
+	return c.postDecode(ctx, endpoint, payload, nil)
+}
+
+func (c Client) postDecode(ctx context.Context, endpoint string, payload any, out any) error {
 	if err := c.Config.Validate(); err != nil {
 		return err
 	}
@@ -336,6 +372,9 @@ func (c Client) post(ctx context.Context, endpoint string, payload any) error {
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return fmt.Errorf("control panel %s failed with status %d", endpoint, res.StatusCode)
+	}
+	if out != nil {
+		return json.NewDecoder(res.Body).Decode(out)
 	}
 	return nil
 }

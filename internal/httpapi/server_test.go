@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/example/autostream-worker/internal/control"
+	"github.com/example/autostream-worker/internal/deepgram"
 	"github.com/example/autostream-worker/internal/encoder"
 	"github.com/example/autostream-worker/internal/ingesttoken"
 	"github.com/example/autostream-worker/internal/jobs"
@@ -28,6 +30,25 @@ type capturePublisher struct {
 
 func (p *capturePublisher) Publish(ctx context.Context, event encoder.Event) error {
 	p.events = append(p.events, event)
+	return nil
+}
+
+type captureCaptionSession struct {
+	packets []deepgram.AudioPacket
+	closed  int
+	err     error
+}
+
+func (s *captureCaptionSession) Ingest(_ context.Context, packet deepgram.AudioPacket) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.packets = append(s.packets, packet)
+	return nil
+}
+
+func (s *captureCaptionSession) Close(context.Context) error {
+	s.closed++
 	return nil
 }
 
@@ -200,6 +221,182 @@ func TestWorkerEventEndpointAcceptsSignedDiscordBotToken(t *testing.T) {
 	defer rejectRes.Body.Close()
 	if rejectRes.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected wrong stream token 401, got %d", rejectRes.StatusCode)
+	}
+}
+
+func TestCaptionAudioVerifierRequiresStrictSignedClaims(t *testing.T) {
+	const signingKey = "caption-signing-key"
+	verifier := TokenVerifier{PlainToken: "service-token", IngestTokenSigningKey: signingKey}
+	issue := func(claims ingesttoken.Claims) string {
+		t.Helper()
+		claims.ExpiresAt = time.Now().Add(time.Hour).Unix()
+		token, err := ingesttoken.Issue(signingKey, claims)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "Bearer " + token
+	}
+	base := ingesttoken.Claims{StreamID: "stream-01", ServiceID: "discord-01", ServiceType: "discord_bot", Purpose: "caption_audio", Audience: "worker"}
+	wrongStream := base
+	wrongStream.StreamID = "stream-02"
+	wrongServiceType := base
+	wrongServiceType.ServiceType = "worker"
+	wrongPurpose := base
+	wrongPurpose.Purpose = "worker_events"
+	wrongAudience := base
+	wrongAudience.Audience = "encoder_recorder"
+
+	tests := []struct {
+		name   string
+		header string
+		want   bool
+	}{
+		{name: "signed caption token", header: issue(base), want: true},
+		{name: "generic service token", header: "Bearer service-token"},
+		{name: "wrong stream", header: issue(wrongStream)},
+		{name: "wrong service type", header: issue(wrongServiceType)},
+		{name: "wrong purpose", header: issue(wrongPurpose)},
+		{name: "wrong audience", header: issue(wrongAudience)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := verifier.VerifyCaptionAudio(tc.header, "stream-01"); got != tc.want {
+				t.Fatalf("VerifyCaptionAudio() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCaptionAudioEndpointAcceptsContractPayloadWithSignedToken(t *testing.T) {
+	const signingKey = "caption-signing-key"
+	manager, captionSession := captionReadyManager(t)
+	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	defer server.Close()
+	token, err := ingesttoken.Issue(signingKey, ingesttoken.Claims{
+		StreamID:    "stream-01",
+		ServiceID:   "discord-01",
+		ServiceType: "discord_bot",
+		Purpose:     "caption_audio",
+		Audience:    "worker",
+		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opus := []byte{0xf8, 0xff, 0xfe}
+	body := `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"` + base64.StdEncoding.EncodeToString(opus) + `"}]}`
+	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", "Bearer "+token, body)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusAccepted {
+		var response bytes.Buffer
+		_, _ = response.ReadFrom(res.Body)
+		t.Fatalf("expected caption audio 202, got %d body=%s", res.StatusCode, response.String())
+	}
+	if len(captionSession.packets) != 1 {
+		t.Fatalf("packet was not forwarded: %#v", captionSession.packets)
+	}
+	packet := captionSession.packets[0]
+	if packet.SSRC != 42 || packet.UserID != "user-42" || packet.Sequence != 7 || packet.Timestamp != 960 || !packet.ReceivedAt.Equal(time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)) || !bytes.Equal(packet.Opus, opus) {
+		t.Fatalf("unexpected forwarded packet: %#v", packet)
+	}
+}
+
+func TestCaptionAudioEndpointRejectsUnknownFieldsAndOversizedBodies(t *testing.T) {
+	const signingKey = "caption-validation-signing-key"
+	server := httptest.NewServer(NewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{IngestTokenSigningKey: signingKey}))
+	defer server.Close()
+	authorization := signedCaptionAudioAuthorization(t, signingKey, "stream-01")
+	validPacket := `{"ssrc":42,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ=="}`
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "top-level unknown field", body: `{"stream_id":"stream-01","source":"discord","packets":[` + validPacket + `],"unknown":true}`},
+		{name: "packet unknown field", body: `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ==","unknown":true}]}`},
+		{name: "multiple json values", body: `{"stream_id":"stream-01","source":"discord","packets":[` + validPacket + `]} {}`},
+		{name: "missing required packet field", body: `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ=="}]}`},
+		{name: "invalid base64", body: `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"not-base64"}]}`},
+		{name: "stream mismatch", body: `{"stream_id":"stream-02","source":"discord","packets":[` + validPacket + `]}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", authorization, tc.body)
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", res.StatusCode)
+			}
+		})
+	}
+
+	oversized := `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"` + strings.Repeat("A", int(maxCaptionAudioBodyBytes)) + `"}]}`
+	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", authorization, oversized)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusRequestEntityTooLarge {
+		var response bytes.Buffer
+		_, _ = response.ReadFrom(res.Body)
+		t.Fatalf("expected 413, got %d body=%s", res.StatusCode, response.String())
+	}
+}
+
+func TestCaptionAudioEndpointReturnsConflictWhenCaptionProfileIsNotSelected(t *testing.T) {
+	const signingKey = "caption-disabled-signing-key"
+	manager := jobs.NewManager(encoder.NoopPublisher{}, observability.Client{})
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	defer server.Close()
+
+	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", signedCaptionAudioAuthorization(t, signingKey, "stream-01"), validCaptionAudioBody())
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("expected disabled caption 409, got %d", res.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["code"] != "caption_audio_disabled" {
+		t.Fatalf("unexpected response: %#v", body)
+	}
+}
+
+func TestCaptionAudioEndpointRejectsGenericServiceToken(t *testing.T) {
+	server := httptest.NewServer(NewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "service-token", IngestTokenSigningKey: "caption-signing-key"}))
+	defer server.Close()
+
+	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", "Bearer service-token", validCaptionAudioBody())
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("generic service token must not authorize caption audio, got %d", res.StatusCode)
+	}
+}
+
+func TestJobStartFailsClosedWhenCaptionSecretResolutionFails(t *testing.T) {
+	manager := jobs.NewManager(encoder.NoopPublisher{}, observability.Client{})
+	resolveCalls := 0
+	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(context.Context, string, string) (control.RuntimeSecret, error) {
+		resolveCalls++
+		return control.RuntimeSecret{}, errors.New("resolve failed with dg-secret-must-not-leak")
+	}), nil)
+	runtimeConfig := captionRuntimeConfigForHTTP()
+	server := httptest.NewServer(NewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "service-token"}, func(context.Context) (control.RuntimeConfig, error) {
+		return runtimeConfig, nil
+	}))
+	defer server.Close()
+
+	res := postJSON(t, server.URL+"/jobs/start", "Bearer service-token", `{"stream_id":"stream-01","caption_profile_id":"caption-01"}`)
+	defer res.Body.Close()
+	var response bytes.Buffer
+	_, _ = response.ReadFrom(res.Body)
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected caption initialization 503, got %d body=%s", res.StatusCode, response.String())
+	}
+	if strings.Contains(response.String(), "dg-secret-must-not-leak") {
+		t.Fatalf("runtime secret leaked in response: %s", response.String())
+	}
+	if manager.CurrentStreamID() != "" || resolveCalls != 1 {
+		t.Fatalf("job was partially started: status=%#v resolve_calls=%d", manager.Status(), resolveCalls)
 	}
 }
 
@@ -387,6 +584,87 @@ func TestErrorDoesNotEchoBearerToken(t *testing.T) {
 	if strings.Contains(buf.String(), "secret-token") {
 		t.Fatalf("token leaked in response: %s", buf.String())
 	}
+}
+
+func captionReadyManager(t *testing.T) (*jobs.Manager, *captureCaptionSession) {
+	t.Helper()
+	manager := jobs.NewManager(encoder.NoopPublisher{}, observability.Client{})
+	session := &captureCaptionSession{}
+	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), jobs.CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (jobs.CaptionSession, error) {
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfigForHTTP())
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.Close(context.Background()) })
+	return manager, session
+}
+
+func captionRuntimeConfigForHTTP() control.RuntimeConfig {
+	return control.RuntimeConfig{
+		Service: control.RegisteredService{ServiceID: "worker-01", ServiceType: control.ServiceType},
+		Assignments: []control.StreamServiceAssignment{{
+			StreamID:       "stream-01",
+			ServiceID:      "worker-01",
+			ServiceType:    control.ServiceType,
+			AssignmentRole: "primary",
+		}},
+		Profiles: map[string][]control.RuntimeProfile{
+			"caption": {{
+				ID:   "caption-01",
+				Kind: "caption",
+				Config: map[string]any{
+					"service_id":          "worker-01",
+					"provider":            "deepgram",
+					"model":               "nova-3",
+					"language":            "ja",
+					"api_key_secret_name": "deepgram_api_key",
+					"endpointing_ms":      300,
+					"interim_results":     true,
+					"smart_format":        true,
+					"delay_ms":            800,
+				},
+			}},
+		},
+	}
+}
+
+func validCaptionAudioBody() string {
+	return `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"` + base64.StdEncoding.EncodeToString([]byte{1}) + `"}]}`
+}
+
+func signedCaptionAudioAuthorization(t *testing.T, signingKey, streamID string) string {
+	t.Helper()
+	token, err := ingesttoken.Issue(signingKey, ingesttoken.Claims{
+		StreamID:    streamID,
+		ServiceID:   "discord-01",
+		ServiceType: "discord_bot",
+		Purpose:     "caption_audio",
+		Audience:    "worker",
+		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "Bearer " + token
+}
+
+func postJSON(t *testing.T, endpoint, authorization, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", authorization)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
 }
 
 func writeNodeConfigForVerifierTest(t *testing.T, path, nodeType string) {

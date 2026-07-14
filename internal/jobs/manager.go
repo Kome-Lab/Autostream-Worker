@@ -2,14 +2,24 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/example/autostream-worker/internal/control"
+	"github.com/example/autostream-worker/internal/deepgram"
 	"github.com/example/autostream-worker/internal/encoder"
 	"github.com/example/autostream-worker/internal/events"
+)
+
+var (
+	ErrCaptionNotConfigured      = errors.New("caption transcription is not configured")
+	ErrCaptionProfileInvalid     = errors.New("caption profile is invalid")
+	ErrCaptionRuntimeUnavailable = errors.New("caption transcription runtime is unavailable")
+	ErrCaptionAudioUnavailable   = errors.New("caption audio transcription is unavailable")
 )
 
 type StreamContext struct {
@@ -42,12 +52,20 @@ type Status struct {
 }
 
 type Manager struct {
-	publisher    encoder.Publisher
-	reporter     Reporter
-	mu           sync.Mutex
-	current      StreamContext
-	defaults     ProfileDefaults
-	assignments  AssignmentPolicy
+	publisher encoder.Publisher
+	reporter  Reporter
+
+	lifecycleMu sync.Mutex
+	mu          sync.Mutex
+	current     StreamContext
+	defaults    ProfileDefaults
+	assignments AssignmentPolicy
+
+	captionProfiles map[string]control.RuntimeProfile
+	secretResolver  RuntimeSecretResolver
+	captionFactory  CaptionSessionFactory
+	captionSession  CaptionSession
+
 	startedAt    time.Time
 	events       []events.OverlayEvent
 	eventCounts  map[string]int
@@ -60,28 +78,128 @@ type Reporter interface {
 	Metric(ctx context.Context, streamID, name, status string, value float64, attributes map[string]any) error
 }
 
+type RuntimeSecretResolver interface {
+	ResolveRuntimeSecret(context.Context, string, string) (control.RuntimeSecret, error)
+}
+
+type RuntimeSecretResolverFunc func(context.Context, string, string) (control.RuntimeSecret, error)
+
+func (f RuntimeSecretResolverFunc) ResolveRuntimeSecret(ctx context.Context, streamID, secretName string) (control.RuntimeSecret, error) {
+	if f == nil {
+		return control.RuntimeSecret{}, ErrCaptionRuntimeUnavailable
+	}
+	return f(ctx, streamID, secretName)
+}
+
+type CaptionSession interface {
+	Ingest(context.Context, deepgram.AudioPacket) error
+	Close(context.Context) error
+}
+
+type CaptionSessionFactory interface {
+	New(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error)
+}
+
+type CaptionSessionFactoryFunc func(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error)
+
+func (f CaptionSessionFactoryFunc) New(config deepgram.Config, apiKey []byte, handler deepgram.Handler) (CaptionSession, error) {
+	if f == nil {
+		return nil, ErrCaptionRuntimeUnavailable
+	}
+	return f(config, apiKey, handler)
+}
+
+type deepgramSessionFactory struct{}
+
+func (deepgramSessionFactory) New(config deepgram.Config, apiKey []byte, handler deepgram.Handler) (CaptionSession, error) {
+	return deepgram.NewSession(config, apiKey, handler)
+}
+
 func NewManager(publisher encoder.Publisher, reporter Reporter) *Manager {
 	if publisher == nil {
 		publisher = encoder.NoopPublisher{}
 	}
-	return &Manager{publisher: publisher, reporter: reporter, eventCounts: map[string]int{}, maxEvents: 200}
+	return &Manager{
+		publisher:       publisher,
+		reporter:        reporter,
+		captionProfiles: map[string]control.RuntimeProfile{},
+		captionFactory:  deepgramSessionFactory{},
+		eventCounts:     map[string]int{},
+		maxEvents:       200,
+	}
 }
 
 func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
-	stream = m.ApplyProfileDefaults(stream)
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	stream = m.applyStartProfileDefaults(stream)
 	if strings.TrimSpace(stream.StreamID) == "" {
 		return errors.New("stream_id is required")
 	}
+	stream.StreamID = strings.TrimSpace(stream.StreamID)
+	stream.CaptionProfileID = strings.TrimSpace(stream.CaptionProfileID)
+
 	m.mu.Lock()
 	if !m.streamAssignedLocked(stream.StreamID) {
 		m.mu.Unlock()
 		return errors.New("stream is not assigned to this worker service as primary")
 	}
-	if m.current.StreamID != "" && m.current.StreamID != stream.StreamID {
+	if m.current.StreamID != "" {
 		m.mu.Unlock()
-		return errors.New("another stream job is already active")
+		return errors.New("a stream job is already active")
+	}
+	profile, profileSelected := m.captionProfiles[stream.CaptionProfileID]
+	resolver := m.secretResolver
+	factory := m.captionFactory
+	m.mu.Unlock()
+
+	var captionSession CaptionSession
+	if stream.CaptionProfileID != "" {
+		if !profileSelected {
+			return m.captionStartFailed(ctx, stream.StreamID, stream.CaptionProfileID, "profile_not_found", ErrCaptionProfileInvalid)
+		}
+		config, secretName, err := captionConfig(profile)
+		if err != nil {
+			return m.captionStartFailed(ctx, stream.StreamID, stream.CaptionProfileID, "profile_invalid", ErrCaptionProfileInvalid)
+		}
+		if resolver == nil || factory == nil {
+			return m.captionStartFailed(ctx, stream.StreamID, stream.CaptionProfileID, "runtime_unavailable", ErrCaptionRuntimeUnavailable)
+		}
+		secret, err := resolver.ResolveRuntimeSecret(ctx, stream.StreamID, secretName)
+		if err != nil {
+			return m.captionStartFailed(ctx, stream.StreamID, stream.CaptionProfileID, "secret_resolve_failed", ErrCaptionRuntimeUnavailable)
+		}
+		if secret.SecretName != secretName || strings.TrimSpace(secret.Value) == "" || secret.ExpiresInSec <= 0 {
+			secret.Value = ""
+			return m.captionStartFailed(ctx, stream.StreamID, stream.CaptionProfileID, "secret_invalid", ErrCaptionRuntimeUnavailable)
+		}
+		apiKey := []byte(secret.Value)
+		secret.Value = ""
+		captionSession, err = factory.New(config, apiKey, func(resultCtx context.Context, transcript deepgram.Transcript) error {
+			_, publishErr := m.CaptionTranscript(resultCtx, stream.StreamID, transcript.Text, transcript.SpeakerUserID, transcript.Final, time.Now().UTC())
+			return publishErr
+		})
+		zeroBytes(apiKey)
+		if err != nil || captionSession == nil {
+			closeCaptionSession(captionSession)
+			return m.captionStartFailed(ctx, stream.StreamID, stream.CaptionProfileID, "session_create_failed", ErrCaptionRuntimeUnavailable)
+		}
+	}
+
+	m.mu.Lock()
+	if !m.streamAssignedLocked(stream.StreamID) {
+		m.mu.Unlock()
+		closeCaptionSession(captionSession)
+		return errors.New("stream is not assigned to this worker service as primary")
+	}
+	if m.current.StreamID != "" {
+		m.mu.Unlock()
+		closeCaptionSession(captionSession)
+		return errors.New("a stream job is already active")
 	}
 	m.current = stream
+	m.captionSession = captionSession
 	m.startedAt = time.Now().UTC()
 	m.events = nil
 	m.eventCounts = map[string]int{}
@@ -112,9 +230,22 @@ func (m *Manager) SetProfileDefaults(defaults ProfileDefaults) {
 	}
 }
 
+func (m *Manager) SetCaptionRuntime(resolver RuntimeSecretResolver, factory CaptionSessionFactory) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.secretResolver = resolver
+	if factory == nil {
+		factory = deepgramSessionFactory{}
+	}
+	m.captionFactory = factory
+}
+
 func (m *Manager) ApplyRuntimeConfig(cfg control.RuntimeConfig) {
 	m.SetProfileDefaults(ProfileDefaultsFromRuntimeConfig(cfg))
 	m.SetAssignmentPolicy(AssignmentPolicyFromRuntimeConfig(cfg))
+	m.mu.Lock()
+	m.captionProfiles = captionProfilesFromRuntimeConfig(cfg)
+	m.mu.Unlock()
 }
 
 func ProfileDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) ProfileDefaults {
@@ -126,6 +257,19 @@ func ProfileDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) ProfileDefaults
 		defaults.CaptionProfileID = profile.ID
 	}
 	return defaults
+}
+
+func captionProfilesFromRuntimeConfig(cfg control.RuntimeConfig) map[string]control.RuntimeProfile {
+	profiles := map[string]control.RuntimeProfile{}
+	for _, profile := range cfg.Profiles["caption"] {
+		profile.ID = strings.TrimSpace(profile.ID)
+		if profile.ID == "" || (profile.Kind != "" && profile.Kind != "caption") || !profileBelongsToService(profile, cfg.Service.ServiceID) {
+			continue
+		}
+		profile.Config = cloneConfig(profile.Config)
+		profiles[profile.ID] = profile
+	}
+	return profiles
 }
 
 func AssignmentPolicyFromRuntimeConfig(cfg control.RuntimeConfig) AssignmentPolicy {
@@ -171,6 +315,141 @@ func profileBelongsToService(profile control.RuntimeProfile, serviceID string) b
 	return profileServiceID == "" || profileServiceID == strings.TrimSpace(serviceID)
 }
 
+func captionConfig(profile control.RuntimeProfile) (deepgram.Config, string, error) {
+	provider, providerOK := stringConfig(profile.Config, "provider")
+	model, modelOK := stringConfig(profile.Config, "model")
+	language, languageOK := stringConfig(profile.Config, "language")
+	secretName, secretOK := stringConfig(profile.Config, "api_key_secret_name")
+	endpointingMS, endpointingOK := integerConfig(profile.Config, "endpointing_ms")
+	delayMS, delayOK := integerConfig(profile.Config, "delay_ms")
+	interimResults, interimOK := booleanConfig(profile.Config, "interim_results")
+	smartFormat, smartFormatOK := booleanConfig(profile.Config, "smart_format")
+	if !providerOK || !strings.EqualFold(provider, "deepgram") || !modelOK || model != "nova-3" ||
+		!languageOK || language == "" || !secretOK || secretName != "deepgram_api_key" ||
+		!endpointingOK || endpointingMS < 10 || endpointingMS > 5000 ||
+		!delayOK || delayMS < 0 || delayMS > 10000 || !interimOK || !smartFormatOK {
+		return deepgram.Config{}, "", ErrCaptionProfileInvalid
+	}
+	config := deepgram.Config{
+		Model:          model,
+		Language:       language,
+		EndpointingMS:  endpointingMS,
+		InterimResults: interimResults,
+		SmartFormat:    smartFormat,
+		Delay:          time.Duration(delayMS) * time.Millisecond,
+	}
+	if _, err := deepgram.ListenURL(config); err != nil {
+		return deepgram.Config{}, "", ErrCaptionProfileInvalid
+	}
+	return config, secretName, nil
+}
+
+func stringConfig(config map[string]any, key string) (string, bool) {
+	value, ok := config[key].(string)
+	if !ok {
+		return "", false
+	}
+	value = strings.TrimSpace(value)
+	return value, value != ""
+}
+
+func booleanConfig(config map[string]any, key string) (bool, bool) {
+	value, ok := config[key].(bool)
+	return value, ok
+}
+
+func integerConfig(config map[string]any, key string) (int, bool) {
+	value, ok := config[key]
+	if !ok {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int32:
+		return int(typed), true
+	case int64:
+		if typed < -1<<31 || typed > 1<<31-1 {
+			return 0, false
+		}
+		return int(typed), true
+	case uint:
+		if uint64(typed) > 1<<31-1 {
+			return 0, false
+		}
+		return int(typed), true
+	case uint32:
+		if typed > 1<<31-1 {
+			return 0, false
+		}
+		return int(typed), true
+	case uint64:
+		if typed > 1<<31-1 {
+			return 0, false
+		}
+		return int(typed), true
+	case float64:
+		if math.Trunc(typed) != typed || typed < -1<<31 || typed > 1<<31-1 {
+			return 0, false
+		}
+		return int(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil || parsed < -1<<31 || parsed > 1<<31-1 {
+			return 0, false
+		}
+		return int(parsed), true
+	default:
+		return 0, false
+	}
+}
+
+func cloneConfig(config map[string]any) map[string]any {
+	if config == nil {
+		return nil
+	}
+	out := make(map[string]any, len(config))
+	for key, value := range config {
+		out[key] = cloneConfigValue(value)
+	}
+	return out
+}
+
+func cloneConfigValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneConfig(typed)
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = cloneConfigValue(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func (m *Manager) captionStartFailed(ctx context.Context, streamID, profileID, reason string, target error) error {
+	m.report(ctx, streamID, "worker.caption.start_failed", "failed", map[string]any{
+		"caption_profile_id": profileID,
+		"reason":             reason,
+	})
+	return target
+}
+
+func closeCaptionSession(session CaptionSession) {
+	if session != nil {
+		_ = session.Close(context.Background())
+	}
+}
+
+func zeroBytes(value []byte) {
+	for i := range value {
+		value[i] = 0
+	}
+}
+
 func (m *Manager) ApplyProfileDefaults(stream StreamContext) StreamContext {
 	m.mu.Lock()
 	defaults := m.defaults
@@ -184,7 +463,20 @@ func (m *Manager) ApplyProfileDefaults(stream StreamContext) StreamContext {
 	return stream
 }
 
+func (m *Manager) applyStartProfileDefaults(stream StreamContext) StreamContext {
+	m.mu.Lock()
+	defaults := m.defaults
+	m.mu.Unlock()
+	if strings.TrimSpace(stream.OverlayProfileID) == "" {
+		stream.OverlayProfileID = defaults.OverlayProfileID
+	}
+	return stream
+}
+
 func (m *Manager) Stop(ctx context.Context, streamID string) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
 	m.mu.Lock()
 	if m.current.StreamID == "" {
 		m.mu.Unlock()
@@ -195,10 +487,58 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 		return errors.New("stream_id does not match current job")
 	}
 	stoppedStreamID := m.current.StreamID
+	captionSession := m.captionSession
+	m.captionSession = nil
+	m.mu.Unlock()
+
+	if captionSession != nil {
+		if err := captionSession.Close(ctx); err != nil {
+			m.report(ctx, stoppedStreamID, "worker.caption.stop_failed", "failed", nil)
+		}
+	}
+
+	m.mu.Lock()
 	m.current = StreamContext{}
 	m.startedAt = time.Time{}
 	m.mu.Unlock()
 	m.report(ctx, stoppedStreamID, "worker.job.stopped", "stopped", nil)
+	return nil
+}
+
+func (m *Manager) Close(ctx context.Context) {
+	streamID := m.CurrentStreamID()
+	if streamID != "" {
+		_ = m.Stop(ctx, streamID)
+	}
+}
+
+func (m *Manager) IngestCaptionAudio(ctx context.Context, streamID string, packets []deepgram.AudioPacket) error {
+	if len(packets) == 0 {
+		return errors.New("at least one opus packet is required")
+	}
+	m.mu.Lock()
+	if err := m.ensureStreamLocked(streamID); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	captionSession := m.captionSession
+	m.mu.Unlock()
+	if captionSession == nil {
+		return ErrCaptionNotConfigured
+	}
+	failed := false
+	for _, packet := range packets {
+		if len(packet.Opus) == 0 {
+			return errors.New("opus packet is required")
+		}
+		if err := captionSession.Ingest(ctx, packet); err != nil {
+			m.report(ctx, streamID, "worker.caption.audio_failed", "failed", map[string]any{"ssrc": packet.SSRC})
+			failed = true
+		}
+	}
+	if failed {
+		return ErrCaptionAudioUnavailable
+	}
 	return nil
 }
 
@@ -261,6 +601,16 @@ func (m *Manager) CurrentTime(ctx context.Context, streamID string, now time.Tim
 func (m *Manager) Caption(ctx context.Context, streamID, text, speakerUserID string, now time.Time) (events.OverlayEvent, error) {
 	if strings.TrimSpace(text) == "" {
 		return events.OverlayEvent{}, errors.New("caption text is required")
+	}
+	return m.publish(ctx, events.CaptionEvent(streamID, text, speakerUserID, now))
+}
+
+func (m *Manager) CaptionTranscript(ctx context.Context, streamID, text, speakerUserID string, final bool, now time.Time) (events.OverlayEvent, error) {
+	if strings.TrimSpace(text) == "" {
+		return events.OverlayEvent{}, errors.New("caption text is required")
+	}
+	if final {
+		return m.publish(ctx, events.FinalCaptionEvent(streamID, text, speakerUserID, now))
 	}
 	return m.publish(ctx, events.CaptionEvent(streamID, text, speakerUserID, now))
 }

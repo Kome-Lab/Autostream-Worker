@@ -34,6 +34,9 @@ func TestRegisterPostsServiceRegistration(t *testing.T) {
 	if gotAuth != "Bearer secret-token" || got.ServiceType != ServiceType || got.Capabilities["overlay_events"] != true {
 		t.Fatalf("unexpected registration: auth=%q body=%#v", gotAuth, got)
 	}
+	if got.Capabilities["caption_audio_ingest"] != true || got.Capabilities["deepgram_transcription"] != true {
+		t.Fatalf("caption capabilities are missing: %#v", got.Capabilities)
+	}
 	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH {
 		t.Fatalf("registration did not include runtime platform: %#v", got)
 	}
@@ -135,6 +138,56 @@ func TestRuntimeConfigFetchesScopedServiceConfig(t *testing.T) {
 	profiles := cfg.Profiles["overlay"]
 	if len(profiles) != 1 || profiles[0].Config["show_clock"] != true {
 		t.Fatalf("unexpected runtime profiles: %#v", profiles)
+	}
+}
+
+func TestResolveRuntimeSecretUsesRuntimeServiceToken(t *testing.T) {
+	var gotAuth string
+	var gotBody map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/services/runtime-secrets/resolve" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"secret_name":"deepgram_api_key","value":"dg-runtime-key","expires_in_sec":300}`))
+	}))
+	defer server.Close()
+
+	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "node-runtime-token", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: "https://worker.example.com"}}
+	secret, err := client.ResolveRuntimeSecret(t.Context(), "stream-01", "deepgram_api_key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer node-runtime-token" {
+		t.Fatalf("unexpected auth header: %q", gotAuth)
+	}
+	if gotBody["service_id"] != "worker-01" || gotBody["stream_id"] != "stream-01" || gotBody["secret_name"] != "deepgram_api_key" || len(gotBody) != 3 {
+		t.Fatalf("unexpected resolve body: %#v", gotBody)
+	}
+	if secret.SecretName != "deepgram_api_key" || secret.Value != "dg-runtime-key" || secret.ExpiresInSec != 300 {
+		t.Fatalf("unexpected runtime secret: %#v", secret)
+	}
+}
+
+func TestResolveRuntimeSecretFailureDoesNotLeakResponseBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"code":"runtime_secret_not_allowed","value":"dg-secret-must-not-leak"}`))
+	}))
+	defer server.Close()
+
+	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "node-runtime-token", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: "https://worker.example.com"}}
+	_, err := client.ResolveRuntimeSecret(t.Context(), "stream-01", "deepgram_api_key")
+	if err == nil {
+		t.Fatal("expected resolve failure")
+	}
+	if strings.Contains(err.Error(), "dg-secret-must-not-leak") || strings.Contains(err.Error(), "node-runtime-token") {
+		t.Fatalf("runtime secret leaked in error: %v", err)
 	}
 }
 

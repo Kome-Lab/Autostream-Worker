@@ -44,6 +44,9 @@ func main() {
 
 	controlClient := control.Client{Config: control.ConfigFromEnv()}
 	manager := jobs.NewManager(publisher, buildReporter(controlClient))
+	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(resolveCtx context.Context, streamID, secretName string) (control.RuntimeSecret, error) {
+		return (control.Client{Config: control.ConfigFromEnv()}).ResolveRuntimeSecret(resolveCtx, streamID, secretName)
+	}), nil)
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
 		if err := controlClient.Register(ctx); err != nil {
 			if requireControlPanelRuntimeConfig() {
@@ -91,12 +94,14 @@ func main() {
 	}()
 	select {
 	case err := <-errCh:
+		manager.Close(context.Background())
 		if err != nil {
 			log.Fatal(err)
 		}
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+		manager.Close(shutdownCtx)
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("worker shutdown failed: %v", err)
 			if closeErr := server.Close(); closeErr != nil {
