@@ -146,13 +146,21 @@ func (c Config) Validate() error {
 	if err := validateHTTPURL(c.ControlPanelURL, "CONTROL_PANEL_URL"); err != nil {
 		return err
 	}
-	if err := validateHTTPURL(c.ServicePublicURL, "SERVICE_PUBLIC_URL"); err != nil {
+	if err := validateServicePublicURL(c.ServicePublicURL); err != nil {
 		return err
 	}
 	return nil
 }
 
 func validateHTTPURL(raw, name string) error {
+	return validateHTTPURLWithAllowedComposeHost(raw, name, "")
+}
+
+func validateServicePublicURL(raw string) error {
+	return validateHTTPURLWithAllowedComposeHost(raw, "SERVICE_PUBLIC_URL", "worker")
+}
+
+func validateHTTPURLWithAllowedComposeHost(raw, name, allowedComposeHost string) error {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return errors.New(name + " must be an absolute URL")
@@ -166,10 +174,14 @@ func validateHTTPURL(raw, name string) error {
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return errors.New(name + " must not include query or fragment")
 	}
-	if parsed.Scheme == "http" && !isLocalDevHost(parsed.Hostname()) {
+	if parsed.Scheme == "http" && !isLocalDevHost(parsed.Hostname()) && !isExactHost(parsed.Hostname(), allowedComposeHost) {
 		return errors.New(name + " must use https for remote hosts")
 	}
 	return nil
+}
+
+func isExactHost(host, allowed string) bool {
+	return allowed != "" && strings.EqualFold(strings.TrimSpace(host), allowed)
 }
 
 func isLocalDevHost(host string) bool {

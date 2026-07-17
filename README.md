@@ -18,6 +18,7 @@ video layer stream は MVP 後の後続タスクです。
 AUTOSTREAM_NODE_CONFIG=/etc/autostream-worker/config.yml
 AUTOSTREAM_ENV=production
 AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG=true
+AUTOSTREAM_BIND_ADDR=127.0.0.1:8084
 TZ=Asia/Tokyo
 ```
 

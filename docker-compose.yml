@@ -4,7 +4,8 @@ services:
     env_file: .env.example
     environment:
       AUTOSTREAM_NODE_CONFIG: /etc/autostream-worker/config.yml
+      AUTOSTREAM_BIND_ADDR: 0.0.0.0:8080
     ports:
-      - "8080:8080"
+      - "8084:8080"
     volumes:
       - ./config/config.yml:/etc/autostream-worker/config.yml:ro

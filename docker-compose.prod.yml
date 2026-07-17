@@ -3,5 +3,7 @@ services:
     image: worker:latest
     restart: unless-stopped
     env_file: .env
-    ports:
-      - "127.0.0.1:8080:8080"
+    environment:
+      AUTOSTREAM_BIND_ADDR: 0.0.0.0:8080
+    ports: !override
+      - "127.0.0.1:8084:8080"

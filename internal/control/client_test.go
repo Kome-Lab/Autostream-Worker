@@ -262,6 +262,17 @@ func TestValidateRejectsRemoteHTTPControlPanelURL(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsComposeWorkerHTTPControlPanelURL(t *testing.T) {
+	cfg := Config{ControlPanelURL: "http://worker:8080", Token: "<SERVICE_TOKEN>", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: "https://worker.example.com"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "CONTROL_PANEL_URL") || !strings.Contains(err.Error(), "https for remote hosts") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestValidateAllowsLocalHTTPControlPanelURL(t *testing.T) {
 	cfg := Config{ControlPanelURL: "http://localhost:8080", Token: "<SERVICE_TOKEN>", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: "http://host.docker.internal:18083"}
 	if err := cfg.Validate(); err != nil {
@@ -277,6 +288,32 @@ func TestValidateRejectsRemoteHTTPServicePublicURL(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "SERVICE_PUBLIC_URL") || !strings.Contains(err.Error(), "https for remote hosts") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateAllowsComposeWorkerHTTPServicePublicURL(t *testing.T) {
+	cfg := Config{ControlPanelURL: "https://control.example.com", Token: "<SERVICE_TOKEN>", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: "http://worker:8080"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected Docker Compose worker HTTP URL to be allowed: %v", err)
+	}
+}
+
+func TestValidateRejectsOtherSingleLabelHTTPServicePublicURLs(t *testing.T) {
+	for _, rawURL := range []string{
+		"http://encoder-recorder:8080",
+		"http://worker-internal:8080",
+		"http://worker.:8080",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			cfg := Config{ControlPanelURL: "https://control.example.com", Token: "<SERVICE_TOKEN>", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: rawURL}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !strings.Contains(err.Error(), "SERVICE_PUBLIC_URL") || !strings.Contains(err.Error(), "https for remote hosts") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
