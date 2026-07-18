@@ -1,4 +1,5 @@
 bin/
 coverage.out
+/.gocache*/
 .env
 *.log
