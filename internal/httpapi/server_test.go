@@ -22,6 +22,7 @@ import (
 	"github.com/example/autostream-worker/internal/ingesttoken"
 	"github.com/example/autostream-worker/internal/jobs"
 	"github.com/example/autostream-worker/internal/observability"
+	"github.com/example/autostream-worker/internal/version"
 )
 
 type capturePublisher struct {
@@ -50,6 +51,35 @@ func (s *captureCaptionSession) Ingest(_ context.Context, packet deepgram.AudioP
 func (s *captureCaptionSession) Close(context.Context) error {
 	s.closed++
 	return nil
+}
+
+func TestUpdaterVersionEndpointIsUnauthenticatedAndReturnsEmbeddedVersionOnly(t *testing.T) {
+	previousVersion := version.Version
+	version.Version = "v1.1.1"
+	t.Setenv("SERVICE_VERSION", "v9.9.9")
+	t.Cleanup(func() { version.Version = previousVersion })
+
+	server := httptest.NewServer(NewServer("worker", nil, TokenVerifier{PlainToken: "expected"}))
+	defer server.Close()
+
+	res, err := http.Get(server.URL + "/updater/version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected unauthenticated updater version request to return 200, got %d", res.StatusCode)
+	}
+	if got := res.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("expected application/json, got %q", got)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 1 || body["version"] != version.Current() {
+		t.Fatalf("unexpected updater version response: %#v", body)
+	}
 }
 
 func TestProtectedEndpointsRejectMissingToken(t *testing.T) {

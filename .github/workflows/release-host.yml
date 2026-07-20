@@ -17,14 +17,17 @@ on:
         type: boolean
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   release-host:
     name: Build Linux host artifacts
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      push_release: ${{ steps.meta.outputs.push_release }}
     env:
       SERVICE_NAME: worker
       ARTIFACT_PREFIX: autostream-worker
@@ -204,33 +207,167 @@ jobs:
           name: host-release-dry-run
           path: artifacts/*
 
-      - name: Refuse to overwrite existing release assets
-        if: steps.meta.outputs.push_release == 'true'
+  publish-release:
+    name: Publish GitHub Release
+    needs: release-host
+    if: needs.release-host.outputs.push_release == 'true'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: host-release-publish-${{ needs.release-host.outputs.version }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: host-release-dry-run
+          path: artifacts
+
+      - name: Validate immutable release namespace
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_VERSION: ${{ needs.release-host.outputs.version }}
         run: |
           set -euo pipefail
-          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_VERSION}" > /dev/null 2> release-query.err; then
-            echo "Release ${RELEASE_VERSION} already exists; refusing to modify an immutable release." >&2
+
+          releases_json="${RUNNER_TEMP}/host-release-pages.json"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "${releases_json}"
+          existing_release_count="$(
+            jq -s --arg tag "${RELEASE_VERSION}" \
+              '[.[][] | select(.tag_name == $tag)] | length' \
+              "${releases_json}"
+          )"
+          if [[ "${existing_release_count}" != "0" ]]; then
+            echo "Release ${RELEASE_VERSION} already exists (including drafts); refusing to modify it." >&2
             exit 1
-          elif ! grep -q 'HTTP 404' release-query.err; then
-            cat release-query.err >&2
+          fi
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            if [[ "${GITHUB_REF_NAME}" != "${RELEASE_VERSION}" ]]; then
+              echo "Triggered tag ${GITHUB_REF_NAME} does not match ${RELEASE_VERSION}." >&2
+              exit 1
+            fi
+
+            tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}")"
+            ref_type="$(jq -r '.object.type' <<< "${tag_ref}")"
+            ref_sha="$(jq -r '.object.sha' <<< "${tag_ref}")"
+            depth=0
+            while [[ "${ref_type}" == "tag" ]]; do
+              depth=$((depth + 1))
+              if (( depth > 8 )); then
+                echo "Annotated tag ${RELEASE_VERSION} exceeds the dereference limit." >&2
+                exit 1
+              fi
+              tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${ref_sha}")"
+              ref_type="$(jq -r '.object.type' <<< "${tag_object}")"
+              ref_sha="$(jq -r '.object.sha' <<< "${tag_object}")"
+            done
+            if [[ "${ref_type}" != "commit" || "${ref_sha}" != "${GITHUB_SHA}" ]]; then
+              echo "Tag ${RELEASE_VERSION} does not resolve to workflow commit ${GITHUB_SHA}." >&2
+              exit 1
+            fi
+          else
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}" > "${RUNNER_TEMP}/existing-tag.json" 2> "${RUNNER_TEMP}/existing-tag.err"; then
+              echo "Tag ${RELEASE_VERSION} already exists; workflow_dispatch may not overwrite or reuse it." >&2
+              exit 1
+            elif ! grep -q 'HTTP 404' "${RUNNER_TEMP}/existing-tag.err"; then
+              cat "${RUNNER_TEMP}/existing-tag.err" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Bind workflow-dispatch tag to build commit
+        if: github.ref_type != 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.release-host.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          created_ref="$(
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_VERSION}" \
+              -f sha="${GITHUB_SHA}"
+          )"
+          if ! jq -e \
+            --arg ref "refs/tags/${RELEASE_VERSION}" \
+            --arg commit "${GITHUB_SHA}" \
+            '(.ref == $ref) and (.object.type == "commit") and (.object.sha == $commit)' \
+            <<< "${created_ref}" > /dev/null; then
+            echo "GitHub returned an unexpected ref after creating tag ${RELEASE_VERSION}." >&2
+            exit 1
+          fi
+
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}")"
+          ref_type="$(jq -r '.object.type' <<< "${tag_ref}")"
+          ref_sha="$(jq -r '.object.sha' <<< "${tag_ref}")"
+          depth=0
+          while [[ "${ref_type}" == "tag" ]]; do
+            depth=$((depth + 1))
+            if (( depth > 8 )); then
+              echo "Created tag ${RELEASE_VERSION} exceeds the dereference limit." >&2
+              exit 1
+            fi
+            tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${ref_sha}")"
+            ref_type="$(jq -r '.object.type' <<< "${tag_object}")"
+            ref_sha="$(jq -r '.object.sha' <<< "${tag_object}")"
+          done
+          if [[ "${ref_type}" != "commit" || "${ref_sha}" != "${GITHUB_SHA}" ]]; then
+            echo "Created tag ${RELEASE_VERSION} does not resolve to workflow commit ${GITHUB_SHA}." >&2
             exit 1
           fi
 
       - name: Attest release manifest
-        if: steps.meta.outputs.push_release == 'true'
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
           subject-path: artifacts/release-manifest.json
           create-storage-record: false
 
       - name: Publish GitHub Release
-        if: steps.meta.outputs.push_release == 'true'
         uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
         with:
-          tag_name: ${{ steps.meta.outputs.version }}
+          tag_name: ${{ needs.release-host.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
           files: artifacts/*
           overwrite_files: false
+
+      - name: Verify published release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.release-host.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_VERSION}")"
+          if ! jq -e \
+            --arg tag "${RELEASE_VERSION}" \
+            '(.tag_name == $tag) and (.draft == false) and (.published_at | type == "string" and length > 0)' \
+            <<< "${release_json}" > /dev/null; then
+            echo "Release ${RELEASE_VERSION} is not a published final release." >&2
+            exit 1
+          fi
+
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}")"
+          ref_type="$(jq -r '.object.type' <<< "${tag_ref}")"
+          ref_sha="$(jq -r '.object.sha' <<< "${tag_ref}")"
+          depth=0
+          while [[ "${ref_type}" == "tag" ]]; do
+            depth=$((depth + 1))
+            if (( depth > 8 )); then
+              echo "Published tag ${RELEASE_VERSION} exceeds the dereference limit." >&2
+              exit 1
+            fi
+            tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${ref_sha}")"
+            ref_type="$(jq -r '.object.type' <<< "${tag_object}")"
+            ref_sha="$(jq -r '.object.sha' <<< "${tag_object}")"
+          done
+          if [[ "${ref_type}" != "commit" || "${ref_sha}" != "${GITHUB_SHA}" ]]; then
+            echo "Published tag ${RELEASE_VERSION} does not resolve to workflow commit ${GITHUB_SHA}." >&2
+            exit 1
+          fi
