@@ -72,26 +72,49 @@ else
 fi
 ```
 
-Edit `/etc/autostream/worker.env` with real environment-specific values, then run:
+Edit `/etc/autostream/worker.env` with real environment-specific values.
+Keep this file root-owned and set `AUTOSTREAM_CONFIG_REVISION=1` for the first
+applied configuration. Increment the value after each configuration change.
+Only an unpadded integer greater than or equal to `1` is accepted; invalid
+values make the worker fail closed before it serves HTTP.
+
+`AUTOSTREAM_BIND_ADDR` accepts an arbitrary unprivileged port from `1024`
+through `65535`; the shipped systemd env uses the standard IPv4 loopback value
+`127.0.0.1:8084`. The binary retains the legacy `127.0.0.1:8080` fallback only
+when the variable is absent, so upgrading an older installation does not move
+its port. The systemd unit does not hard-code a port. An invalid address or an
+out-of-range port makes the worker fail closed during startup.
+
+Set `WORKER_PORT` below to the port component of `AUTOSTREAM_BIND_ADDR`, then
+run:
 
 ```bash
 set -euo pipefail
 VERSION="${VERSION:?export VERSION=vX.Y.Z before continuing}"
+WORKER_PORT="${WORKER_PORT:-8084}"
+PROBE_HOST="${PROBE_HOST:-127.0.0.1}"
+[[ "$WORKER_PORT" =~ ^[0-9]+$ ]]
+(( WORKER_PORT >= 1024 && WORKER_PORT <= 65535 ))
 sudo systemctl daemon-reload
 sudo systemctl enable autostream-worker
 sudo systemctl restart autostream-worker
 PID="$(sudo systemctl show --property=MainPID --value autostream-worker)"
 EXPECTED="$(sudo readlink -f /opt/autostream/worker/current/bin/autostream-worker)"
 test "$(sudo readlink -f "/proc/$PID/exe")" = "$EXPECTED"
-curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8084/health >/dev/null
+curl --fail --silent --show-error --max-time 10 "http://${PROBE_HOST}:${WORKER_PORT}/health" >/dev/null
 test "$(curl --fail --silent --show-error --max-time 10 \
-  http://127.0.0.1:8084/updater/version | jq -r '.version')" = "$VERSION"
+  "http://${PROBE_HOST}:${WORKER_PORT}/updater/version" | jq -r '.version')" = "$VERSION"
 ```
 
-Use the host's configured loopback port if it differs from `8084`.
-`/updater/version` is the unauthenticated, minimal endpoint used only to prove
-the running binary's embedded release version to the update helper. Block this
-exact path at any public reverse proxy.
+The standard systemd/local-executor profile uses IPv4 loopback. For an explicit
+IPv6 loopback bind such as `AUTOSTREAM_BIND_ADDR=[::1]:18084`, run the smoke
+check with `PROBE_HOST='[::1]' WORKER_PORT=18084`; the brackets are required in
+the URL.
+
+`/updater/version` is the unauthenticated, identity-bound local executor probe.
+Its exact response fields are version, service_id, service_type, and config_revision.
+The service ID comes from the same Control Panel node config used by
+registration. Block this exact path at any public reverse proxy.
 
 Do not fabricate `.artifact-sha256` or `.version` from an unverified local
 binary. Releases without `release-manifest.json` remain manual-only; publish a

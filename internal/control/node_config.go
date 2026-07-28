@@ -27,6 +27,11 @@ func applyNodeConfigFromEnv(cfg *Config, expectedType string) {
 	if path == "" {
 		return
 	}
+	cfg.ControlPanelURL = ""
+	cfg.Token = ""
+	cfg.ServiceID = ""
+	cfg.ServiceName = ""
+	cfg.ServicePublicURL = ""
 	nodeCfg, err := loadNodeAgentConfig(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -78,6 +83,7 @@ func StreamIngestSigningKey() string {
 		if err == nil && strings.TrimSpace(cfg.StreamIngestSigningKey) != "" {
 			return strings.TrimSpace(cfg.StreamIngestSigningKey)
 		}
+		return ""
 	}
 	return strings.TrimSpace(os.Getenv("AUTOSTREAM_STREAM_INGEST_SIGNING_KEY"))
 }

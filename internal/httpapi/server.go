@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -161,10 +162,11 @@ func envBool(key string, fallback bool) bool {
 }
 
 type Server struct {
-	serviceType   string
-	manager       *jobs.Manager
-	verifier      TokenVerifier
-	runtimeConfig RuntimeConfigProvider
+	serviceType     string
+	updaterIdentity *UpdaterIdentityLatch
+	manager         *jobs.Manager
+	verifier        TokenVerifier
+	runtimeConfig   RuntimeConfigProvider
 }
 
 type RuntimeConfigProvider func(context.Context) (control.RuntimeConfig, error)
@@ -174,10 +176,26 @@ func NewServer(serviceType string, manager *jobs.Manager, verifier TokenVerifier
 }
 
 func NewServerWithRuntimeConfig(serviceType string, manager *jobs.Manager, verifier TokenVerifier, runtimeConfig RuntimeConfigProvider) http.Handler {
+	return NewServerWithRuntimeConfigAndUpdaterIdentity(serviceType, manager, verifier, runtimeConfig, NewUpdaterIdentityLatch(serviceType))
+}
+
+func NewServerWithRuntimeConfigAndUpdaterIdentity(serviceType string, manager *jobs.Manager, verifier TokenVerifier, runtimeConfig RuntimeConfigProvider, updaterIdentity *UpdaterIdentityLatch) http.Handler {
 	if manager == nil {
 		manager = jobs.NewManager(encoder.NoopPublisher{}, observability.Client{})
 	}
-	server := Server{serviceType: serviceType, manager: manager, verifier: verifier, runtimeConfig: runtimeConfig}
+	if updaterIdentity == nil {
+		panic("worker updater identity latch is required")
+	}
+	if _, err := updaterIdentity.ResolveFromEnv(); err != nil && !errors.Is(err, ErrUpdaterIdentityPending) {
+		panic(err)
+	}
+	server := Server{
+		serviceType:     serviceType,
+		updaterIdentity: updaterIdentity,
+		manager:         manager,
+		verifier:        verifier,
+		runtimeConfig:   runtimeConfig,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", server.health)
 	mux.HandleFunc("GET /updater/version", server.updaterVersion)
@@ -200,7 +218,49 @@ func (s Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) updaterVersion(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"version": version.Current()})
+	identity, err := s.updaterIdentity.ResolveFromEnv()
+	if err != nil {
+		code := "updater_identity_invalid"
+		if errors.Is(err, ErrUpdaterIdentityPending) {
+			code = "updater_identity_pending"
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": code})
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Version        string `json:"version"`
+		ServiceID      string `json:"service_id"`
+		ServiceType    string `json:"service_type"`
+		ConfigRevision int64  `json:"config_revision"`
+	}{
+		Version:        version.Current(),
+		ServiceID:      identity.ServiceID,
+		ServiceType:    identity.ServiceType,
+		ConfigRevision: identity.ConfigRevision,
+	})
+}
+
+func ConfigRevisionFromEnv() (int64, error) {
+	raw := os.Getenv("AUTOSTREAM_CONFIG_REVISION")
+	if raw == "" {
+		return 1, nil
+	}
+	if raw != strings.TrimSpace(raw) {
+		return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must be an unpadded positive integer")
+	}
+	if raw[0] == '0' {
+		return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must not contain leading zeroes")
+	}
+	for _, char := range raw {
+		if char < '0' || char > '9' {
+			return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must contain decimal digits only")
+		}
+	}
+	revision, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || revision < 1 {
+		return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must be an integer greater than or equal to 1")
+	}
+	return revision, nil
 }
 
 func (s Server) status(w http.ResponseWriter, r *http.Request) {

@@ -215,6 +215,8 @@ jobs:
     concurrency:
       group: host-release-publish-${{ needs.release-host.outputs.version }}
       cancel-in-progress: false
+    env:
+      ARTIFACT_PREFIX: autostream-worker
     permissions:
       contents: write
       id-token: write
@@ -225,7 +227,26 @@ jobs:
           name: host-release-dry-run
           path: artifacts
 
-      - name: Validate immutable release namespace
+      - name: Require repository immutable releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.AUTOSTREAM_RELEASE_SETTINGS_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          settings_json="${RUNNER_TEMP}/immutable-release-settings.json"
+          settings_error="${RUNNER_TEMP}/immutable-release-settings.err"
+          if ! gh api \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+            > "${settings_json}" 2> "${settings_error}"; then
+            cat "${settings_error}" >&2
+            echo "Cannot prove that immutable releases are enabled. Configure AUTOSTREAM_RELEASE_SETTINGS_TOKEN with Administration (read) when GITHUB_TOKEN cannot read the setting." >&2
+            exit 1
+          fi
+          jq -e '(.enabled == true)' "${settings_json}" > /dev/null
+
+      - name: Validate immutable release namespace and local asset set
+        id: preflight
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -279,27 +300,270 @@ jobs:
             fi
           fi
 
-      - name: Bind workflow-dispatch tag to build commit
-        if: github.ref_type != 'tag'
+          expected_names="${RUNNER_TEMP}/host-release-expected-names.txt"
+          actual_names="${RUNNER_TEMP}/host-release-actual-names.txt"
+          cat > "${expected_names}" <<EOF
+          ${ARTIFACT_PREFIX}_${RELEASE_VERSION}_linux_amd64.tar.gz
+          ${ARTIFACT_PREFIX}_${RELEASE_VERSION}_linux_amd64.tar.gz.sha256
+          ${ARTIFACT_PREFIX}_${RELEASE_VERSION}_linux_arm64.tar.gz
+          ${ARTIFACT_PREFIX}_${RELEASE_VERSION}_linux_arm64.tar.gz.sha256
+          release-manifest.json
+          release-manifest.json.sha256
+          EOF
+          LC_ALL=C sort -o "${expected_names}" "${expected_names}"
+
+          unexpected_entry="$(find artifacts -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+          if [[ -n "${unexpected_entry}" ]]; then
+            echo "Release staging contains a non-file entry: ${unexpected_entry}" >&2
+            exit 1
+          fi
+          find artifacts -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > "${actual_names}"
+          diff -u "${expected_names}" "${actual_names}"
+
+          expected_assets='[]'
+          while IFS= read -r name; do
+            path="artifacts/${name}"
+            size="$(stat -c %s "${path}")"
+            digest="sha256:$(sha256sum "${path}" | awk '{ print $1 }')"
+            expected_assets="$(
+              jq -c \
+                --arg name "${name}" \
+                --argjson size "${size}" \
+                --arg digest "${digest}" \
+                '. + [{name: $name, size: $size, digest: $digest}]' \
+                <<< "${expected_assets}"
+            )"
+          done < "${expected_names}"
+          jq -S 'sort_by(.name)' <<< "${expected_assets}" > "${RUNNER_TEMP}/host-release-expected-assets.json"
+
+          draft_tag="${RELEASE_VERSION}-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "draft_tag=${draft_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create unpublished staging release with deterministic notes
+        id: create-draft
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.release-host.outputs.version }}
+          DRAFT_TAG: ${{ steps.preflight.outputs.draft_tag }}
         run: |
           set -euo pipefail
 
-          created_ref="$(
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/${RELEASE_VERSION}" \
-              -f sha="${GITHUB_SHA}"
-          )"
-          if ! jq -e \
-            --arg ref "refs/tags/${RELEASE_VERSION}" \
-            --arg commit "${GITHUB_SHA}" \
-            '(.ref == $ref) and (.object.type == "commit") and (.object.sha == $commit)' \
-            <<< "${created_ref}" > /dev/null; then
-            echo "GitHub returned an unexpected ref after creating tag ${RELEASE_VERSION}." >&2
+          release_notes_path="${RUNNER_TEMP}/host-release-notes.md"
+          {
+            printf '## AutoStream Host Release %s\n\n' "${RELEASE_VERSION}"
+            printf 'Immutable host artifacts for `%s`.\n\n' "${ARTIFACT_PREFIX}"
+            printf -- '- Channel: `host`\n'
+            printf -- '- Source commit: `%s`\n' "${GITHUB_SHA}"
+            printf -- '- Migration bridge: `ssh-free-pull-v2`\n'
+            printf -- '- Asset count: `6`\n'
+          } > "${release_notes_path}"
+          if [[ ! -s "${release_notes_path}" ]]; then
+            echo "Deterministic release notes are blank; refusing publication." >&2
             exit 1
+          fi
+          release_notes_digest="sha256:$(sha256sum "${release_notes_path}" | awk '{ print $1 }')"
+          if ! [[ "${release_notes_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Deterministic release notes digest is invalid." >&2
+            exit 1
+          fi
+          printf '%s\n' "${release_notes_digest}" > "${RUNNER_TEMP}/host-release-expected-notes.sha256"
+
+          release_id="$(
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+              -f tag_name="${DRAFT_TAG}" \
+              -f target_commitish="${GITHUB_SHA}" \
+              -f name="${RELEASE_VERSION}" \
+              -F "body=@${release_notes_path}" \
+              -F draft=true \
+              -F prerelease=false \
+              --jq '.id'
+          )"
+          if [[ ! "${release_id}" =~ ^[0-9]+$ ]]; then
+            echo "GitHub did not return a numeric staging release id." >&2
+            exit 1
+          fi
+          echo "release_id=${release_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload all assets to staging release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_RELEASE_ID: ${{ steps.create-draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find artifacts -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort)
+          if [[ "${#assets[@]}" -ne 6 ]]; then
+            echo "Expected 6 release assets, found ${#assets[@]}." >&2
+            exit 1
+          fi
+          index=0
+          for asset in "${assets[@]}"; do
+            name="${asset##*/}"
+            response="${RUNNER_TEMP}/host-release-upload-${index}.json"
+            curl --silent --show-error --fail-with-body --location \
+              --retry 3 --retry-all-errors --retry-delay 2 \
+              --request POST \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              --header 'Content-Type: application/octet-stream' \
+              --data-binary "@${asset}" \
+              --output "${response}" \
+              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}/assets?name=${name}"
+            size="$(stat -c %s "${asset}")"
+            digest="sha256:$(sha256sum "${asset}" | awk '{ print $1 }')"
+            jq -e \
+              --arg name "${name}" \
+              --argjson size "${size}" \
+              --arg digest "${digest}" \
+              '(.name == $name) and
+               (.size == $size) and
+               (.digest == $digest) and
+               (.state == "uploaded")' \
+              "${response}" > /dev/null
+            index=$((index + 1))
+          done
+
+      - name: Verify staging release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_TAG: ${{ steps.preflight.outputs.draft_tag }}
+          DRAFT_RELEASE_ID: ${{ steps.create-draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          release_json="${RUNNER_TEMP}/host-release-draft.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}" > "${release_json}"
+          jq -e \
+            --arg tag "${DRAFT_TAG}" \
+            --arg commit "${GITHUB_SHA}" \
+            '(.tag_name == $tag) and
+             (.target_commitish == $commit) and
+             (.draft == true) and
+             (.published_at == null) and
+             (.body | type == "string") and
+             (.body | gsub("\\s"; "") | length > 0)' \
+            "${release_json}" > /dev/null
+
+          draft_notes_path="${RUNNER_TEMP}/host-release-draft-notes.md"
+          jq -j '.body' "${release_json}" > "${draft_notes_path}"
+          if ! cmp -s "${RUNNER_TEMP}/host-release-notes.md" "${draft_notes_path}"; then
+            echo "Draft release notes differ from the deterministic body." >&2
+            diff -u "${RUNNER_TEMP}/host-release-notes.md" "${draft_notes_path}" || true
+            exit 1
+          fi
+          expected_notes_digest="$(< "${RUNNER_TEMP}/host-release-expected-notes.sha256")"
+          draft_notes_digest="sha256:$(sha256sum "${draft_notes_path}" | awk '{ print $1 }')"
+          if [[ "${draft_notes_digest}" != "${expected_notes_digest}" ]]; then
+            echo "Draft release notes digest differs from the deterministic body." >&2
+            exit 1
+          fi
+
+          assets_pages="${RUNNER_TEMP}/host-release-asset-pages.json"
+          uploaded_assets="${RUNNER_TEMP}/host-release-uploaded-assets.json"
+          uploaded_projection="${RUNNER_TEMP}/host-release-uploaded-projection.json"
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}/assets?per_page=100" \
+            > "${assets_pages}"
+          jq -s -S \
+            '[.[][] | {name, size, digest, state}] | sort_by(.name)' \
+            "${assets_pages}" > "${uploaded_assets}"
+          jq -e \
+            '(length == 6) and
+             (all(.[];
+               (.name | test("^[A-Za-z0-9._-]+$")) and
+               (.size | type == "number" and . > 0) and
+               (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+               (.state == "uploaded")))' \
+            "${uploaded_assets}" > /dev/null
+          jq -S '[.[] | {name, size, digest}]' \
+            "${uploaded_assets}" > "${uploaded_projection}"
+          diff -u "${RUNNER_TEMP}/host-release-expected-assets.json" "${uploaded_projection}"
+
+      - name: Attest release manifest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: artifacts/release-manifest.json
+          create-storage-record: false
+
+      - name: Publish verified release atomically
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.release-host.outputs.version }}
+          DRAFT_TAG: ${{ steps.preflight.outputs.draft_tag }}
+          DRAFT_RELEASE_ID: ${{ steps.create-draft.outputs.release_id }}
+          IMMUTABILITY_TOKEN: ${{ secrets.AUTOSTREAM_RELEASE_SETTINGS_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+
+          releases_json="${RUNNER_TEMP}/host-release-prepublish-pages.json"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "${releases_json}"
+          existing_release_count="$(
+            jq -s --arg tag "${RELEASE_VERSION}" \
+              '[.[][] | select(.tag_name == $tag)] | length' \
+              "${releases_json}"
+          )"
+          if [[ "${existing_release_count}" != "0" ]]; then
+            echo "Release ${RELEASE_VERSION} appeared during staging; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}")"
+            ref_type="$(jq -r '.object.type' <<< "${tag_ref}")"
+            ref_sha="$(jq -r '.object.sha' <<< "${tag_ref}")"
+            depth=0
+            while [[ "${ref_type}" == "tag" ]]; do
+              depth=$((depth + 1))
+              if (( depth > 8 )); then
+                echo "Annotated tag ${RELEASE_VERSION} exceeds the dereference limit before publish." >&2
+                exit 1
+              fi
+              tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${ref_sha}")"
+              ref_type="$(jq -r '.object.type' <<< "${tag_object}")"
+              ref_sha="$(jq -r '.object.sha' <<< "${tag_object}")"
+            done
+            if [[ "${ref_type}" != "commit" || "${ref_sha}" != "${GITHUB_SHA}" ]]; then
+              echo "Tag ${RELEASE_VERSION} moved during staging; refusing to publish mismatched assets." >&2
+              exit 1
+            fi
+          fi
+
+          settings_json="${RUNNER_TEMP}/immutable-release-settings-prepublish.json"
+          settings_error="${RUNNER_TEMP}/immutable-release-settings-prepublish.err"
+          if ! GH_TOKEN="${IMMUTABILITY_TOKEN}" gh api \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+            > "${settings_json}" 2> "${settings_error}"; then
+            cat "${settings_error}" >&2
+            echo "Cannot re-confirm immutable releases immediately before publication; keeping the release unpublished." >&2
+            exit 1
+          fi
+          jq -e '(.enabled == true)' "${settings_json}" > /dev/null
+
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            created_ref_json="${RUNNER_TEMP}/host-release-created-final-tag.json"
+            created_ref_error="${RUNNER_TEMP}/host-release-created-final-tag.err"
+            if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_VERSION}" \
+              -f sha="${GITHUB_SHA}" \
+              > "${created_ref_json}" 2> "${created_ref_error}"; then
+              cat "${created_ref_error}" >&2
+              echo "Could not atomically claim tag ${RELEASE_VERSION}; refusing to overwrite or reuse an existing tag." >&2
+              exit 1
+            fi
+            printf '%s\n' "${GITHUB_SHA}" > "${RUNNER_TEMP}/host-release-owned-final-tag"
+            if ! jq -e \
+              --arg ref "refs/tags/${RELEASE_VERSION}" \
+              --arg commit "${GITHUB_SHA}" \
+              '(.ref == $ref) and (.object.type == "commit") and (.object.sha == $commit)' \
+              "${created_ref_json}" > /dev/null; then
+              echo "Created tag ${RELEASE_VERSION} does not resolve to workflow commit ${GITHUB_SHA}." >&2
+              exit 1
+            fi
           fi
 
           tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}")"
@@ -309,7 +573,7 @@ jobs:
           while [[ "${ref_type}" == "tag" ]]; do
             depth=$((depth + 1))
             if (( depth > 8 )); then
-              echo "Created tag ${RELEASE_VERSION} exceeds the dereference limit." >&2
+              echo "Final tag ${RELEASE_VERSION} exceeds the dereference limit immediately before publish." >&2
               exit 1
             fi
             tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${ref_sha}")"
@@ -317,41 +581,53 @@ jobs:
             ref_sha="$(jq -r '.object.sha' <<< "${tag_object}")"
           done
           if [[ "${ref_type}" != "commit" || "${ref_sha}" != "${GITHUB_SHA}" ]]; then
-            echo "Created tag ${RELEASE_VERSION} does not resolve to workflow commit ${GITHUB_SHA}." >&2
+            echo "Final tag ${RELEASE_VERSION} does not resolve to workflow commit ${GITHUB_SHA} immediately before publish." >&2
             exit 1
           fi
 
-      - name: Attest release manifest
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
-        with:
-          subject-path: artifacts/release-manifest.json
-          create-storage-record: false
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}" \
+            -f tag_name="${RELEASE_VERSION}" \
+            -f target_commitish="${GITHUB_SHA}" \
+            -f name="${RELEASE_VERSION}" \
+            -F draft=false \
+            -F prerelease=false \
+            > "${RUNNER_TEMP}/host-release-published.json"
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          tag_name: ${{ needs.release-host.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          fail_on_unmatched_files: true
-          files: artifacts/*
-          overwrite_files: false
-
-      - name: Verify published release tag
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ needs.release-host.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_VERSION}")"
-          if ! jq -e \
+          published_json="${RUNNER_TEMP}/host-release-published-check.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}" > "${published_json}"
+          jq -e \
+            --argjson release_id "${DRAFT_RELEASE_ID}" \
             --arg tag "${RELEASE_VERSION}" \
-            '(.tag_name == $tag) and (.draft == false) and (.published_at | type == "string" and length > 0)' \
-            <<< "${release_json}" > /dev/null; then
-            echo "Release ${RELEASE_VERSION} is not a published final release." >&2
+            '(.id == $release_id) and
+             (.tag_name == $tag) and
+             (.draft == false) and
+             (.immutable == true) and
+             (.published_at | type == "string" and length > 0) and
+             (.body | type == "string") and
+             (.body | gsub("\\s"; "") | length > 0) and
+             (.assets | length == 6) and
+             (all(.assets[];
+               (.state == "uploaded") and
+               (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))))' \
+            "${published_json}" > /dev/null
+          published_notes_path="${RUNNER_TEMP}/host-release-published-notes.md"
+          jq -j '.body' "${published_json}" > "${published_notes_path}"
+          if ! cmp -s "${RUNNER_TEMP}/host-release-notes.md" "${published_notes_path}"; then
+            echo "Published release notes differ from the deterministic body." >&2
+            diff -u "${RUNNER_TEMP}/host-release-notes.md" "${published_notes_path}" || true
             exit 1
           fi
+          expected_notes_digest="$(< "${RUNNER_TEMP}/host-release-expected-notes.sha256")"
+          published_notes_digest="sha256:$(sha256sum "${published_notes_path}" | awk '{ print $1 }')"
+          if [[ "${published_notes_digest}" != "${expected_notes_digest}" ]]; then
+            echo "Published release notes digest differs from the deterministic body." >&2
+            exit 1
+          fi
+          jq -S '[.assets[] | {name, size, digest}] | sort_by(.name)' \
+            "${published_json}" > "${RUNNER_TEMP}/host-release-published-assets.json"
+          diff -u \
+            "${RUNNER_TEMP}/host-release-expected-assets.json" \
+            "${RUNNER_TEMP}/host-release-published-assets.json"
 
           tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}")"
           ref_type="$(jq -r '.object.type' <<< "${tag_ref}")"
@@ -369,5 +645,82 @@ jobs:
           done
           if [[ "${ref_type}" != "commit" || "${ref_sha}" != "${GITHUB_SHA}" ]]; then
             echo "Published tag ${RELEASE_VERSION} does not resolve to workflow commit ${GITHUB_SHA}." >&2
+            exit 1
+          fi
+
+          postpublish_staging_ref="${RUNNER_TEMP}/host-release-postpublish-staging-tag.json"
+          postpublish_staging_error="${RUNNER_TEMP}/host-release-postpublish-staging-tag.err"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${DRAFT_TAG}" > "${postpublish_staging_ref}" 2> "${postpublish_staging_error}"; then
+            if ! jq -e \
+              --arg commit "${GITHUB_SHA}" \
+              '(.object.type == "commit") and (.object.sha == $commit)' \
+              "${postpublish_staging_ref}" > /dev/null; then
+              echo "Refusing to delete staging tag ${DRAFT_TAG}: it is not the workflow-owned commit." >&2
+              exit 1
+            fi
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${DRAFT_TAG}"
+          elif ! grep -q 'HTTP 404' "${postpublish_staging_error}"; then
+            cat "${postpublish_staging_error}" >&2
+            exit 1
+          fi
+          echo "verification_state=verified" >> "${GITHUB_OUTPUT}"
+
+      - name: Reconcile staging state without deleting releases or tags
+        if: ${{ always() && steps.create-draft.outputs.release_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.release-host.outputs.version }}
+          DRAFT_TAG: ${{ steps.preflight.outputs.draft_tag }}
+          DRAFT_RELEASE_ID: ${{ steps.create-draft.outputs.release_id }}
+          PUBLISH_VERIFICATION_STATE: ${{ steps.publish.outputs.verification_state }}
+        run: |
+          set -euo pipefail
+          release_absent=false
+          release_json="${RUNNER_TEMP}/host-release-cleanup.json"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}" > "${release_json}" 2> "${RUNNER_TEMP}/host-release-cleanup.err"; then
+            if grep -q 'HTTP 404' "${RUNNER_TEMP}/host-release-cleanup.err"; then
+              release_absent=true
+            else
+              cat "${RUNNER_TEMP}/host-release-cleanup.err" >&2
+              exit 1
+            fi
+          fi
+
+          if [[ "${release_absent}" == "true" ]]; then
+            echo "Release ${DRAFT_RELEASE_ID} is absent during reconciliation; no automatic mutation was attempted." >&2
+            echo "The release namespace and any claimed tags require manual recovery verification." >&2
+            exit 1
+          fi
+
+          release_tag="$(jq -r '.tag_name' "${release_json}")"
+          is_draft="$(jq -r '.draft' "${release_json}")"
+          if [[ "${is_draft}" == "true" ]]; then
+            if [[ "${release_tag}" != "${DRAFT_TAG}" ]]; then
+              echo "Draft release ${DRAFT_RELEASE_ID} has unexpected tag ${release_tag}; no automatic mutation was attempted." >&2
+              exit 1
+            fi
+            owned_final_tag="${RUNNER_TEMP}/host-release-owned-final-tag"
+            if [[ -f "${owned_final_tag}" ]]; then
+              if [[ "$(< "${owned_final_tag}")" != "${GITHUB_SHA}" ]]; then
+                echo "Claimed final tag ownership marker is invalid; no automatic mutation was attempted." >&2
+                exit 1
+              fi
+              echo "Claimed final tag ${RELEASE_VERSION} may remain and requires manual recovery." >&2
+            fi
+            echo "Automatic release deletion is forbidden; release ${DRAFT_RELEASE_ID} was not deleted." >&2
+            echo "Automatic tag deletion is forbidden; staging and claimed final refs were not deleted." >&2
+            echo "Draft release ${DRAFT_RELEASE_ID} requires manual recovery after ownership and publication state are re-verified." >&2
+            exit 1
+          elif [[ "${release_tag}" == "${RELEASE_VERSION}" ]]; then
+            if [[ "${PUBLISH_VERIFICATION_STATE}" == "verified" ]]; then
+              echo "Verified release ${RELEASE_VERSION} is published; no staging draft remains."
+            else
+              echo "Release ${RELEASE_VERSION} is published-but-unverified; do not consume or promote its assets." >&2
+              echo "Recovery: inspect the immutable state, release attestation, tag commit, deterministic notes, and exact asset digests. Publish a new version if verification cannot be established." >&2
+              exit 1
+            fi
+          else
+            echo "Release ${DRAFT_RELEASE_ID} is published under unexpected tag ${release_tag}; refusing mutation." >&2
             exit 1
           fi

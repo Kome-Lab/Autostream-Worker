@@ -6,7 +6,11 @@ Wants=network-online.target
 [Service]
 User=autostream
 Group=autostream
+# AUTOSTREAM_CONFIG_REVISION is supplied by this root-owned environment file.
 EnvironmentFile=/etc/autostream/worker.env
+# Optional root-owned Control Panel managed bind/revision override. It is loaded
+# after worker.env so AUTOSTREAM_BIND_ADDR and AUTOSTREAM_CONFIG_REVISION win.
+EnvironmentFile=-/opt/autostream/local-executor/ports/worker.env
 ExecStart=/opt/autostream/worker/current/bin/autostream-worker
 Restart=on-failure
 NoNewPrivileges=true

@@ -1,11 +1,87 @@
 package main
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/example/autostream-worker/internal/control"
+	"github.com/example/autostream-worker/internal/httpapi"
 )
+
+func TestWorkerBindAddrFromEnvPreservesLegacyFallbackPort8080(t *testing.T) {
+	t.Setenv("AUTOSTREAM_BIND_ADDR", "")
+
+	got, err := workerBindAddrFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "127.0.0.1:8080" {
+		t.Fatalf("default bind address = %q, want bridge-compatible 127.0.0.1:8080", got)
+	}
+}
+
+func TestWorkerBindAddrFromEnvAcceptsConfigurableUnprivilegedPort(t *testing.T) {
+	for _, value := range []string{
+		"127.0.0.1:1024",
+		"127.0.0.1:18084",
+		"127.0.0.1:65535",
+	} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("AUTOSTREAM_BIND_ADDR", value)
+			got, err := workerBindAddrFromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != value {
+				t.Fatalf("bind address = %q, want %q", got, value)
+			}
+		})
+	}
+}
+
+func TestWorkerBindAddrFromEnvAcceptsIPv6(t *testing.T) {
+	t.Setenv("AUTOSTREAM_BIND_ADDR", "[::1]:18084")
+
+	got, err := workerBindAddrFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "[::1]:18084" {
+		t.Fatalf("bind address = %q, want [::1]:18084", got)
+	}
+}
+
+func TestWorkerBindAddrFromEnvRejectsInvalidOrPrivilegedPort(t *testing.T) {
+	for _, value := range []string{
+		"127.0.0.1",
+		"127.0.0.1:0",
+		"127.0.0.1:1023",
+		"127.0.0.1:65536",
+		"127.0.0.1:not-a-port",
+	} {
+		t.Run(strings.ReplaceAll(value, ":", "_"), func(t *testing.T) {
+			t.Setenv("AUTOSTREAM_BIND_ADDR", value)
+			if _, err := workerBindAddrFromEnv(); err == nil {
+				t.Fatalf("workerBindAddrFromEnv() accepted %q", value)
+			}
+		})
+	}
+}
+
+func TestRequireMatchingUpdaterIdentityRejectsRegistrationIDDrift(t *testing.T) {
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", "")
+	t.Setenv("SERVICE_ID", "worker-authoritative")
+	latch := httpapi.NewUpdaterIdentityLatch(control.ServiceType)
+
+	if err := requireMatchingUpdaterIdentity(latch, "worker-authoritative"); err != nil {
+		t.Fatalf("matching registration identity failed: %v", err)
+	}
+	if err := requireMatchingUpdaterIdentity(latch, "worker-drifted"); !errors.Is(err, httpapi.ErrUpdaterIdentityDrift) {
+		t.Fatalf("registration identity drift error = %v", err)
+	}
+}
 
 func TestWorkerProfileDefaultsFromRuntimeConfigUsesOnlyOwnServiceProfiles(t *testing.T) {
 	cfg := control.RuntimeConfig{

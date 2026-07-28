@@ -53,13 +53,33 @@ func (s *captureCaptionSession) Close(context.Context) error {
 	return nil
 }
 
-func TestUpdaterVersionEndpointIsUnauthenticatedAndReturnsEmbeddedVersionOnly(t *testing.T) {
+func TestUpdaterVersionEndpointIsUnauthenticatedAndReturnsIdentityBoundProbe(t *testing.T) {
 	previousVersion := version.Version
 	version.Version = "v1.1.1"
 	t.Setenv("SERVICE_VERSION", "v9.9.9")
+	t.Setenv("SERVICE_ID", "wrong-fallback")
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "7")
 	t.Cleanup(func() { version.Version = previousVersion })
 
-	server := httptest.NewServer(NewServer("worker", nil, TokenVerifier{PlainToken: "expected"}))
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(configPath, []byte(`panel:
+  url: "https://panel.example.com"
+node:
+  id: "worker-probe-01"
+  name: "Worker Probe"
+  type: "worker"
+api:
+  host: "127.0.0.1"
+  port: 8084
+  ssl_enabled: false
+auth:
+  token: "runtime-token"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
+
+	server := httptest.NewServer(NewServer(control.ServiceType, nil, TokenVerifier{PlainToken: "expected"}))
 	defer server.Close()
 
 	res, err := http.Get(server.URL + "/updater/version")
@@ -73,13 +93,64 @@ func TestUpdaterVersionEndpointIsUnauthenticatedAndReturnsEmbeddedVersionOnly(t 
 	if got := res.Header.Get("Content-Type"); got != "application/json" {
 		t.Fatalf("expected application/json, got %q", got)
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body) != 1 || body["version"] != version.Current() {
+	if len(body) != 4 ||
+		body["version"] != version.Current() ||
+		body["service_id"] != "worker-probe-01" ||
+		body["service_type"] != control.ServiceType ||
+		body["config_revision"] != float64(7) {
 		t.Fatalf("unexpected updater version response: %#v", body)
 	}
+}
+
+func TestConfigRevisionFromEnvValidatesPositiveInteger(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		value   string
+		want    int64
+		wantErr bool
+	}{
+		{name: "default", value: "", want: 1},
+		{name: "one", value: "1", want: 1},
+		{name: "higher", value: "27", want: 27},
+		{name: "zero", value: "0", wantErr: true},
+		{name: "leading zero", value: "01", wantErr: true},
+		{name: "negative", value: "-1", wantErr: true},
+		{name: "fraction", value: "1.5", wantErr: true},
+		{name: "padded", value: " 1 ", wantErr: true},
+		{name: "text", value: "next", wantErr: true},
+		{name: "overflow", value: "9223372036854775808", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AUTOSTREAM_CONFIG_REVISION", tt.value)
+			got, err := ConfigRevisionFromEnv()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ConfigRevisionFromEnv() accepted %q", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("revision = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewServerFailsClosedOnInvalidConfigRevision(t *testing.T) {
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "0")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewServer must reject an invalid AUTOSTREAM_CONFIG_REVISION")
+		}
+	}()
+	_ = NewServer(control.ServiceType, nil, TokenVerifier{})
 }
 
 func TestProtectedEndpointsRejectMissingToken(t *testing.T) {

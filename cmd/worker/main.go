@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,13 +38,20 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	addr := os.Getenv("AUTOSTREAM_BIND_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:8080"
+	addr, err := workerBindAddrFromEnv()
+	if err != nil {
+		log.Fatalf("invalid AUTOSTREAM_BIND_ADDR: %v", err)
+	}
+	updaterIdentity := httpapi.NewUpdaterIdentityLatch(control.ServiceType)
+	if _, err := updaterIdentity.ResolveFromEnv(); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
+		log.Fatalf("invalid updater identity: %v", err)
 	}
 	publisher := buildPublisher()
 
 	controlClient := control.Client{Config: control.ConfigFromEnv()}
+	if err := requireMatchingUpdaterIdentity(updaterIdentity, controlClient.Config.ServiceID); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
+		log.Fatalf("invalid updater identity: %v", err)
+	}
 	manager := jobs.NewManager(publisher, buildReporter(controlClient))
 	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(resolveCtx context.Context, streamID, secretName string) (control.RuntimeSecret, error) {
 		return (control.Client{Config: control.ConfigFromEnv()}).ResolveRuntimeSecret(resolveCtx, streamID, secretName)
@@ -65,7 +74,7 @@ func main() {
 			log.Printf("control panel heartbeat failed: %v", err)
 		})
 	} else if control.NodeConfigPendingFromEnv() {
-		go runPendingControlPanelRegistrationLoop(ctx, manager, requireControlPanelRuntimeConfig())
+		go runPendingControlPanelRegistrationLoop(ctx, manager, requireControlPanelRuntimeConfig(), updaterIdentity)
 	} else if requireControlPanelRuntimeConfig() {
 		if strings.TrimSpace(controlClient.Config.ConfigError) != "" {
 			log.Fatalf("node config invalid: %v", controlClient.Config.ConfigError)
@@ -76,7 +85,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.NewServerWithRuntimeConfig(control.ServiceType, manager, httpapi.TokenVerifierFromEnv(), controlRuntimeConfigFromEnv),
+		Handler:           httpapi.NewServerWithRuntimeConfigAndUpdaterIdentity(control.ServiceType, manager, httpapi.TokenVerifierFromEnv(), controlRuntimeConfigFromEnv, updaterIdentity),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -111,11 +120,32 @@ func main() {
 	}
 }
 
+func workerBindAddrFromEnv() (string, error) {
+	const defaultAddr = "127.0.0.1:8080"
+
+	addr := strings.TrimSpace(os.Getenv("AUTOSTREAM_BIND_ADDR"))
+	if addr == "" {
+		addr = defaultAddr
+	}
+	_, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("must be host:port: %w", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return "", fmt.Errorf("port must be an integer: %w", err)
+	}
+	if port < 1024 || port > 65535 {
+		return "", fmt.Errorf("port %d is outside the supported range 1024-65535", port)
+	}
+	return addr, nil
+}
+
 func controlRuntimeConfigFromEnv(ctx context.Context) (control.RuntimeConfig, error) {
 	return control.Client{Config: control.ConfigFromEnv()}.RuntimeConfig(ctx)
 }
 
-func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.Manager, requireRuntimeConfig bool) {
+func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.Manager, requireRuntimeConfig bool, updaterIdentity *httpapi.UpdaterIdentityLatch) {
 	lastState := ""
 	registeredServiceID := ""
 	for {
@@ -123,6 +153,23 @@ func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.M
 		client := control.Client{Config: cfg}
 		wait := controlPanelRegistrationInterval(cfg)
 		state := ""
+		if err := requireMatchingUpdaterIdentity(updaterIdentity, cfg.ServiceID); err != nil {
+			if errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
+				state = "pending:" + control.NodeConfigPathFromEnv()
+				logRegistrationStateChange(&lastState, state, "node config pending: waiting for %s", control.NodeConfigPathFromEnv())
+				registeredServiceID = ""
+			} else {
+				log.Fatalf("updater identity invalid: %v", err)
+			}
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
 		switch {
 		case strings.TrimSpace(cfg.ConfigError) != "":
 			state = "invalid:" + cfg.ConfigError
@@ -172,6 +219,17 @@ func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.M
 		case <-timer.C:
 		}
 	}
+}
+
+func requireMatchingUpdaterIdentity(latch *httpapi.UpdaterIdentityLatch, serviceID string) error {
+	identity, err := latch.ResolveFromEnv()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(serviceID) != identity.ServiceID {
+		return fmt.Errorf("%w: control client service id does not match the updater identity", httpapi.ErrUpdaterIdentityDrift)
+	}
+	return nil
 }
 
 func controlPanelRegistrationInterval(cfg control.Config) time.Duration {

@@ -37,11 +37,17 @@ func TestConfigFromEnvRejectsWrongNodeType(t *testing.T) {
 func TestConfigFromEnvTreatsMissingNodeConfigAsPending(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "config.yml")
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
-	t.Setenv("CONTROL_PANEL_URL", "")
-	t.Setenv("CONTROL_PANEL_TOKEN", "")
+	t.Setenv("CONTROL_PANEL_URL", "https://legacy-panel.example.jp")
+	t.Setenv("CONTROL_PANEL_TOKEN", "legacy-token")
+	t.Setenv("SERVICE_ID", "legacy-worker")
+	t.Setenv("SERVICE_NAME", "Legacy Worker")
+	t.Setenv("SERVICE_PUBLIC_URL", "https://legacy-worker.example.jp")
 	cfg := ConfigFromEnv()
 	if cfg.ConfigError != "" {
 		t.Fatalf("missing node config should not be fatal: %#v", cfg)
+	}
+	if cfg.ControlPanelURL != "" || cfg.Token != "" || cfg.ServiceID != "" || cfg.ServiceName != "" || cfg.ServicePublicURL != "" {
+		t.Fatalf("configured node path must clear legacy panel identity while pending: %#v", cfg)
 	}
 	if !NodeConfigPendingFromEnv() {
 		t.Fatal("missing node config should be reported as pending")
@@ -50,8 +56,8 @@ func TestConfigFromEnvTreatsMissingNodeConfigAsPending(t *testing.T) {
 		t.Fatalf("runtime token = %q, want empty", got)
 	}
 	t.Setenv("AUTOSTREAM_STREAM_INGEST_SIGNING_KEY", "legacy-env-signing-key")
-	if got := StreamIngestSigningKey(); got != "legacy-env-signing-key" {
-		t.Fatalf("legacy stream ingest signing key fallback = %q", got)
+	if got := StreamIngestSigningKey(); got != "" {
+		t.Fatalf("configured node path must not fall back to the legacy signing key, got %q", got)
 	}
 }
 
