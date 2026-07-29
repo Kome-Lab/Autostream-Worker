@@ -17,13 +17,19 @@ if [[ ${AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS:-} != "1" ]]; then
   exec unshare --mount --propagation private bash -c '
     mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
       autostream-worker-installer-test /usr/local/bin
+    mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
+      autostream-worker-installer-test-opt /opt
     exec env AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS=1 bash "$1"
   ' autostream-worker-installer-test-mount "$0"
 fi
 grep -Eq ' /usr/local/bin .* - tmpfs autostream-worker-installer-test ' \
   /proc/self/mountinfo || die "isolated /usr/local/bin mount is missing"
+grep -Eq ' /opt .* - tmpfs autostream-worker-installer-test-opt ' \
+  /proc/self/mountinfo || die "isolated /opt mount is missing"
 [[ $(stat -c '%U:%G:%a' -- /usr/local/bin) == "root:root:755" ]] || \
   die "could not create an isolated safe /usr/local/bin fixture"
+[[ $(stat -c '%U:%G:%a' -- /opt) == "root:root:755" ]] || \
+  die "could not create an isolated safe /opt fixture"
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly INSTALLER_SOURCE="${SCRIPT_DIR}/install-autostream-worker"
