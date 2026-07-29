@@ -152,6 +152,10 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 			t.Fatalf("Worker installer integration fixture is missing %q", marker)
 		}
 	}
+	const safeAccountReset = "userdel autostream\nif getent group autostream >/dev/null 2>&1; then\n  groupdel autostream\nfi"
+	if count := strings.Count(fixture, safeAccountReset); count != 1 {
+		t.Fatalf("expected one account reset that tolerates userdel removing the private group, got %d", count)
+	}
 }
 
 func TestWorkerInstallerCoversStagingDurabilityAndInterruptedRetry(t *testing.T) {

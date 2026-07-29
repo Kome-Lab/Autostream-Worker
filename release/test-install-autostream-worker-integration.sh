@@ -302,7 +302,9 @@ rmdir \
   /etc/autostream >/dev/null 2>&1 || \
   die "fresh-install reset left an unexpected directory"
 userdel autostream
-groupdel autostream
+if getent group autostream >/dev/null 2>&1; then
+  groupdel autostream
+fi
 [[ ! -e ${MANAGED_ROOT} && ! -L ${MANAGED_ROOT} ]] || \
   die "fresh-install reset retained the managed root"
 if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
