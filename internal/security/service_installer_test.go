@@ -136,6 +136,13 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 	}
 	fixture := string(body)
 	for _, marker := range []string{
+		`AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS`,
+		`autostream-worker-installer-test /usr/local/bin`,
+		`autostream-worker-installer-test-opt /opt`,
+		`isolated /usr/local/bin mount is missing`,
+		`isolated /opt mount is missing`,
+		`could not create an isolated safe /usr/local/bin fixture`,
+		`could not create an isolated safe /opt fixture`,
 		`mount --bind '${FAIL_SYSTEMCTL}' /usr/bin/systemctl`,
 		`daemon-reload failure injection did not reach the commit boundary`,
 		`failed migration did not restore the legacy binary`,
@@ -153,6 +160,14 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 		if !strings.Contains(fixture, marker) {
 			t.Fatalf("Worker installer integration fixture is missing %q", marker)
 		}
+	}
+	namespaceIndex := strings.Index(
+		fixture,
+		`if [[ ${AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS:-} != "1" ]]; then`,
+	)
+	workDirIndex := strings.Index(fixture, `work_dir=""`)
+	if namespaceIndex < 0 || workDirIndex < 0 || namespaceIndex >= workDirIndex {
+		t.Fatal("installer integration fixture must enter its isolated mount namespace before creating mutable state")
 	}
 	const safeAccountReset = "userdel autostream\nif getent group autostream >/dev/null 2>&1; then\n  groupdel autostream\nfi"
 	if count := strings.Count(fixture, safeAccountReset); count != 1 {
