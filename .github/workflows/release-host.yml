@@ -68,6 +68,14 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Check service installer syntax
+        run: |
+          bash -n release/install-autostream-worker
+          bash -n release/test-install-autostream-worker-integration.sh
+
+      - name: Test managed service installer with root-owned Linux fixtures
+        run: sudo bash release/test-install-autostream-worker-integration.sh
+
       - name: Package linux artifacts
         shell: bash
         run: |
@@ -86,6 +94,8 @@ jobs:
             cp .env.example "${root}/.env.example"
             cp systemd/*.service.example "${root}/systemd/"
             cp release/README.install.md "${root}/README.install.md"
+            cp release/install-autostream-worker "${root}/install-autostream-worker"
+            chmod 0755 "${root}/install-autostream-worker"
             (cd "${root}" && find . -type f ! -path './checksums.txt' -print0 | sort -z | xargs -0 sha256sum > checksums.txt)
             tar -C staging -czf "artifacts/${artifact}.tar.gz" "${artifact}"
             (cd artifacts && sha256sum "${artifact}.tar.gz" > "${artifact}.tar.gz.sha256")
@@ -480,6 +490,14 @@ jobs:
           jq -S '[.[] | {name, size, digest}]' \
             "${uploaded_assets}" > "${uploaded_projection}"
           diff -u "${RUNNER_TEMP}/host-release-expected-assets.json" "${uploaded_projection}"
+
+      - name: Attest Worker archives
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            artifacts/autostream-worker_${{ needs.release-host.outputs.version }}_linux_amd64.tar.gz
+            artifacts/autostream-worker_${{ needs.release-host.outputs.version }}_linux_arm64.tar.gz
+          create-storage-record: false
 
       - name: Attest release manifest
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0

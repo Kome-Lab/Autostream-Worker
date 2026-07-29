@@ -15,5 +15,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.mod
+      - name: Check service installer syntax
+        run: |
+          bash -n release/install-autostream-worker
+          bash -n release/test-install-autostream-worker-integration.sh
+      - name: Test managed service installer with root-owned Linux fixtures
+        run: sudo bash release/test-install-autostream-worker-integration.sh
       - run: go test ./...
       - run: go build ./...

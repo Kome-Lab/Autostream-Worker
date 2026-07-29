@@ -1,0 +1,1137 @@
+#!/bin/bash
+set -euo pipefail
+
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+
+readonly SERVICE_NAME="worker"
+readonly ARTIFACT_PREFIX="autostream-worker"
+readonly MANIFEST_SERVICE="${SERVICE_NAME}"
+readonly MANAGED_ROOT="/opt/autostream/worker"
+readonly RELEASES_DIR="${MANAGED_ROOT}/releases"
+readonly CURRENT_LINK="${MANAGED_ROOT}/current"
+readonly PUBLIC_BINARY="/usr/local/bin/autostream-worker"
+readonly PUBLIC_ALIAS="/usr/local/bin/worker"
+readonly ENV_DEST="/etc/autostream/worker.env"
+readonly UNIT_DEST="/etc/systemd/system/autostream-worker.service"
+readonly UNIT_NAME="autostream-worker.service"
+readonly STATE_DIR="/var/lib/autostream/worker"
+readonly INSTALL_MIGRATION_ROOT="/var/backups/autostream/install-migrations"
+readonly LEGACY_BACKUP_ROOT="${INSTALL_MIGRATION_ROOT}/worker"
+
+die() {
+  printf 'install-autostream-worker: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ ${EUID} -eq 0 ]] || die "must run as root (use sudo)"
+[[ $# -eq 0 ]] || die "this installer does not accept arguments"
+
+for command in \
+  awk basename chmod chown cmp cp dirname find flock getent grep groupadd id install jq \
+  ln mktemp mv readlink rm runuser sha256sum sort stat sync systemctl tar uname \
+  useradd wc; do
+  command -v "${command}" >/dev/null 2>&1 || die "required command is unavailable: ${command}"
+done
+
+service_was_active=false
+if systemctl is-active --quiet "${UNIT_NAME}"; then
+  service_was_active=true
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || \
+  die "could not resolve the installer directory"
+[[ -n ${SCRIPT_DIR} && ${SCRIPT_DIR} == /* && -d ${SCRIPT_DIR} && ! -L ${SCRIPT_DIR} ]] || \
+  die "installer directory is missing or unsafe"
+readonly SCRIPT_DIR
+ARTIFACT_ID="$(basename -- "${SCRIPT_DIR}")" || \
+  die "could not resolve the artifact directory name"
+[[ -n ${ARTIFACT_ID} && ${ARTIFACT_ID} != */* ]] || \
+  die "artifact directory name is empty or unsafe"
+readonly ARTIFACT_ID
+readonly ARTIFACT_PATTERN="^${ARTIFACT_PREFIX}_(v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?)_linux_(amd64|arm64)$"
+if [[ ! ${ARTIFACT_ID} =~ ${ARTIFACT_PATTERN} ]]; then
+  die "the extracted directory name is invalid: ${ARTIFACT_ID}"
+fi
+readonly VERSION="${BASH_REMATCH[1]}"
+readonly ARCH="${BASH_REMATCH[3]}"
+
+case "$(uname -m)" in
+  x86_64) readonly HOST_ARCH="amd64" ;;
+  aarch64|arm64) readonly HOST_ARCH="arm64" ;;
+  *) die "unsupported host architecture: $(uname -m)" ;;
+esac
+[[ ${ARCH} == "${HOST_ARCH}" ]] || \
+  die "artifact architecture ${ARCH} does not match host ${HOST_ARCH}"
+
+ARTIFACT_PARENT="$(dirname -- "${SCRIPT_DIR}")" || \
+  die "could not resolve the artifact parent directory"
+[[ -n ${ARTIFACT_PARENT} && ${ARTIFACT_PARENT} == /* &&
+  -d ${ARTIFACT_PARENT} && ! -L ${ARTIFACT_PARENT} ]] || \
+  die "artifact parent directory is missing or unsafe"
+readonly ARTIFACT_PARENT
+readonly ARCHIVE_NAME="${ARTIFACT_ID}.tar.gz"
+readonly ARCHIVE_SOURCE="${ARTIFACT_PARENT}/${ARCHIVE_NAME}"
+readonly ARCHIVE_CHECKSUM_SOURCE="${ARCHIVE_SOURCE}.sha256"
+readonly MANIFEST_SOURCE="${ARTIFACT_PARENT}/release-manifest.json"
+readonly MANIFEST_CHECKSUM_SOURCE="${ARTIFACT_PARENT}/release-manifest.json.sha256"
+
+for source in \
+  "${ARCHIVE_SOURCE}" \
+  "${ARCHIVE_CHECKSUM_SOURCE}" \
+  "${MANIFEST_SOURCE}" \
+  "${MANIFEST_CHECKSUM_SOURCE}"; do
+  [[ -f ${source} && ! -L ${source} ]] || \
+    die "required verified release file is missing or unsafe: ${source}"
+done
+
+verify_root_permission_boundary() {
+  local path=$1
+  local mode
+
+  [[ -d ${path} && ! -L ${path} ]] || \
+    die "permission boundary is missing or unsafe: ${path}"
+  [[ $(readlink -f -- "${path}") == "${path}" ]] || \
+    die "permission boundary must resolve to its canonical path: ${path}"
+  [[ $(stat -c '%U:%G' -- "${path}") == "root:root" ]] || \
+    die "permission boundary must be owned by root:root: ${path}"
+  mode="$(stat -c '%a' -- "${path}")"
+  (( (8#${mode} & 0022) == 0 )) || \
+    die "permission boundary must not be group/other writable: ${path}"
+}
+
+verify_existing_root_permission_boundary() {
+  local path=$1
+
+  if [[ -e ${path} || -L ${path} ]]; then
+    verify_root_permission_boundary "${path}"
+  fi
+}
+
+verify_root_sticky_temp_boundary() {
+  local path=$1
+  local mode
+
+  [[ -d ${path} && ! -L ${path} ]] || \
+    die "temporary-file boundary is missing or unsafe: ${path}"
+  [[ $(readlink -f -- "${path}") == "${path}" ]] || \
+    die "temporary-file boundary must resolve to its canonical path: ${path}"
+  [[ $(stat -c '%U:%G' -- "${path}") == "root:root" ]] || \
+    die "temporary-file boundary must be owned by root:root: ${path}"
+  mode="$(stat -c '%a' -- "${path}")"
+  (( (8#${mode} & 01000) != 0 )) || \
+    die "temporary-file boundary must have the sticky bit set: ${path}"
+}
+
+verify_existing_worker_state_directory() {
+  local state_mode
+
+  if [[ ! -e ${STATE_DIR} && ! -L ${STATE_DIR} ]]; then
+    return 0
+  fi
+  [[ -d ${STATE_DIR} && ! -L ${STATE_DIR} ]] || \
+    die "Worker state path must be a non-symlink directory"
+  [[ $(readlink -f -- "${STATE_DIR}") == "${STATE_DIR}" ]] || \
+    die "Worker state path must resolve to its canonical path"
+  [[ $(stat -c '%U:%G' -- "${STATE_DIR}") == "autostream:autostream" ]] || \
+    die "Worker state path has unexpected ownership"
+  state_mode="$(stat -c '%a' -- "${STATE_DIR}")"
+  (( (8#${state_mode} & 07022) == 0 )) || \
+    die "Worker state path has unsafe write or special mode bits"
+}
+
+for boundary in \
+  /opt \
+  /usr \
+  /usr/local \
+  /usr/local/bin \
+  /etc \
+  /etc/systemd \
+  /etc/systemd/system \
+  /var \
+  /var/lib \
+  /run; do
+  verify_root_permission_boundary "${boundary}"
+done
+verify_root_sticky_temp_boundary /var/tmp
+for boundary in \
+  /opt/autostream \
+  "${MANAGED_ROOT}" \
+  "${RELEASES_DIR}" \
+  /var/lib/autostream \
+  /etc/autostream \
+  /var/backups \
+  /var/backups/autostream \
+  "${INSTALL_MIGRATION_ROOT}" \
+  "${LEGACY_BACKUP_ROOT}" \
+  /run/autostream-updater; do
+  verify_existing_root_permission_boundary "${boundary}"
+done
+verify_existing_worker_state_directory
+
+input_stage=""
+if ! input_stage="$(mktemp -d /var/tmp/autostream-worker-install.XXXXXXXX)"; then
+  die "failed to create input staging directory"
+fi
+[[ -n ${input_stage} ]] || die "mktemp returned an empty input staging path"
+[[ ${input_stage} == /var/tmp/autostream-worker-install.* &&
+  $(dirname -- "${input_stage}") == "/var/tmp" &&
+  -d ${input_stage} && ! -L ${input_stage} &&
+  $(readlink -f -- "${input_stage}") == "${input_stage}" &&
+  $(stat -c '%U:%G:%a' -- "${input_stage}") == "root:root:700" ]] || \
+  die "mktemp returned an unsafe input staging directory"
+readonly INPUT_STAGE="${input_stage}"
+readonly UNPACK_DIR="${INPUT_STAGE}/unpack"
+managed_candidate=""
+installation_committed=false
+current_changed=false
+previous_current_target=""
+unit_installed=false
+previous_unit_exists=false
+previous_unit_mode=""
+previous_unit_identity=""
+previous_unit_sha256=""
+legacy_unit_needs_backup=false
+created_env=false
+created_env_identity=""
+created_env_sha256=""
+preserve_input_stage=false
+declare -a changed_public_paths=()
+declare -a previous_public_kinds=()
+declare -a previous_public_targets=()
+declare -a previous_public_recoveries=()
+declare -A interrupted_public_backups=()
+legacy_backup_stage=""
+declare -a mutated_filesystem_parents=("/var/tmp" "${INPUT_STAGE}")
+
+record_mutated_parent() {
+  local parent=$1
+  local recorded
+
+  for recorded in "${mutated_filesystem_parents[@]}"; do
+    [[ ${recorded} == "${parent}" ]] && return 0
+  done
+  mutated_filesystem_parents+=("${parent}")
+}
+
+sync_installation_parents() {
+  local parent
+
+  for parent in "${mutated_filesystem_parents[@]}"; do
+    [[ -d ${parent} && ! -L ${parent} ]] || \
+      die "mutated filesystem parent is missing or unsafe before commit: ${parent}"
+    sync -f "${parent}" || \
+      die "failed to sync filesystem parent before commit: ${parent}"
+  done
+}
+
+best_effort_sync_mutated_parents() {
+  local parent
+  local failed=false
+
+  for parent in "${mutated_filesystem_parents[@]}"; do
+    if [[ -d ${parent} && ! -L ${parent} ]]; then
+      sync -f "${parent}" || failed=true
+    fi
+  done
+  [[ ${failed} == false ]]
+}
+
+rollback_public_links() {
+  local index
+  local path
+  local kind
+  local target
+  local recovery
+  local rollback_next
+  local expected_digest
+  local failed=false
+
+  for ((index=${#changed_public_paths[@]} - 1; index >= 0; index--)); do
+    path="${changed_public_paths[index]}"
+    kind="${previous_public_kinds[index]}"
+    target="${previous_public_targets[index]}"
+    recovery="${previous_public_recoveries[index]}"
+    case "${kind}" in
+      regular)
+        if [[ ! -f ${recovery} || -L ${recovery} ]]; then
+          failed=true
+          continue
+        fi
+        expected_digest="$(sha256sum -- "${recovery}" | awk 'NR == 1 { print $1 }')"
+        rollback_next="${path}.rollback.$$"
+        rm -f -- "${rollback_next}" || failed=true
+        if cp -a -- "${recovery}" "${rollback_next}"; then
+          mv -Tf -- "${rollback_next}" "${path}" || failed=true
+        else
+          failed=true
+        fi
+        [[ -f ${path} &&
+          ! -L ${path} &&
+          $(sha256sum -- "${path}" | awk 'NR == 1 { print $1 }') == "${expected_digest}" ]] || \
+          failed=true
+        ;;
+      symlink)
+        rollback_next="${path}.rollback.$$"
+        rm -f -- "${rollback_next}" || failed=true
+        ln -s -- "${target}" "${rollback_next}" || failed=true
+        if [[ -L ${rollback_next} ]]; then
+          mv -Tf -- "${rollback_next}" "${path}" || failed=true
+        fi
+        [[ -L ${path} && $(readlink -- "${path}") == "${target}" ]] || failed=true
+        ;;
+      absent)
+        rm -f -- "${path}" || failed=true
+        [[ ! -e ${path} && ! -L ${path} ]] || failed=true
+        ;;
+    esac
+    sync -f "$(dirname -- "${path}")" || failed=true
+  done
+  [[ ${failed} == false ]]
+}
+
+rollback_current_link() {
+  local rollback_next
+  local failed=false
+
+  [[ ${current_changed} == true ]] || return 0
+  if [[ -n ${previous_current_target} ]]; then
+    rollback_next="${MANAGED_ROOT}/.current.rollback.$$"
+    rm -f -- "${rollback_next}" || failed=true
+    ln -s -- "${previous_current_target}" "${rollback_next}" || failed=true
+    if [[ -L ${rollback_next} ]]; then
+      mv -Tf -- "${rollback_next}" "${CURRENT_LINK}" || failed=true
+    fi
+    [[ -L ${CURRENT_LINK} &&
+      $(readlink -- "${CURRENT_LINK}") == "${previous_current_target}" ]] || \
+      failed=true
+  else
+    rm -f -- "${CURRENT_LINK}" || failed=true
+    [[ ! -e ${CURRENT_LINK} && ! -L ${CURRENT_LINK} ]] || failed=true
+  fi
+  sync -f "${MANAGED_ROOT}" || failed=true
+  [[ ${failed} == false ]]
+}
+
+rollback_unit_and_environment() {
+  local unit_rollback_next
+  local unit_recovered=true
+  local failed=false
+
+  if [[ ${unit_installed} == true ]]; then
+    if [[ ${previous_unit_exists} == true ]]; then
+      unit_recovered=false
+      unit_rollback_next="${UNIT_DEST}.rollback.$$"
+      rm -f -- "${unit_rollback_next}" || failed=true
+      if [[ -f ${INPUT_STAGE}/previous-autostream-worker.service &&
+        ! -L ${INPUT_STAGE}/previous-autostream-worker.service ]] &&
+        install -o root -g root -m "${previous_unit_mode}" \
+          "${INPUT_STAGE}/previous-autostream-worker.service" \
+          "${unit_rollback_next}" &&
+        mv -Tf -- "${unit_rollback_next}" "${UNIT_DEST}" &&
+        [[ -f ${UNIT_DEST} &&
+          ! -L ${UNIT_DEST} &&
+          $(stat -c '%U:%G:%a' -- "${UNIT_DEST}") == \
+            "root:root:${previous_unit_mode}" &&
+          $(sha256sum -- "${UNIT_DEST}" | awk 'NR == 1 { print $1 }') == \
+            "${previous_unit_sha256}" ]]; then
+        unit_recovered=true
+      else
+        failed=true
+      fi
+    else
+      rm -f -- "${UNIT_DEST}" || failed=true
+      [[ ! -e ${UNIT_DEST} && ! -L ${UNIT_DEST} ]] || {
+        unit_recovered=false
+        failed=true
+      }
+    fi
+    if [[ ${unit_recovered} == true ]]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+  elif [[ ${previous_unit_exists} == true ]]; then
+    [[ -f ${UNIT_DEST} &&
+      ! -L ${UNIT_DEST} &&
+      $(stat -c '%U:%G:%a' -- "${UNIT_DEST}") == \
+        "root:root:${previous_unit_mode}" &&
+      $(sha256sum -- "${UNIT_DEST}" | awk 'NR == 1 { print $1 }') == \
+        "${previous_unit_sha256}" ]] || {
+      unit_recovered=false
+      failed=true
+    }
+  fi
+  rm -f -- "${UNIT_DEST}.next.$$" || failed=true
+  sync -f /etc/systemd/system || failed=true
+
+  if [[ ${created_env} == true ]]; then
+    if [[ -f ${ENV_DEST} &&
+      ! -L ${ENV_DEST} &&
+      $(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${ENV_DEST}") == "${created_env_identity}" &&
+      $(sha256sum -- "${ENV_DEST}" | awk 'NR == 1 { print $1 }') == "${created_env_sha256}" ]]; then
+      rm -f -- "${ENV_DEST}" || failed=true
+      [[ ! -e ${ENV_DEST} && ! -L ${ENV_DEST} ]] || failed=true
+    else
+      printf 'install-autostream-worker: preserving environment file modified during failed installation: %s\n' \
+        "${ENV_DEST}" >&2
+    fi
+  fi
+  rm -f -- "${ENV_DEST}.next.$$" || failed=true
+  sync -f /etc/autostream || failed=true
+  if [[ ${unit_recovered} != true ]]; then
+    preserve_input_stage=true
+  fi
+  [[ ${failed} == false ]]
+}
+
+cleanup() {
+  local original_status=$?
+  set +e
+  local rollback_failed=false
+
+  if [[ ${installation_committed} != true ]]; then
+    rollback_public_links || rollback_failed=true
+    rollback_current_link || rollback_failed=true
+    rollback_unit_and_environment || rollback_failed=true
+  fi
+  best_effort_sync_mutated_parents || rollback_failed=true
+  if [[ ${rollback_failed} == true ]]; then
+    preserve_input_stage=true
+  fi
+  if [[ -n ${managed_candidate} && -e ${managed_candidate} ]]; then
+    rm -rf -- "${managed_candidate}" || rollback_failed=true
+  fi
+  if [[ -n ${legacy_backup_stage} ]]; then
+    rm -f -- "${legacy_backup_stage}" || rollback_failed=true
+  fi
+  if [[ ${preserve_input_stage} == true ]]; then
+    printf 'install-autostream-worker: preserved recovery files at %s\n' \
+      "${INPUT_STAGE}" >&2
+  else
+    rm -rf -- "${INPUT_STAGE}" || rollback_failed=true
+  fi
+  best_effort_sync_mutated_parents || rollback_failed=true
+  if [[ ${rollback_failed} == true ]]; then
+    printf 'install-autostream-worker: one or more cleanup operations failed; inspect host state before retrying\n' >&2
+  fi
+  return "${original_status}"
+}
+trap cleanup EXIT
+install -d -o root -g root -m 0700 "${UNPACK_DIR}"
+record_mutated_parent "${UNPACK_DIR}"
+
+copy_stable_source() {
+  local source=$1
+  local destination=$2
+  local identity
+  local digest
+
+  identity="$(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${source}")"
+  digest="$(sha256sum -- "${source}" | awk 'NR == 1 { print $1 }')"
+  install -o root -g root -m 0600 "${source}" "${destination}"
+  [[ -f ${source} && ! -L ${source} ]] || \
+    die "release source changed while being staged: ${source}"
+  [[ $(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${source}") == "${identity}" ]] || \
+    die "release source identity changed while being staged: ${source}"
+  [[ $(sha256sum -- "${source}" | awk 'NR == 1 { print $1 }') == "${digest}" ]] || \
+    die "release source content changed while being staged: ${source}"
+  [[ $(sha256sum -- "${destination}" | awk 'NR == 1 { print $1 }') == "${digest}" ]] || \
+    die "staged release file differs from its source: ${source}"
+}
+
+ensure_root_directory() {
+  local path=$1
+  local requested_mode=$2
+  local expected_mode="${requested_mode#0}"
+  local existing_mode
+
+  if [[ -e ${path} || -L ${path} ]]; then
+    [[ -d ${path} && ! -L ${path} ]] || \
+      die "root-owned directory path is unsafe: ${path}"
+    [[ $(stat -c '%U:%G' -- "${path}") == "root:root" ]] || \
+      die "root-owned directory has unexpected ownership: ${path}"
+    existing_mode="$(stat -c '%a' -- "${path}")"
+    (( (8#${existing_mode} & 0022) == 0 )) || \
+      die "root-owned directory is group/other writable: ${path}"
+  fi
+  install -d -o root -g root -m "${requested_mode}" "${path}"
+  [[ $(stat -c '%U:%G:%a' -- "${path}") == "root:root:${expected_mode}" ]] || \
+    die "root-owned directory mode verification failed: ${path}"
+  [[ $(readlink -f -- "${path}") == "${path}" ]] || \
+    die "root-owned directory must resolve to its exact canonical path: ${path}"
+}
+
+copy_stable_source "${ARCHIVE_SOURCE}" "${INPUT_STAGE}/${ARCHIVE_NAME}"
+copy_stable_source "${ARCHIVE_CHECKSUM_SOURCE}" "${INPUT_STAGE}/${ARCHIVE_NAME}.sha256"
+copy_stable_source "${MANIFEST_SOURCE}" "${INPUT_STAGE}/release-manifest.json"
+copy_stable_source "${MANIFEST_CHECKSUM_SOURCE}" "${INPUT_STAGE}/release-manifest.json.sha256"
+
+verify_checksum_file() {
+  local checksum_path=$1
+  local expected_name=$2
+  local declared_name
+
+  [[ $(wc -l < "${checksum_path}") -eq 1 ]] || \
+    die "checksum file must contain exactly one line: ${checksum_path}"
+  grep -Eq '^[0-9a-f]{64}  [^/[:space:]]+$' "${checksum_path}" || \
+    die "checksum file has an invalid format: ${checksum_path}"
+  declared_name="$(awk 'NR == 1 { print $2 }' "${checksum_path}")"
+  [[ ${declared_name} == "${expected_name}" ]] || \
+    die "checksum file names ${declared_name}, expected ${expected_name}"
+}
+
+verify_checksum_file "${INPUT_STAGE}/${ARCHIVE_NAME}.sha256" "${ARCHIVE_NAME}"
+verify_checksum_file "${INPUT_STAGE}/release-manifest.json.sha256" "release-manifest.json"
+(cd -- "${INPUT_STAGE}" && sha256sum --check --strict "${ARCHIVE_NAME}.sha256")
+(cd -- "${INPUT_STAGE}" && sha256sum --check --strict release-manifest.json.sha256)
+
+ARTIFACT_SHA256="$(
+  sha256sum -- "${INPUT_STAGE}/${ARCHIVE_NAME}" | awk 'NR == 1 { print $1 }'
+)" || die "could not calculate the artifact SHA-256 digest"
+[[ ${ARTIFACT_SHA256} =~ ^[0-9a-f]{64}$ ]] || \
+  die "could not calculate a valid artifact SHA-256 digest"
+readonly ARTIFACT_SHA256
+ARTIFACT_SIZE="$(stat -c %s -- "${INPUT_STAGE}/${ARCHIVE_NAME}")" || \
+  die "could not calculate the artifact size"
+[[ ${ARTIFACT_SIZE} =~ ^[1-9][0-9]*$ ]] || \
+  die "could not calculate a positive artifact size"
+readonly ARTIFACT_SIZE
+jq -e \
+  --arg version "${VERSION}" \
+  --arg prefix "${ARTIFACT_PREFIX}" \
+  --arg service "${MANIFEST_SERVICE}" \
+  --arg arch "${ARCH}" \
+  --arg name "${ARCHIVE_NAME}" \
+  --arg sha256 "${ARTIFACT_SHA256}" \
+  --argjson size "${ARTIFACT_SIZE}" \
+  '((keys | sort) ==
+     ["channel", "components", "minimum_agent_version", "published_at", "release_id", "schema_version"]) and
+   (.schema_version == 1) and
+   (.release_id == $version) and
+   (.channel == "host") and
+   (.published_at | type == "string" and
+     test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+   (.minimum_agent_version | type == "string" and
+     test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+   (.components | type == "array" and length == 1) and
+   (.components[0] | type == "object") and
+   ((.components[0] | keys | sort) ==
+     ["artifacts", "commit", "database_schema", "rollback_compatible", "service", "source_version"]) and
+   (.components[0].service == $service) and
+   (.components[0].source_version == $version) and
+   (.components[0].commit | type == "string" and test("^[0-9a-f]{40}$")) and
+   (.components[0].rollback_compatible == true) and
+   (.components[0].database_schema == "none") and
+   (.components[0].artifacts | type == "array" and length == 2) and
+   ([.components[0].artifacts[].arch] | sort == ["amd64", "arm64"]) and
+   (all(.components[0].artifacts[];
+     (type == "object") and
+     ((keys | sort) == ["arch", "name", "os", "sha256", "size"]) and
+     (.os == "linux") and
+     (.arch == "amd64" or .arch == "arm64") and
+     (.name == ($prefix + "_" + $version + "_linux_" + .arch + ".tar.gz")) and
+     (.size | type == "number" and . > 0 and . <= 268435456) and
+     (.sha256 | type == "string" and test("^[0-9a-f]{64}$")))) and
+   ([.components[0].artifacts[] |
+      select(.arch == $arch and
+             .name == $name and
+             .sha256 == $sha256 and
+             .size == $size)] | length == 1)' \
+  "${INPUT_STAGE}/release-manifest.json" >/dev/null || \
+  die "release-manifest.json does not authorize this exact artifact"
+
+tar -tzf "${INPUT_STAGE}/${ARCHIVE_NAME}" > "${INPUT_STAGE}/archive.list"
+[[ -s ${INPUT_STAGE}/archive.list ]] || die "release archive is empty"
+while IFS= read -r entry; do
+  [[ ${entry} =~ ^[A-Za-z0-9._/-]+$ ]] || \
+    die "release archive contains an unsafe path: ${entry}"
+  [[ ${entry} == "${ARTIFACT_ID}" ||
+    ${entry} == "${ARTIFACT_ID}/" ||
+    ${entry} == "${ARTIFACT_ID}/"* ]] || \
+    die "release archive contains a path outside ${ARTIFACT_ID}: ${entry}"
+  [[ ${entry} != /* &&
+    ${entry} != ../* &&
+    ${entry} != *"/../"* &&
+    ${entry} != *"/.." ]] || \
+    die "release archive contains an unsafe path: ${entry}"
+done < "${INPUT_STAGE}/archive.list"
+duplicate_paths="$(sort "${INPUT_STAGE}/archive.list" | uniq -d)"
+[[ -z ${duplicate_paths} ]] || die "release archive contains duplicate paths"
+while IFS= read -r entry; do
+  case "${entry:0:1}" in
+    -|d) ;;
+    *) die "release archive contains a symlink, hardlink, or other unsupported entry" ;;
+  esac
+done < <(tar -tvzf "${INPUT_STAGE}/${ARCHIVE_NAME}")
+
+tar --no-same-owner --no-same-permissions \
+  -xzf "${INPUT_STAGE}/${ARCHIVE_NAME}" \
+  -C "${UNPACK_DIR}"
+readonly EXTRACTED_ROOT="${UNPACK_DIR}/${ARTIFACT_ID}"
+[[ -d ${EXTRACTED_ROOT} && ! -L ${EXTRACTED_ROOT} ]] || \
+  die "release archive root is missing or unsafe"
+[[ -z $(find "${UNPACK_DIR}" -mindepth 1 -maxdepth 1 ! -name "${ARTIFACT_ID}" -print -quit) ]] || \
+  die "release archive contains more than one top-level path"
+[[ -z $(find "${EXTRACTED_ROOT}" -type l -print -quit) ]] || \
+  die "release archive must not contain symlinks"
+for reserved_marker in .artifact-sha256 .version; do
+  [[ ! -e ${EXTRACTED_ROOT}/${reserved_marker} &&
+    ! -L ${EXTRACTED_ROOT}/${reserved_marker} ]] || \
+    die "release archive must not provide ${reserved_marker}"
+done
+
+find "${EXTRACTED_ROOT}" -type d -exec chmod 0755 {} +
+find "${EXTRACTED_ROOT}" -type f -exec chmod 0644 {} +
+for executable in \
+  "${EXTRACTED_ROOT}/bin/autostream-worker" \
+  "${EXTRACTED_ROOT}/bin/worker" \
+  "${EXTRACTED_ROOT}/install-autostream-worker"; do
+  [[ -f ${executable} && ! -L ${executable} ]] || \
+    die "required executable is missing or unsafe: ${executable#${EXTRACTED_ROOT}/}"
+  chmod 0755 "${executable}"
+done
+
+[[ -f ${EXTRACTED_ROOT}/checksums.txt && ! -L ${EXTRACTED_ROOT}/checksums.txt ]] || \
+  die "release checksums.txt is missing or unsafe"
+while IFS= read -r checksum_entry; do
+  [[ ${checksum_entry} =~ ^[0-9a-f]{64}\ \ (.+)$ ]] || \
+    die "inner checksum entry has an invalid format"
+  checked_path="${BASH_REMATCH[1]}"
+  [[ ${checked_path} != /* &&
+    ${checked_path} != ../* &&
+    ${checked_path} != *"/../"* &&
+    ${checked_path} != *"/.." ]] || \
+    die "inner checksum entry has an unsafe path"
+  [[ -f ${EXTRACTED_ROOT}/${checked_path} && ! -L ${EXTRACTED_ROOT}/${checked_path} ]] || \
+    die "inner checksum entry does not name a regular file: ${checked_path}"
+done < "${EXTRACTED_ROOT}/checksums.txt"
+(cd -- "${EXTRACTED_ROOT}" && sha256sum --check --strict checksums.txt)
+
+for required in \
+  ".env.example" \
+  "systemd/autostream-worker.service.example" \
+  "install-autostream-worker"; do
+  [[ -f ${EXTRACTED_ROOT}/${required} && ! -L ${EXTRACTED_ROOT}/${required} ]] || \
+    die "required release file is missing or unsafe: ${required}"
+done
+grep -Fx -- "ExecStart=${PUBLIC_BINARY}" \
+  "${EXTRACTED_ROOT}/systemd/autostream-worker.service.example" >/dev/null || \
+  die "Worker systemd unit does not use the stable public binary path"
+cmp -s \
+  "${EXTRACTED_ROOT}/bin/autostream-worker" \
+  "${EXTRACTED_ROOT}/bin/worker" || \
+  die "worker binary aliases in the release do not match"
+"${EXTRACTED_ROOT}/bin/autostream-worker" --version |
+  grep -Fx -- "autostream-worker ${VERSION}" >/dev/null || \
+  die "Worker binary version does not match ${VERSION}"
+
+record_mutated_parent /run
+ensure_root_directory /run/autostream-updater 0700
+record_mutated_parent /run/autostream-updater
+target_lock_id=""
+if ! target_lock_id="$(
+  printf '%s' "${UNIT_NAME}" |
+    sha256sum |
+    awk 'NR == 1 { print substr($1, 1, 12) }'
+)"; then
+  die "could not derive the updater target lock identifier"
+fi
+[[ ${target_lock_id} =~ ^[0-9a-f]{12}$ ]] || \
+  die "could not derive the updater target lock identifier"
+readonly TARGET_LOCK_ID="${target_lock_id}"
+readonly TARGET_LOCK="/run/autostream-updater/.autostream-updater-${TARGET_LOCK_ID}.lock"
+if [[ -e ${TARGET_LOCK} || -L ${TARGET_LOCK} ]]; then
+  [[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} ]] || \
+    die "updater target lock path is unsafe"
+  [[ $(stat -c '%U:%G' -- "${TARGET_LOCK}") == "root:root" ]] || \
+    die "updater target lock must be owned by root:root"
+  target_lock_mode="$(stat -c '%a' -- "${TARGET_LOCK}")"
+  (( (8#${target_lock_mode} & 0077) == 0 )) || \
+    die "updater target lock must not grant group/other permissions"
+fi
+exec 9>"${TARGET_LOCK}"
+chown root:root "${TARGET_LOCK}"
+chmod 0600 "${TARGET_LOCK}"
+[[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} &&
+  $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" &&
+  $(stat -Lc '%d:%i' -- /proc/self/fd/9) == \
+    "$(stat -c '%d:%i' -- "${TARGET_LOCK}")" ]] || \
+  die "updater target lock identity changed while being opened"
+flock -n 9 || die "another privileged update is already active for ${UNIT_NAME}"
+
+record_mutated_parent /etc
+record_mutated_parent /var/lib
+if ! getent group autostream >/dev/null; then
+  groupadd --system autostream
+fi
+if ! id autostream >/dev/null 2>&1; then
+  useradd --system --gid autostream --home-dir /var/lib/autostream \
+    --no-create-home --shell /usr/sbin/nologin autostream
+fi
+[[ $(id -u autostream) -ne 0 ]] || die "autostream service account must not be root"
+[[ $(id -gn autostream) == "autostream" ]] || \
+  die "autostream service account must use the autostream primary group"
+
+[[ ! -L /opt/autostream ]] || die "/opt/autostream must not be a symlink"
+record_mutated_parent /opt
+install -d -o root -g root -m 0755 /opt/autostream
+[[ ! -L ${MANAGED_ROOT} ]] || die "managed root must not be a symlink"
+[[ ! -L ${RELEASES_DIR} ]] || die "managed releases path must not be a symlink"
+record_mutated_parent /opt/autostream
+record_mutated_parent "${MANAGED_ROOT}"
+install -d -o root -g root -m 0755 "${MANAGED_ROOT}" "${RELEASES_DIR}"
+record_mutated_parent "${RELEASES_DIR}"
+[[ ! -L /var/lib/autostream ]] || die "/var/lib/autostream must not be a symlink"
+record_mutated_parent /var/lib
+install -d -o root -g root -m 0755 /var/lib/autostream
+verify_existing_worker_state_directory
+record_mutated_parent /var/lib/autostream
+install -d -o autostream -g autostream -m 0750 "${STATE_DIR}"
+[[ $(stat -c '%U:%G:%a' -- "${STATE_DIR}") == "autostream:autostream:750" ]] || \
+  die "Worker state path ownership or mode is invalid"
+record_mutated_parent /var
+ensure_root_directory /var/backups 0755
+record_mutated_parent /var/backups
+ensure_root_directory /var/backups/autostream 0700
+record_mutated_parent /var/backups/autostream
+ensure_root_directory "${INSTALL_MIGRATION_ROOT}" 0700
+record_mutated_parent "${INSTALL_MIGRATION_ROOT}"
+ensure_root_directory "${LEGACY_BACKUP_ROOT}" 0700
+record_mutated_parent "${LEGACY_BACKUP_ROOT}"
+LEGACY_BACKUP_ROOT_IDENTITY=$(
+  stat -c '%d:%i:%u:%g:%a' -- "${LEGACY_BACKUP_ROOT}"
+) || die "could not capture the legacy backup root identity"
+[[ ${LEGACY_BACKUP_ROOT_IDENTITY} =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-7]+$ ]] || \
+  die "legacy backup root identity is invalid"
+readonly LEGACY_BACKUP_ROOT_IDENTITY
+
+verify_legacy_backup_root() {
+  [[ -d ${LEGACY_BACKUP_ROOT} && ! -L ${LEGACY_BACKUP_ROOT} ]] || \
+    die "legacy backup root changed during installation"
+  [[ $(stat -c '%d:%i:%u:%g:%a' -- "${LEGACY_BACKUP_ROOT}") == \
+    "${LEGACY_BACKUP_ROOT_IDENTITY}" ]] || \
+    die "legacy backup root identity changed during installation"
+}
+
+verify_legacy_backup_file() {
+  local backup_path=$1
+  local expected_digest=${2-}
+  local backup_mode
+
+  [[ -f ${backup_path} && ! -L ${backup_path} ]] || \
+    die "recoverable legacy backup conflict at ${backup_path}: expected a regular root-owned file; inspect and move the conflicting path aside, then retry"
+  [[ $(stat -c '%U:%G' -- "${backup_path}") == "root:root" ]] || \
+    die "recoverable legacy backup conflict at ${backup_path}: ownership is not root:root; inspect and repair or move it aside, then retry"
+  backup_mode="$(stat -c '%a' -- "${backup_path}")"
+  (( (8#${backup_mode} & 0022) == 0 )) || \
+    die "recoverable legacy backup conflict at ${backup_path}: file is group/other writable; inspect and repair or move it aside, then retry"
+  if [[ -n ${expected_digest} &&
+    $(sha256sum -- "${backup_path}" | awk 'NR == 1 { print $1 }') != "${expected_digest}" ]]; then
+    die "recoverable legacy backup conflict at ${backup_path}: source and backup differ; preserve both files and move the conflicting backup aside after inspection, then retry"
+  fi
+}
+
+ensure_durable_legacy_backup() {
+  local source=$1
+  local backup_path=$2
+  local source_mode=$3
+  local source_digest
+
+  [[ -f ${source} && ! -L ${source} ]] || \
+    die "legacy backup source is missing or unsafe: ${source}"
+  source_digest="$(sha256sum -- "${source}" | awk 'NR == 1 { print $1 }')"
+  if [[ -e ${backup_path} || -L ${backup_path} ]]; then
+    verify_legacy_backup_file "${backup_path}" "${source_digest}"
+    return 0
+  fi
+
+  verify_legacy_backup_root
+  ensure_root_directory "$(dirname -- "${backup_path}")" 0700
+  record_mutated_parent "$(dirname -- "${backup_path}")"
+  legacy_backup_stage="${backup_path}.next.$$"
+  rm -f -- "${legacy_backup_stage}"
+  install -o root -g root -m "${source_mode}" "${source}" "${legacy_backup_stage}"
+  [[ -f ${legacy_backup_stage} && ! -L ${legacy_backup_stage} &&
+    $(stat -c '%U:%G:%a' -- "${legacy_backup_stage}") == "root:root:${source_mode}" &&
+    $(sha256sum -- "${legacy_backup_stage}" | awk 'NR == 1 { print $1 }') == \
+      "${source_digest}" ]] || \
+    die "staged legacy backup verification failed: ${backup_path}"
+  sync -f "$(dirname -- "${backup_path}")"
+  mv -T -- "${legacy_backup_stage}" "${backup_path}"
+  legacy_backup_stage=""
+  sync -f "$(dirname -- "${backup_path}")"
+  verify_legacy_backup_file "${backup_path}" "${source_digest}"
+}
+
+readonly RELEASE_DIR="${RELEASES_DIR}/${VERSION}-${ARTIFACT_SHA256:0:12}"
+write_tree_inventory() {
+  local root=$1
+  local output=$2
+  (
+    cd -- "${root}"
+    find . -mindepth 1 \
+      ! -path './.artifact-sha256' \
+      ! -path './.version' \
+      -printf '%y %P\n' |
+      sort
+  ) > "${output}"
+}
+
+verify_managed_release() {
+  local release_dir=$1
+
+  [[ -d ${release_dir} && ! -L ${release_dir} ]] || \
+    die "managed release is missing or unsafe: ${release_dir}"
+  [[ -f ${release_dir}/.artifact-sha256 && ! -L ${release_dir}/.artifact-sha256 ]] || \
+    die "managed release digest marker is missing or unsafe"
+  [[ -f ${release_dir}/.version && ! -L ${release_dir}/.version ]] || \
+    die "managed release version marker is missing or unsafe"
+  [[ $(stat -c '%U:%G:%a' -- "${release_dir}/.artifact-sha256") == "root:root:444" ]] || \
+    die "managed release digest marker ownership or mode is invalid"
+  [[ $(stat -c '%U:%G:%a' -- "${release_dir}/.version") == "root:root:444" ]] || \
+    die "managed release version marker ownership or mode is invalid"
+  [[ $(< "${release_dir}/.artifact-sha256") == "${ARTIFACT_SHA256}" ]] || \
+    die "managed release digest marker differs from the verified artifact"
+  [[ $(< "${release_dir}/.version") == "${VERSION}" ]] || \
+    die "managed release version marker differs from the verified artifact"
+  [[ -z $(find "${release_dir}" \( ! -user root -o ! -group root \) -print -quit) ]] || \
+    die "managed release must be entirely owned by root:root"
+  [[ -z $(find "${release_dir}" -perm /022 -print -quit) ]] || \
+    die "managed release must not be group/other writable"
+  [[ -z $(find "${release_dir}" -type l -print -quit) ]] || \
+    die "managed release must not contain symlinks"
+  cmp -s "${EXTRACTED_ROOT}/checksums.txt" "${release_dir}/checksums.txt" || \
+    die "managed release checksums differ from the verified artifact"
+  write_tree_inventory "${EXTRACTED_ROOT}" "${INPUT_STAGE}/expected-tree"
+  write_tree_inventory "${release_dir}" "${INPUT_STAGE}/managed-tree"
+  cmp -s "${INPUT_STAGE}/expected-tree" "${INPUT_STAGE}/managed-tree" || \
+    die "managed release file tree differs from the verified artifact"
+  (cd -- "${release_dir}" && sha256sum --check --strict checksums.txt)
+  [[ -x ${release_dir}/bin/autostream-worker ]] || \
+    die "managed Worker binary is not executable"
+}
+
+if [[ -e ${RELEASE_DIR} || -L ${RELEASE_DIR} ]]; then
+  verify_managed_release "${RELEASE_DIR}"
+else
+  if ! managed_candidate="$(mktemp -d "${RELEASES_DIR}/.install-${VERSION}.XXXXXXXX")"; then
+    die "failed to create managed release staging directory"
+  fi
+  [[ -n ${managed_candidate} &&
+    ${managed_candidate} == "${RELEASES_DIR}/.install-${VERSION}."* &&
+    $(dirname -- "${managed_candidate}") == "${RELEASES_DIR}" &&
+    -d ${managed_candidate} && ! -L ${managed_candidate} &&
+    $(readlink -f -- "${managed_candidate}") == "${managed_candidate}" ]] || \
+    die "mktemp returned an unsafe managed release staging directory"
+  cp -a --no-preserve=ownership -- "${EXTRACTED_ROOT}/." "${managed_candidate}/"
+  chown -R root:root "${managed_candidate}"
+  chmod 0755 "${managed_candidate}"
+  printf '%s\n' "${ARTIFACT_SHA256}" > "${managed_candidate}/.artifact-sha256"
+  printf '%s\n' "${VERSION}" > "${managed_candidate}/.version"
+  chmod 0444 "${managed_candidate}/.artifact-sha256" "${managed_candidate}/.version"
+  (cd -- "${managed_candidate}" && sha256sum --check --strict checksums.txt)
+  sync -f "${managed_candidate}"
+  mv -T -- "${managed_candidate}" "${RELEASE_DIR}"
+  managed_candidate=""
+  sync -f "${RELEASES_DIR}"
+  verify_managed_release "${RELEASE_DIR}"
+fi
+record_mutated_parent "${RELEASE_DIR}"
+runuser -u autostream -- "${RELEASE_DIR}/bin/autostream-worker" --version |
+  grep -Fx -- "autostream-worker ${VERSION}" >/dev/null || \
+  die "managed Worker binary is not runnable by autostream"
+
+[[ ! -L /etc/autostream ]] || die "/etc/autostream must not be a symlink"
+record_mutated_parent /etc
+install -d -o root -g root -m 0750 /etc/autostream
+record_mutated_parent /etc/autostream
+existing_env_identity=""
+existing_env_sha256=""
+if [[ -e ${ENV_DEST} || -L ${ENV_DEST} ]]; then
+  [[ -f ${ENV_DEST} && ! -L ${ENV_DEST} ]] || \
+    die "existing environment file is not a regular file"
+  [[ $(stat -c '%U:%G' -- "${ENV_DEST}") == "root:root" ]] || \
+    die "existing environment file must be owned by root:root"
+  env_mode="$(stat -c '%a' -- "${ENV_DEST}")"
+  [[ ${env_mode} == "600" || ${env_mode} == "640" ]] || \
+    die "existing environment file mode must be 0600 or 0640"
+  existing_env_identity="$(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${ENV_DEST}")"
+  existing_env_sha256="$(sha256sum -- "${ENV_DEST}" | awk 'NR == 1 { print $1 }')"
+fi
+
+readonly LEGACY_BACKUP_DIR="${LEGACY_BACKUP_ROOT}/${VERSION}-${ARTIFACT_SHA256:0:12}"
+verify_existing_root_permission_boundary "${LEGACY_BACKUP_DIR}"
+record_mutated_parent "${LEGACY_BACKUP_ROOT}"
+ensure_root_directory "${LEGACY_BACKUP_DIR}" 0700
+record_mutated_parent "${LEGACY_BACKUP_DIR}"
+readonly LEGACY_UNIT_BACKUP="${LEGACY_BACKUP_DIR}/autostream-worker.service"
+if [[ -e ${UNIT_DEST} || -L ${UNIT_DEST} ]]; then
+  [[ -f ${UNIT_DEST} && ! -L ${UNIT_DEST} ]] || \
+    die "existing systemd unit is not a regular file"
+  [[ $(stat -c '%U:%G' -- "${UNIT_DEST}") == "root:root" ]] || \
+    die "existing systemd unit must be owned by root:root"
+  previous_unit_mode="$(stat -c '%a' -- "${UNIT_DEST}")"
+  (( (8#${previous_unit_mode} & 0022) == 0 )) || \
+    die "existing systemd unit must not be group/other writable"
+  previous_unit_identity="$(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${UNIT_DEST}")"
+  previous_unit_sha256="$(sha256sum -- "${UNIT_DEST}" | awk 'NR == 1 { print $1 }')"
+  copy_stable_source \
+    "${UNIT_DEST}" \
+    "${INPUT_STAGE}/previous-autostream-worker.service"
+  previous_unit_exists=true
+  if ! cmp -s \
+    "${INPUT_STAGE}/previous-autostream-worker.service" \
+    "${RELEASE_DIR}/systemd/autostream-worker.service.example"; then
+    legacy_unit_needs_backup=true
+    if [[ -e ${LEGACY_UNIT_BACKUP} || -L ${LEGACY_UNIT_BACKUP} ]]; then
+      verify_legacy_backup_file "${LEGACY_UNIT_BACKUP}" "${previous_unit_sha256}"
+    fi
+  fi
+fi
+preflight_public_path() {
+  local link_path=$1
+  local expected_target=$2
+  local backup_name
+  local backup_path
+  local parent
+  local mode
+  local source_digest
+
+  backup_name=$(basename -- "${link_path}") || \
+    die "could not resolve the public path name"
+  [[ -n ${backup_name} && ${backup_name} != */* ]] || \
+    die "public path name is empty or unsafe"
+  backup_path="${LEGACY_BACKUP_DIR}/${backup_name}"
+  verify_legacy_backup_root
+  parent="$(dirname -- "${link_path}")"
+  verify_root_permission_boundary "${parent}"
+  if [[ -L ${link_path} ]]; then
+    [[ $(readlink -- "${link_path}") == "${expected_target}" ]] || \
+      die "existing public link has an unexpected target: ${link_path}"
+  elif [[ -e ${link_path} ]]; then
+    [[ -f ${link_path} && ! -L ${link_path} ]] || \
+      die "existing public path is not a regular file: ${link_path}"
+    [[ $(stat -c '%U:%G' -- "${link_path}") == "root:root" ]] || \
+      die "existing public file must be owned by root:root: ${link_path}"
+    mode="$(stat -c '%a' -- "${link_path}")"
+    (( (8#${mode} & 0022) == 0 )) || \
+      die "existing public file must not be group/other writable: ${link_path}"
+    if [[ -e ${backup_path} || -L ${backup_path} ]]; then
+      source_digest="$(sha256sum -- "${link_path}" | awk 'NR == 1 { print $1 }')"
+      verify_legacy_backup_file "${backup_path}" "${source_digest}"
+    fi
+  elif [[ -e ${backup_path} || -L ${backup_path} ]]; then
+    verify_legacy_backup_file "${backup_path}"
+    interrupted_public_backups["${link_path}"]=true
+  fi
+}
+
+preflight_public_path "${PUBLIC_BINARY}" "${CURRENT_LINK}/bin/autostream-worker"
+preflight_public_path "${PUBLIC_ALIAS}" "${PUBLIC_BINARY}"
+
+[[ ! -e ${CURRENT_LINK} || -L ${CURRENT_LINK} ]] || \
+  die "managed current path must be absent or a symlink"
+if [[ -L ${CURRENT_LINK} ]]; then
+  previous_current_target="$(readlink -- "${CURRENT_LINK}")"
+  resolved_previous_current="$(readlink -f -- "${CURRENT_LINK}")" || \
+    die "managed current link is dangling"
+  [[ ${resolved_previous_current} == "${RELEASES_DIR}/"* ]] || \
+    die "managed current link points outside the release root"
+  [[ -d ${resolved_previous_current} && ! -L ${resolved_previous_current} ]] || \
+    die "managed current link target is missing or unsafe"
+  [[ $(stat -c '%U:%G' -- "${resolved_previous_current}") == "root:root" ]] || \
+    die "managed current link target must be owned by root:root"
+  [[ -z $(find "${resolved_previous_current}" \( ! -user root -o ! -group root \) -print -quit) ]] || \
+    die "managed current release must be entirely owned by root:root"
+  [[ -z $(find "${resolved_previous_current}" -perm /022 -print -quit) ]] || \
+    die "managed current release must not be group/other writable"
+  [[ -z $(find "${resolved_previous_current}" -type l -print -quit) ]] || \
+    die "managed current release must not contain symlinks"
+  for marker in .artifact-sha256 .version checksums.txt; do
+    [[ -f ${resolved_previous_current}/${marker} &&
+      ! -L ${resolved_previous_current}/${marker} ]] || \
+      die "managed current release marker is missing or unsafe: ${marker}"
+  done
+  [[ $(stat -c '%U:%G:%a' -- "${resolved_previous_current}/.artifact-sha256") == "root:root:444" ]] || \
+    die "managed current release digest marker ownership or mode is invalid"
+  [[ $(stat -c '%U:%G:%a' -- "${resolved_previous_current}/.version") == "root:root:444" ]] || \
+    die "managed current release version marker ownership or mode is invalid"
+  previous_sha256="$(< "${resolved_previous_current}/.artifact-sha256")"
+  previous_version="$(< "${resolved_previous_current}/.version")"
+  [[ ${previous_sha256} =~ ^[0-9a-f]{64}$ ]] || \
+    die "managed current release digest marker is invalid"
+  [[ ${previous_version} =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || \
+    die "managed current release version marker is invalid"
+  [[ $(basename -- "${resolved_previous_current}") == \
+    "${previous_version}-${previous_sha256:0:12}" ]] || \
+    die "managed current release directory does not match its markers"
+  while IFS= read -r checksum_entry; do
+    [[ ${checksum_entry} =~ ^[0-9a-f]{64}\ \ (.+)$ ]] || \
+      die "managed current inner checksum entry has an invalid format"
+    checked_path="${BASH_REMATCH[1]}"
+    [[ ${checked_path} != /* &&
+      ${checked_path} != ../* &&
+      ${checked_path} != *"/../"* &&
+      ${checked_path} != *"/.." ]] || \
+      die "managed current inner checksum entry has an unsafe path"
+    [[ -f ${resolved_previous_current}/${checked_path} &&
+      ! -L ${resolved_previous_current}/${checked_path} ]] || \
+      die "managed current inner checksum entry does not name a regular file"
+  done < "${resolved_previous_current}/checksums.txt"
+  (cd -- "${resolved_previous_current}" && sha256sum --check --strict checksums.txt)
+fi
+record_mutated_parent "${MANAGED_ROOT}"
+current_next="${MANAGED_ROOT}/.current.next.$$"
+rm -f -- "${current_next}"
+ln -s -- "${RELEASE_DIR}" "${current_next}"
+mv -Tf -- "${current_next}" "${CURRENT_LINK}"
+current_changed=true
+sync -f "${MANAGED_ROOT}"
+[[ $(readlink -f -- "${CURRENT_LINK}") == "${RELEASE_DIR}" ]] || \
+  die "managed current link verification failed"
+
+if [[ -z ${existing_env_identity} ]]; then
+  record_mutated_parent /etc/autostream
+  env_next="${ENV_DEST}.next.$$"
+  rm -f -- "${env_next}"
+  install -o root -g root -m 0640 "${RELEASE_DIR}/.env.example" "${env_next}"
+  sync -f /etc/autostream
+  [[ ! -e ${ENV_DEST} && ! -L ${ENV_DEST} ]] || \
+    die "environment file appeared during installation"
+  mv -T -- "${env_next}" "${ENV_DEST}"
+  created_env=true
+  created_env_identity="$(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${ENV_DEST}")"
+  created_env_sha256="$(sha256sum -- "${ENV_DEST}" | awk 'NR == 1 { print $1 }')"
+  sync -f /etc/autostream
+fi
+
+if [[ ${previous_unit_exists} == true ]]; then
+  [[ -f ${UNIT_DEST} && ! -L ${UNIT_DEST} ]] || \
+    die "existing systemd unit changed during installation"
+  [[ $(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${UNIT_DEST}") == "${previous_unit_identity}" ]] || \
+    die "existing systemd unit identity changed during installation"
+  [[ $(sha256sum -- "${UNIT_DEST}" | awk 'NR == 1 { print $1 }') == "${previous_unit_sha256}" ]] || \
+    die "existing systemd unit content changed during installation"
+fi
+if [[ ${legacy_unit_needs_backup} == true ]]; then
+  verify_legacy_backup_root
+  ensure_root_directory "${LEGACY_BACKUP_DIR}" 0700
+  ensure_durable_legacy_backup \
+    "${INPUT_STAGE}/previous-autostream-worker.service" \
+    "${LEGACY_UNIT_BACKUP}" \
+    "${previous_unit_mode}"
+fi
+record_mutated_parent /etc/systemd/system
+unit_next="${UNIT_DEST}.next.$$"
+rm -f -- "${unit_next}"
+install -o root -g root -m 0644 \
+  "${RELEASE_DIR}/systemd/autostream-worker.service.example" \
+  "${unit_next}"
+sync -f /etc/systemd/system
+if [[ ${previous_unit_exists} != true ]]; then
+  [[ ! -e ${UNIT_DEST} && ! -L ${UNIT_DEST} ]] || \
+    die "systemd unit appeared during installation"
+fi
+mv -Tf -- "${unit_next}" "${UNIT_DEST}"
+unit_installed=true
+sync -f /etc/systemd/system
+
+install_public_link() {
+  local target=$1
+  local link_path=$2
+  local backup_name
+  local backup_path
+  local link_next="${link_path}.next.$$"
+  local previous_kind
+  local previous_target=""
+  local previous_recovery=""
+  local previous_mode=""
+  local source_identity
+  local source_digest
+
+  backup_name=$(basename -- "${link_path}") || \
+    die "could not resolve the public path name"
+  [[ -n ${backup_name} && ${backup_name} != */* ]] || \
+    die "public path name is empty or unsafe"
+  backup_path="${LEGACY_BACKUP_DIR}/${backup_name}"
+  if [[ -L ${link_path} ]]; then
+    previous_kind="symlink"
+    previous_target="$(readlink -- "${link_path}")"
+  elif [[ -e ${link_path} ]]; then
+    previous_kind="regular"
+    previous_recovery="${INPUT_STAGE}/legacy-public-$(basename -- "${link_path}")"
+    source_identity="$(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${link_path}")"
+    source_digest="$(sha256sum -- "${link_path}" | awk 'NR == 1 { print $1 }')"
+    previous_mode="$(stat -c '%a' -- "${link_path}")"
+    cp -a -- "${link_path}" "${previous_recovery}"
+    [[ -f ${link_path} &&
+      ! -L ${link_path} &&
+      $(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${link_path}") == "${source_identity}" &&
+      $(sha256sum -- "${link_path}" | awk 'NR == 1 { print $1 }') == "${source_digest}" &&
+      -f ${previous_recovery} &&
+      ! -L ${previous_recovery} &&
+      $(sha256sum -- "${previous_recovery}" | awk 'NR == 1 { print $1 }') == "${source_digest}" ]] || \
+      die "legacy public binary changed while being staged: ${link_path}"
+  elif [[ ${interrupted_public_backups["${link_path}"]-false} == true ]]; then
+    previous_kind="regular"
+    previous_recovery="${INPUT_STAGE}/legacy-public-$(basename -- "${link_path}")"
+    verify_legacy_backup_file "${backup_path}"
+    previous_mode="$(stat -c '%a' -- "${backup_path}")"
+    source_digest="$(sha256sum -- "${backup_path}" | awk 'NR == 1 { print $1 }')"
+    cp -a -- "${backup_path}" "${previous_recovery}"
+    [[ -f ${previous_recovery} && ! -L ${previous_recovery} &&
+      $(sha256sum -- "${previous_recovery}" | awk 'NR == 1 { print $1 }') == \
+        "${source_digest}" ]] || \
+      die "interrupted legacy backup changed while being staged: ${backup_path}"
+    printf 'install-autostream-worker: resuming interrupted public-path migration from verified backup: %s\n' \
+      "${backup_path}" >&2
+  else
+    previous_kind="absent"
+  fi
+
+  changed_public_paths+=("${link_path}")
+  previous_public_kinds+=("${previous_kind}")
+  previous_public_targets+=("${previous_target}")
+  previous_public_recoveries+=("${previous_recovery}")
+
+  record_mutated_parent "$(dirname -- "${link_path}")"
+  if [[ ${previous_kind} == "regular" && -e ${link_path} ]]; then
+    ensure_durable_legacy_backup \
+      "${link_path}" \
+      "${backup_path}" \
+      "${previous_mode}"
+  fi
+  rm -f -- "${link_next}"
+  ln -s -- "${target}" "${link_next}"
+  mv -Tf -- "${link_next}" "${link_path}"
+  sync -f "$(dirname -- "${link_path}")"
+}
+
+install_public_link "${CURRENT_LINK}/bin/autostream-worker" "${PUBLIC_BINARY}"
+install_public_link "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}"
+[[ $(readlink -f -- "${PUBLIC_BINARY}") == "${RELEASE_DIR}/bin/autostream-worker" ]] || \
+  die "public Worker binary link verification failed"
+[[ $(readlink -f -- "${PUBLIC_ALIAS}") == "${RELEASE_DIR}/bin/autostream-worker" ]] || \
+  die "public Worker alias link verification failed"
+
+if [[ -n ${existing_env_identity} ]]; then
+  [[ -f ${ENV_DEST} && ! -L ${ENV_DEST} ]] || \
+    die "existing environment file changed during installation"
+  [[ $(stat -c '%d:%i:%s:%Y:%f:%u:%g' -- "${ENV_DEST}") == "${existing_env_identity}" ]] || \
+    die "existing environment file identity changed during installation"
+  [[ $(sha256sum -- "${ENV_DEST}" | awk 'NR == 1 { print $1 }') == "${existing_env_sha256}" ]] || \
+    die "existing environment file content changed during installation"
+fi
+
+sync_installation_parents
+systemctl daemon-reload
+installation_committed=true
+
+printf 'Installed AutoStream Worker %s.\n' "${VERSION}"
+printf 'Existing settings were preserved. Review %s, then run:\n' "${ENV_DEST}"
+if [[ ${service_was_active} == true ]] || systemctl is-active --quiet "${UNIT_NAME}"; then
+  printf '  sudo systemctl restart %s\n' "${UNIT_NAME}"
+else
+  printf '  sudo systemctl enable --now %s\n' "${UNIT_NAME}"
+fi
+printf '  sudo systemctl status %s\n' "${UNIT_NAME}"
