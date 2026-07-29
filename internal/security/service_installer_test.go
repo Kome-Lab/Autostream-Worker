@@ -144,6 +144,8 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 		`fresh installer did not create the autostream account`,
 		`fresh installer unexpectedly started the service`,
 		`fresh installer unexpectedly enabled the service`,
+		`legacy_unit_file_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"`,
+		`legacy fixture must begin disabled`,
 		`systemctl show --property MainPID`,
 		`/var/backups/autostream/install-migrations/worker`,
 		`database_schema: "none"`,
@@ -155,6 +157,9 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 	const safeAccountReset = "userdel autostream\nif getent group autostream >/dev/null 2>&1; then\n  groupdel autostream\nfi"
 	if count := strings.Count(fixture, safeAccountReset); count != 1 {
 		t.Fatalf("expected one account reset that tolerates userdel removing the private group, got %d", count)
+	}
+	if count := strings.Count(fixture, "[Install]\nWantedBy=multi-user.target"); count != 2 {
+		t.Fatalf("integration fixture must define two enable-capable but disabled units, got %d", count)
 	}
 }
 

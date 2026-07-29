@@ -329,6 +329,9 @@ Description=${LEGACY_UNIT_CONTENT}
 [Service]
 Type=simple
 ExecStart=/usr/bin/sleep infinity
+
+[Install]
+WantedBy=multi-user.target
 EOF
 chmod 0644 "${UNIT_PATH}"
 systemctl daemon-reload
@@ -336,7 +339,9 @@ systemctl start "${UNIT}"
 old_pid="$(systemctl show --property MainPID --value "${UNIT}")"
 [[ ${old_pid} =~ ^[1-9][0-9]*$ ]] || die "legacy service did not start"
 kill -0 "${old_pid}" || die "legacy service PID is not alive"
-systemctl is-enabled --quiet "${UNIT}" && die "legacy fixture unexpectedly enabled the service"
+legacy_unit_file_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"
+[[ ${legacy_unit_file_state} == "disabled" ]] || \
+  die "legacy fixture must begin disabled, got ${legacy_unit_file_state:-unknown}"
 
 env_before="$(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }')"
 unit_before="$(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }')"
