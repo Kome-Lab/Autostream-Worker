@@ -13,6 +13,18 @@ die() {
 [[ ${EUID} -eq 0 ]] || die "must run as root"
 [[ $(uname -m) == "x86_64" ]] || die "this integration fixture requires an amd64 Linux runner"
 
+if [[ ${AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS:-} != "1" ]]; then
+  exec unshare --mount --propagation private bash -c '
+    mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
+      autostream-worker-installer-test /usr/local/bin
+    exec env AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS=1 bash "$1"
+  ' autostream-worker-installer-test-mount "$0"
+fi
+grep -Eq ' /usr/local/bin .* - tmpfs autostream-worker-installer-test ' \
+  /proc/self/mountinfo || die "isolated /usr/local/bin mount is missing"
+[[ $(stat -c '%U:%G:%a' -- /usr/local/bin) == "root:root:755" ]] || \
+  die "could not create an isolated safe /usr/local/bin fixture"
+
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly INSTALLER_SOURCE="${SCRIPT_DIR}/install-autostream-worker"
 readonly VERSION="v9.9.9"
@@ -231,8 +243,11 @@ mktemp_failure_status=$?
 set -e
 [[ ${mktemp_failure_status} -eq 1 ]] || \
   die "production mktemp failure did not return the installer failure status"
-grep -Fx -- "production-mktemp-reached" "${MKTEMP_REACHED_MARKER}" >/dev/null || \
+if [[ ! -f ${MKTEMP_REACHED_MARKER} ]] ||
+  ! grep -Fx -- "production-mktemp-reached" "${MKTEMP_REACHED_MARKER}" >/dev/null; then
+  cat "${WORK_DIR}/mktemp-failure.out" >&2
   die "mktemp failure injection did not reach production mktemp"
+fi
 grep -Fx -- "install-autostream-worker: failed to create input staging directory" \
   "${WORK_DIR}/mktemp-failure.out" >/dev/null || \
   die "production mktemp failure did not report the exact installer error"
