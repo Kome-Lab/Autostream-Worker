@@ -138,20 +138,56 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 	for _, marker := range []string{
 		`AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS`,
 		`autostream-worker-installer-test-scratch /mnt`,
-		`install -d -o root -g root -m 0755 /mnt/usr-lower /mnt/usr-upper /mnt/usr-upper/local`,
-		`install -d -o root -g root -m 0700 /mnt/usr-work`,
+		`/mnt/usr-lower \`,
+		`/mnt/usr-upper/local`,
+		`/mnt/usr-work \`,
 		`mount --rbind /usr /mnt/usr-lower`,
 		`mount --make-rprivate /mnt/usr-lower`,
+		`mount --rbind /etc /mnt/etc-lower`,
+		`mount --make-rprivate /mnt/etc-lower`,
+		`mount --rbind /var /mnt/var-lower`,
+		`mount --make-rprivate /mnt/var-lower`,
+		`mount --rbind /run /mnt/run-lower`,
+		`mount --make-rprivate /mnt/run-lower`,
 		`lowerdir=/mnt/usr-lower,upperdir=/mnt/usr-upper,workdir=/mnt/usr-work`,
+		`lowerdir=/mnt/etc-lower,upperdir=/mnt/etc-upper,workdir=/mnt/etc-work`,
+		`lowerdir=/mnt/var-lower,upperdir=/mnt/var-upper,workdir=/mnt/var-work`,
+		`lowerdir=/mnt/run-lower,upperdir=/mnt/run-upper,workdir=/mnt/run-work`,
+		`install -d -o root -g root -m 1777 /mnt/var-upper/tmp`,
 		`autostream-worker-installer-test-usr-overlay`,
 		`grep -Eq ' /usr .* - overlay autostream-worker-installer-test-usr-overlay '`,
+		`autostream-worker-installer-test-etc-overlay`,
+		`grep -Eq ' /etc .* - overlay autostream-worker-installer-test-etc-overlay '`,
+		`autostream-worker-installer-test-var-overlay`,
+		`grep -Eq ' /var .* - overlay autostream-worker-installer-test-var-overlay '`,
+		`autostream-worker-installer-test-run-overlay`,
+		`grep -Eq ' /run .* - overlay autostream-worker-installer-test-run-overlay '`,
+		`mount --rbind /mnt/run-lower/systemd /run/systemd`,
+		`systemd_identity="$(stat -c "%d:%i" -- /mnt/run-lower/systemd)"`,
+		`AUTOSTREAM_WORKER_INSTALLER_TEST_SYSTEMD_IDENTITY="${systemd_identity}"`,
+		`autostream-worker-installer-test-sealed /mnt`,
+		`ro,nodev,nosuid,noexec,mode=0555`,
+		`sealed /mnt mount is missing`,
+		`sealed /mnt mount options are unsafe`,
+		`sealed /mnt ownership or mode is unsafe`,
+		`sealed /mnt unexpectedly accepted a write`,
+		`readonly EXPECTED_SYSTEMD_IDENTITY="${AUTOSTREAM_WORKER_INSTALLER_TEST_SYSTEMD_IDENTITY:-}"`,
+		`host-backed /run/systemd mount is missing`,
+		`host-backed /run/systemd mount identity is invalid`,
 		`autostream-worker-installer-test /usr/local/bin`,
 		`autostream-worker-installer-test-opt /opt`,
-		`isolated /mnt scratch mount is missing`,
 		`isolated /usr overlay mount is missing`,
 		`isolated /usr/local/bin mount is missing`,
 		`isolated /opt mount is missing`,
 		`could not create an isolated safe /usr fixture`,
+		`could not create an isolated safe /etc fixture`,
+		`could not create an isolated safe /etc/systemd fixture`,
+		`could not create an isolated safe /etc/systemd/system fixture`,
+		`could not create an isolated safe /var fixture`,
+		`could not create an isolated safe /var/lib fixture`,
+		`could not create an isolated safe /var/backups fixture`,
+		`could not create an isolated safe /var/tmp fixture`,
+		`could not create an isolated safe /run fixture`,
 		`could not create an isolated safe /usr/local fixture`,
 		`could not create an isolated safe /usr/local/bin fixture`,
 		`could not create an isolated safe /opt fixture`,
@@ -166,12 +202,92 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 		`legacy_unit_file_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"`,
 		`legacy fixture must begin disabled`,
 		`systemctl show --property MainPID`,
+		`readonly RUNTIME_UNIT_PATH="/run/systemd/system/${UNIT}"`,
+		`systemd runtime unit directory is unsafe`,
+		`fixture_owns_paths=false`,
+		`fixture_owns_runtime_unit=false`,
+		`fixture_owns_service=false`,
+		`if [[ ${fixture_owns_paths} == true ]]; then`,
+		`if [[ ${fixture_owns_service} == true &&`,
+		`if [[ ${fixture_owns_runtime_unit} == true &&`,
+		`runtime_identity_matches=false`,
+		`${runtime_identity_matches} == true`,
+		`old_pid_starttime=""`,
+		`/proc/${pid}/stat`,
+		`${stat_fields[19]}`,
+		`kill_recorded_process_if_same_starttime`,
+		`PID reuse guard did not reject a mismatched process identity`,
+		`PID reuse guard killed the mismatched process`,
+		`cleanup_failed=false`,
+		`owned runtime unit identity changed`,
+		`runtime unit identity changed before service cleanup`,
+		`runtime unit identity changed before removal`,
+		`could not remove owned runtime unit`,
+		`systemctl show --property ActiveState --value`,
+		`service did not become inactive`,
+		`service unit remained loaded`,
+		`if [[ ${cleanup_failed} == true && ${exit_code} -eq 0 ]]; then`,
+		`loaded_unit_state="$(systemctl show --property LoadState --value "${UNIT}"`,
+		`runner service is already loaded`,
+		`AUTOSTREAM_WORKER_INSTALLER_TEST_PREFLIGHT_PROBE=1`,
+		`run_preflight_cleanup_probe`,
+		`preflight failure removed the existing runtime unit`,
+		`preflight failure replaced the existing service process`,
+		`preflight failure changed the existing service enablement`,
+		`ln -- "${runtime_unit_staging}" "${RUNTIME_UNIT_PATH}"`,
+		`mv -fT -- "${runtime_unit_staging}" "${RUNTIME_UNIT_PATH}"`,
+		`owned systemd runtime unit changed before atomic commit`,
+		`sync -f -- "${runtime_unit_staging}"`,
+		`sync -f -- /run/systemd/system`,
+		`replace_owned_runtime_unit_atomically "${UNIT_PATH}"`,
+		`systemctl show --property FragmentPath --value`,
+		`systemctl show --property ExecStart --value`,
+		`systemctl show --property User --value`,
+		`assert_legacy_runtime_unit "failed migration"`,
+		`assert_legacy_runtime_unit "sync failure"`,
+		`successful migration did not synchronize the managed runtime unit`,
+		`idempotent reinstall changed the loaded runtime unit`,
+		`"${TARGET_LOCK}"; do`,
 		`/var/backups/autostream/install-migrations/worker`,
 		`database_schema: "none"`,
 	} {
 		if !strings.Contains(fixture, marker) {
 			t.Fatalf("Worker installer integration fixture is missing %q", marker)
 		}
+	}
+	atomicReplaceStart := strings.Index(fixture, "replace_owned_runtime_unit_atomically() {")
+	if atomicReplaceStart < 0 {
+		t.Fatal("Worker installer fixture is missing the atomic runtime unit replacement function")
+	}
+	atomicReplaceEnd := strings.Index(
+		fixture[atomicReplaceStart:],
+		"\n}\n\nassert_loaded_runtime_unit()",
+	)
+	if atomicReplaceEnd < 0 {
+		t.Fatal("Worker installer fixture is missing the atomic runtime unit replacement function")
+	}
+	atomicReplace := fixture[atomicReplaceStart : atomicReplaceStart+atomicReplaceEnd]
+	stageRuntimeIndex := strings.Index(atomicReplace, `stage_runtime_unit "${source_path}"`)
+	recheckIdentityIndex := strings.LastIndex(
+		atomicReplace,
+		`current_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}")"`,
+	)
+	rejectMismatchIndex := strings.Index(
+		atomicReplace,
+		`if [[ ${current_identity} != "${runtime_unit_identity}" ]]; then`,
+	)
+	atomicCommitIndex := strings.Index(
+		atomicReplace,
+		`mv -fT -- "${runtime_unit_staging}" "${RUNTIME_UNIT_PATH}"`,
+	)
+	if stageRuntimeIndex < 0 ||
+		recheckIdentityIndex < 0 ||
+		rejectMismatchIndex < 0 ||
+		atomicCommitIndex < 0 ||
+		stageRuntimeIndex >= recheckIdentityIndex ||
+		recheckIdentityIndex >= rejectMismatchIndex ||
+		rejectMismatchIndex >= atomicCommitIndex {
+		t.Fatal("Worker runtime unit replacement must stage, recheck ownership, reject mismatches, then commit atomically")
 	}
 	namespaceIndex := strings.Index(
 		fixture,
@@ -186,29 +302,127 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 		`autostream-worker-installer-test-scratch /mnt`,
 	)
 	outerStrictIndex := strings.LastIndex(fixture, "set -euo pipefail")
-	lowerIndex := strings.Index(fixture, `mount --rbind /usr /mnt/usr-lower`)
-	privateIndex := strings.Index(fixture, `mount --make-rprivate /mnt/usr-lower`)
-	overlayIndex := strings.Index(fixture, `autostream-worker-installer-test-usr-overlay`)
-	childMountIndex := strings.Index(
+	usrLowerIndex := strings.Index(fixture, `mount --rbind /usr /mnt/usr-lower`)
+	usrPrivateIndex := strings.Index(fixture, `mount --make-rprivate /mnt/usr-lower`)
+	etcLowerIndex := strings.Index(fixture, `mount --rbind /etc /mnt/etc-lower`)
+	etcPrivateIndex := strings.Index(fixture, `mount --make-rprivate /mnt/etc-lower`)
+	varLowerIndex := strings.Index(fixture, `mount --rbind /var /mnt/var-lower`)
+	varPrivateIndex := strings.Index(fixture, `mount --make-rprivate /mnt/var-lower`)
+	runLowerIndex := strings.Index(fixture, `mount --rbind /run /mnt/run-lower`)
+	runPrivateIndex := strings.Index(fixture, `mount --make-rprivate /mnt/run-lower`)
+	usrUpperIndex := strings.Index(fixture, `/mnt/usr-upper \`)
+	etcUpperIndex := strings.Index(fixture, `/mnt/etc-upper \`)
+	varUpperIndex := strings.Index(fixture, `/mnt/var-upper \`)
+	runUpperIndex := strings.Index(fixture, `/mnt/run-upper \`)
+	usrWorkIndex := strings.Index(fixture, `/mnt/usr-work \`)
+	etcWorkIndex := strings.Index(fixture, `/mnt/etc-work \`)
+	varWorkIndex := strings.Index(fixture, `/mnt/var-work \`)
+	runWorkIndex := strings.Index(fixture, `/mnt/run-work`)
+	usrOverlayIndex := strings.Index(fixture, `autostream-worker-installer-test-usr-overlay /usr`)
+	etcOverlayIndex := strings.Index(fixture, `autostream-worker-installer-test-etc-overlay /etc`)
+	varOverlayIndex := strings.Index(fixture, `autostream-worker-installer-test-var-overlay /var`)
+	runOverlayIndex := strings.Index(fixture, `autostream-worker-installer-test-run-overlay /run`)
+	systemdBindIndex := strings.Index(fixture, `mount --rbind /mnt/run-lower/systemd /run/systemd`)
+	systemdIdentityIndex := strings.Index(
+		fixture,
+		`systemd_identity="$(stat -c "%d:%i" -- /mnt/run-lower/systemd)"`,
+	)
+	runtimeSafetyIndex := strings.Index(
+		fixture,
+		`readonly RUNTIME_UNIT_PATH="/run/systemd/system/${UNIT}"`,
+	)
+	binMountIndex := strings.Index(
 		fixture,
 		`autostream-worker-installer-test /usr/local/bin`,
 	)
-	if outerStrictIndex < 0 || scratchIndex < 0 || lowerIndex < 0 || privateIndex < 0 ||
-		overlayIndex < 0 || childMountIndex < 0 ||
+	optMountIndex := strings.Index(fixture, `autostream-worker-installer-test-opt /opt`)
+	sealedMountIndex := strings.Index(fixture, `autostream-worker-installer-test-sealed /mnt`)
+	identityExportIndex := strings.Index(
+		fixture,
+		`AUTOSTREAM_WORKER_INSTALLER_TEST_SYSTEMD_IDENTITY="${systemd_identity}"`,
+	)
+	if outerStrictIndex < 0 || scratchIndex < 0 ||
+		usrLowerIndex < 0 || usrPrivateIndex < 0 ||
+		etcLowerIndex < 0 || etcPrivateIndex < 0 ||
+		varLowerIndex < 0 || varPrivateIndex < 0 ||
+		runLowerIndex < 0 || runPrivateIndex < 0 ||
+		usrUpperIndex < 0 || etcUpperIndex < 0 ||
+		varUpperIndex < 0 || runUpperIndex < 0 ||
+		usrWorkIndex < 0 || etcWorkIndex < 0 ||
+		varWorkIndex < 0 || runWorkIndex < 0 ||
+		usrOverlayIndex < 0 || etcOverlayIndex < 0 ||
+		varOverlayIndex < 0 || runOverlayIndex < 0 ||
+		systemdBindIndex < 0 || systemdIdentityIndex < 0 ||
+		binMountIndex < 0 || optMountIndex < 0 ||
+		sealedMountIndex < 0 || identityExportIndex < 0 ||
+		workDirIndex < 0 || runtimeSafetyIndex < 0 ||
 		namespaceIndex >= outerStrictIndex ||
 		outerStrictIndex >= scratchIndex ||
-		scratchIndex >= lowerIndex ||
-		lowerIndex >= privateIndex ||
-		privateIndex >= overlayIndex ||
-		overlayIndex >= childMountIndex {
-		t.Fatal("installer integration fixture must isolate /mnt and overlay /usr before child mounts")
+		scratchIndex >= usrLowerIndex ||
+		usrLowerIndex >= usrPrivateIndex ||
+		usrPrivateIndex >= etcLowerIndex ||
+		etcLowerIndex >= etcPrivateIndex ||
+		etcPrivateIndex >= varLowerIndex ||
+		varLowerIndex >= varPrivateIndex ||
+		varPrivateIndex >= runLowerIndex ||
+		runLowerIndex >= runPrivateIndex ||
+		runPrivateIndex >= usrUpperIndex ||
+		usrUpperIndex >= etcUpperIndex ||
+		etcUpperIndex >= varUpperIndex ||
+		varUpperIndex >= runUpperIndex ||
+		runUpperIndex >= usrWorkIndex ||
+		usrWorkIndex >= etcWorkIndex ||
+		etcWorkIndex >= varWorkIndex ||
+		varWorkIndex >= runWorkIndex ||
+		runWorkIndex >= usrOverlayIndex ||
+		usrOverlayIndex >= etcOverlayIndex ||
+		etcOverlayIndex >= varOverlayIndex ||
+		varOverlayIndex >= runOverlayIndex ||
+		runOverlayIndex >= systemdBindIndex ||
+		systemdBindIndex >= systemdIdentityIndex ||
+		systemdIdentityIndex >= binMountIndex ||
+		binMountIndex >= optMountIndex ||
+		optMountIndex >= sealedMountIndex ||
+		sealedMountIndex >= identityExportIndex ||
+		identityExportIndex >= workDirIndex ||
+		workDirIndex >= runtimeSafetyIndex {
+		t.Fatal("installer integration fixture mount isolation and mutable-state ordering is incomplete")
 	}
 	const safeAccountReset = "userdel autostream\nif getent group autostream >/dev/null 2>&1; then\n  groupdel autostream\nfi"
 	if count := strings.Count(fixture, safeAccountReset); count != 1 {
 		t.Fatalf("expected one account reset that tolerates userdel removing the private group, got %d", count)
 	}
-	if count := strings.Count(fixture, "[Install]\nWantedBy=multi-user.target"); count != 2 {
-		t.Fatalf("integration fixture must define two enable-capable but disabled units, got %d", count)
+	if count := strings.Count(fixture, "[Install]\nWantedBy=multi-user.target"); count != 3 {
+		t.Fatalf("integration fixture must define three enable-capable but disabled units, got %d", count)
+	}
+	preflightIndex := strings.Index(fixture, `for path in \`)
+	probeIndex := strings.Index(fixture, "\nrun_preflight_cleanup_probe\n")
+	ownershipIndex := strings.Index(fixture, `fixture_owns_paths=true`)
+	runtimeCreateIndex := strings.LastIndex(fixture, `create_runtime_unit_no_clobber "${UNIT_PATH}"`)
+	if preflightIndex < 0 || probeIndex < 0 || ownershipIndex < 0 || runtimeCreateIndex < 0 ||
+		preflightIndex >= probeIndex || probeIndex >= ownershipIndex ||
+		ownershipIndex >= runtimeCreateIndex {
+		t.Fatal("fixture must run the non-destructive preflight probe before claiming path ownership")
+	}
+	if strings.Contains(
+		fixture,
+		`install -o root -g root -m 0644 "${UNIT_PATH}" "${RUNTIME_UNIT_PATH}"`,
+	) {
+		t.Fatal("runtime unit creation must be atomic and no-clobber")
+	}
+	innerFixtureIndex := strings.Index(fixture, "\nfi\ngrep -Eq ' /mnt ")
+	if innerFixtureIndex < 0 ||
+		strings.Contains(fixture[innerFixtureIndex:], "/mnt/run-lower") {
+		t.Fatal("sealed inner fixture must not retain a writable lower-directory alias")
+	}
+	starttimeCheckIndex := strings.Index(
+		fixture,
+		`[[ ${current_starttime} == "${old_pid_starttime}" ]]`,
+	)
+	fallbackKillIndex := strings.Index(fixture, `kill "${old_pid}" || return 1`)
+	if starttimeCheckIndex < 0 || fallbackKillIndex < 0 ||
+		starttimeCheckIndex >= fallbackKillIndex {
+		t.Fatal("raw PID fallback must verify the recorded /proc start time before kill")
 	}
 }
 

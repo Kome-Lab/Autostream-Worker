@@ -18,29 +18,112 @@ if [[ ${AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS:-} != "1" ]]; then
     set -euo pipefail
     mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
       autostream-worker-installer-test-scratch /mnt
-    install -d -o root -g root -m 0755 /mnt/usr-lower /mnt/usr-upper /mnt/usr-upper/local
-    install -d -o root -g root -m 0700 /mnt/usr-work
+    install -d -o root -g root -m 0755 \
+      /mnt/usr-lower \
+      /mnt/etc-lower \
+      /mnt/var-lower \
+      /mnt/run-lower
     mount --rbind /usr /mnt/usr-lower
     mount --make-rprivate /mnt/usr-lower
+    mount --rbind /etc /mnt/etc-lower
+    mount --make-rprivate /mnt/etc-lower
+    mount --rbind /var /mnt/var-lower
+    mount --make-rprivate /mnt/var-lower
+    mount --rbind /run /mnt/run-lower
+    mount --make-rprivate /mnt/run-lower
+    install -d -o root -g root -m 0755 \
+      /mnt/usr-upper \
+      /mnt/usr-upper/local \
+      /mnt/etc-upper \
+      /mnt/etc-upper/systemd \
+      /mnt/etc-upper/systemd/system \
+      /mnt/var-upper \
+      /mnt/var-upper/lib \
+      /mnt/var-upper/backups \
+      /mnt/run-upper \
+      /mnt/run-upper/systemd
+    install -d -o root -g root -m 1777 /mnt/var-upper/tmp
+    install -d -o root -g root -m 0700 \
+      /mnt/usr-work \
+      /mnt/etc-work \
+      /mnt/var-work \
+      /mnt/run-work
     mount -t overlay -o nodev,nosuid,lowerdir=/mnt/usr-lower,upperdir=/mnt/usr-upper,workdir=/mnt/usr-work \
       autostream-worker-installer-test-usr-overlay /usr
+    mount -t overlay -o nodev,nosuid,lowerdir=/mnt/etc-lower,upperdir=/mnt/etc-upper,workdir=/mnt/etc-work \
+      autostream-worker-installer-test-etc-overlay /etc
+    mount -t overlay -o nodev,nosuid,lowerdir=/mnt/var-lower,upperdir=/mnt/var-upper,workdir=/mnt/var-work \
+      autostream-worker-installer-test-var-overlay /var
+    mount -t overlay -o nodev,nosuid,lowerdir=/mnt/run-lower,upperdir=/mnt/run-upper,workdir=/mnt/run-work \
+      autostream-worker-installer-test-run-overlay /run
+    mount --rbind /mnt/run-lower/systemd /run/systemd
+    mount --make-rprivate /run/systemd
+    systemd_identity="$(stat -c "%d:%i" -- /mnt/run-lower/systemd)"
+    [[ ${systemd_identity} =~ ^[0-9]+:[0-9]+$ &&
+      $(stat -c "%d:%i" -- /run/systemd) == "${systemd_identity}" ]]
     mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
       autostream-worker-installer-test /usr/local/bin
     mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
       autostream-worker-installer-test-opt /opt
-    exec env AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS=1 bash "$1"
+    mount -t tmpfs -o ro,nodev,nosuid,noexec,mode=0555,uid=0,gid=0 \
+      autostream-worker-installer-test-sealed /mnt
+    exec env \
+      AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS=1 \
+      AUTOSTREAM_WORKER_INSTALLER_TEST_SYSTEMD_IDENTITY="${systemd_identity}" \
+      bash "$1"
   ' autostream-worker-installer-test-mount "$0"
 fi
-grep -Eq ' /mnt .* - tmpfs autostream-worker-installer-test-scratch ' \
-  /proc/self/mountinfo || die "isolated /mnt scratch mount is missing"
+grep -Eq ' /mnt .* - tmpfs autostream-worker-installer-test-sealed ' \
+  /proc/self/mountinfo || die "sealed /mnt mount is missing"
+awk '$5 == "/mnt" &&
+  $6 ~ /(^|,)ro(,|$)/ &&
+  $6 ~ /(^|,)nodev(,|$)/ &&
+  $6 ~ /(^|,)nosuid(,|$)/ &&
+  $6 ~ /(^|,)noexec(,|$)/ { found = 1 }
+  END { exit !found }' /proc/self/mountinfo || \
+  die "sealed /mnt mount options are unsafe"
+[[ $(stat -c '%U:%G:%a' -- /mnt) == "root:root:555" ]] || \
+  die "sealed /mnt ownership or mode is unsafe"
+if touch /mnt/.autostream-worker-write-probe 2>/dev/null; then
+  rm -f -- /mnt/.autostream-worker-write-probe
+  die "sealed /mnt unexpectedly accepted a write"
+fi
 grep -Eq ' /usr .* - overlay autostream-worker-installer-test-usr-overlay ' \
   /proc/self/mountinfo || die "isolated /usr overlay mount is missing"
+grep -Eq ' /etc .* - overlay autostream-worker-installer-test-etc-overlay ' \
+  /proc/self/mountinfo || die "isolated /etc overlay mount is missing"
+grep -Eq ' /var .* - overlay autostream-worker-installer-test-var-overlay ' \
+  /proc/self/mountinfo || die "isolated /var overlay mount is missing"
+grep -Eq ' /run .* - overlay autostream-worker-installer-test-run-overlay ' \
+  /proc/self/mountinfo || die "isolated /run overlay mount is missing"
+grep -Eq ' /run/systemd ' /proc/self/mountinfo || \
+  die "host-backed /run/systemd mount is missing"
+readonly EXPECTED_SYSTEMD_IDENTITY="${AUTOSTREAM_WORKER_INSTALLER_TEST_SYSTEMD_IDENTITY:-}"
+[[ ${EXPECTED_SYSTEMD_IDENTITY} =~ ^[0-9]+:[0-9]+$ &&
+  $(stat -c '%d:%i' -- /run/systemd) == "${EXPECTED_SYSTEMD_IDENTITY}" ]] || \
+  die "host-backed /run/systemd mount identity is invalid"
 grep -Eq ' /usr/local/bin .* - tmpfs autostream-worker-installer-test ' \
   /proc/self/mountinfo || die "isolated /usr/local/bin mount is missing"
 grep -Eq ' /opt .* - tmpfs autostream-worker-installer-test-opt ' \
   /proc/self/mountinfo || die "isolated /opt mount is missing"
 [[ $(stat -c '%U:%G:%a' -- /usr) == "root:root:755" ]] || \
   die "could not create an isolated safe /usr fixture"
+[[ $(stat -c '%U:%G:%a' -- /etc) == "root:root:755" ]] || \
+  die "could not create an isolated safe /etc fixture"
+[[ $(stat -c '%U:%G:%a' -- /etc/systemd) == "root:root:755" ]] || \
+  die "could not create an isolated safe /etc/systemd fixture"
+[[ $(stat -c '%U:%G:%a' -- /etc/systemd/system) == "root:root:755" ]] || \
+  die "could not create an isolated safe /etc/systemd/system fixture"
+[[ $(stat -c '%U:%G:%a' -- /var) == "root:root:755" ]] || \
+  die "could not create an isolated safe /var fixture"
+[[ $(stat -c '%U:%G:%a' -- /var/lib) == "root:root:755" ]] || \
+  die "could not create an isolated safe /var/lib fixture"
+[[ $(stat -c '%U:%G:%a' -- /var/backups) == "root:root:755" ]] || \
+  die "could not create an isolated safe /var/backups fixture"
+[[ $(stat -c '%U:%G:%a' -- /var/tmp) == "root:root:1777" ]] || \
+  die "could not create an isolated safe /var/tmp fixture"
+[[ $(stat -c '%U:%G:%a' -- /run) == "root:root:755" ]] || \
+  die "could not create an isolated safe /run fixture"
 [[ $(stat -c '%U:%G:%a' -- /usr/local) == "root:root:755" ]] || \
   die "could not create an isolated safe /usr/local fixture"
 [[ $(stat -c '%U:%G:%a' -- /usr/local/bin) == "root:root:755" ]] || \
@@ -77,6 +160,11 @@ readonly SYNC_MATCH_COUNT="${WORK_DIR}/sync.match-count"
 readonly SYNC_CALL_LOG="${WORK_DIR}/sync.calls"
 readonly UNIT="autostream-worker.service"
 readonly UNIT_PATH="/etc/systemd/system/${UNIT}"
+readonly RUNTIME_UNIT_PATH="/run/systemd/system/${UNIT}"
+[[ -d /run/systemd/system && ! -L /run/systemd/system &&
+  $(readlink -f -- /run/systemd/system) == "/run/systemd/system" &&
+  $(stat -c '%U:%G:%a' -- /run/systemd/system) == "root:root:755" ]] || \
+  die "systemd runtime unit directory is unsafe"
 readonly PUBLIC_BINARY="/usr/local/bin/autostream-worker"
 readonly PUBLIC_ALIAS="/usr/local/bin/worker"
 readonly ENV_PATH="/etc/autostream/worker.env"
@@ -93,34 +181,361 @@ readonly LEGACY_ALIAS_CONTENT="worker-installer-integration-legacy-alias"
 readonly LEGACY_ENV_CONTENT="WORKER_INSTALLER_INTEGRATION_ENV=preserve-exactly"
 
 created_autostream_user=false
+fixture_owns_paths=false
+fixture_owns_runtime_unit=false
+fixture_owns_service=false
+runtime_unit_identity=""
+runtime_unit_staging=""
 old_pid=""
+old_pid_starttime=""
+
+read_process_starttime() {
+  local pid=$1
+  local stat_line=""
+  local stat_tail=""
+  local -a stat_fields=()
+
+  [[ ${pid} =~ ^[1-9][0-9]*$ && -r /proc/${pid}/stat ]] || return 1
+  IFS= read -r stat_line < "/proc/${pid}/stat" || return 1
+  stat_tail="${stat_line##*) }"
+  read -r -a stat_fields <<< "${stat_tail}"
+  [[ ${#stat_fields[@]} -ge 20 && ${stat_fields[19]} =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${stat_fields[19]}"
+}
+
+kill_recorded_process_if_same_starttime() {
+  local current_starttime=""
+
+  [[ -n ${old_pid} && -n ${old_pid_starttime} ]] || return 0
+  if [[ ! -e /proc/${old_pid} ]]; then
+    old_pid=""
+    old_pid_starttime=""
+    return 0
+  fi
+  current_starttime="$(read_process_starttime "${old_pid}")" || return 1
+  [[ ${current_starttime} == "${old_pid_starttime}" ]] || return 2
+  kill "${old_pid}" || return 1
+  old_pid=""
+  old_pid_starttime=""
+}
+
+stage_runtime_unit() {
+  local source_path=$1
+  local staged_path=""
+
+  if ! staged_path="$(mktemp "/run/systemd/system/.${UNIT}.fixture.XXXXXXXX")"; then
+    die "could not stage the systemd runtime unit"
+  fi
+  runtime_unit_staging="${staged_path}"
+  install -o root -g root -m 0644 "${source_path}" "${runtime_unit_staging}"
+  sync -f -- "${runtime_unit_staging}"
+}
+
+create_runtime_unit_no_clobber() {
+  local source_path=$1
+
+  stage_runtime_unit "${source_path}"
+  if ! ln -- "${runtime_unit_staging}" "${RUNTIME_UNIT_PATH}"; then
+    rm -f -- "${runtime_unit_staging}"
+    runtime_unit_staging=""
+    die "runner became unclean at ${RUNTIME_UNIT_PATH}"
+  fi
+  fixture_owns_runtime_unit=true
+  runtime_unit_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}")"
+  rm -f -- "${runtime_unit_staging}"
+  runtime_unit_staging=""
+  sync -f -- /run/systemd/system
+}
+
+replace_owned_runtime_unit_atomically() {
+  local source_path=$1
+  local current_identity=""
+
+  [[ ${fixture_owns_runtime_unit} == true ]] || \
+    die "refusing to replace an unowned systemd runtime unit"
+  [[ -f ${RUNTIME_UNIT_PATH} && ! -L ${RUNTIME_UNIT_PATH} ]] || \
+    die "owned systemd runtime unit disappeared or became unsafe"
+  current_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}")"
+  [[ ${current_identity} == "${runtime_unit_identity}" ]] || \
+    die "owned systemd runtime unit was replaced externally"
+
+  stage_runtime_unit "${source_path}"
+  current_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}")"
+  if [[ ${current_identity} != "${runtime_unit_identity}" ]]; then
+    rm -f -- "${runtime_unit_staging}"
+    runtime_unit_staging=""
+    die "owned systemd runtime unit changed before atomic commit"
+  fi
+  mv -fT -- "${runtime_unit_staging}" "${RUNTIME_UNIT_PATH}"
+  runtime_unit_staging=""
+  runtime_unit_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}")"
+  sync -f -- /run/systemd/system
+}
+
+assert_loaded_runtime_unit() {
+  local expected_exec=$1
+  local expected_user=$2
+  local scenario=$3
+  local fragment_path=""
+  local exec_start=""
+  local service_user=""
+
+  fragment_path="$(systemctl show --property FragmentPath --value "${UNIT}")"
+  [[ ${fragment_path} == "${RUNTIME_UNIT_PATH}" ]] || \
+    die "${scenario} loaded unit from ${fragment_path:-unknown}, expected ${RUNTIME_UNIT_PATH}"
+  exec_start="$(systemctl show --property ExecStart --value "${UNIT}")"
+  [[ ${exec_start} == *"${expected_exec}"* ]] || \
+    die "${scenario} loaded unexpected ExecStart: ${exec_start:-empty}"
+  service_user="$(systemctl show --property User --value "${UNIT}")"
+  [[ ${service_user} == "${expected_user}" ]] || \
+    die "${scenario} loaded unexpected User: ${service_user:-root}"
+}
+
+assert_legacy_runtime_unit() {
+  local scenario=$1
+
+  [[ -f ${RUNTIME_UNIT_PATH} && ! -L ${RUNTIME_UNIT_PATH} ]] || \
+    die "${scenario} lost the legacy runtime unit"
+  [[ $(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $1 }') == \
+    "${runtime_unit_before}" ]] || \
+    die "${scenario} changed the legacy runtime unit"
+  [[ $(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $1 }') == \
+    "$(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }')" ]] || \
+    die "${scenario} runtime unit diverged from the restored legacy unit"
+  assert_loaded_runtime_unit "/usr/bin/sleep" "" "${scenario}"
+}
+
+run_preflight_cleanup_probe() {
+  local probe_enabled_state=""
+  local probe_hash=""
+  local probe_identity=""
+  local probe_pid=""
+  local probe_status=0
+  local mismatch_status=0
+  local saved_starttime=""
+  local current_identity=""
+
+  [[ ${fixture_owns_paths} == false &&
+    ${fixture_owns_runtime_unit} == false &&
+    ${fixture_owns_service} == false ]] || \
+    die "preflight cleanup probe began after fixture ownership"
+
+  cat > "${UNIT_PATH}" <<EOF
+[Unit]
+Description=AutoStream Worker preflight cleanup sentinel
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sleep infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "${UNIT_PATH}"
+  create_runtime_unit_no_clobber "${UNIT_PATH}"
+  systemctl daemon-reload
+  fixture_owns_service=true
+  systemctl start "${UNIT}"
+  probe_pid="$(systemctl show --property MainPID --value "${UNIT}")"
+  [[ ${probe_pid} =~ ^[1-9][0-9]*$ ]] || \
+    die "preflight cleanup sentinel did not start"
+  old_pid="${probe_pid}"
+  if ! old_pid_starttime="$(read_process_starttime "${old_pid}")"; then
+    die "could not record the preflight cleanup sentinel process identity"
+  fi
+  assert_loaded_runtime_unit "/usr/bin/sleep" "" "preflight cleanup sentinel"
+  saved_starttime="${old_pid_starttime}"
+  old_pid_starttime=0
+  set +e
+  kill_recorded_process_if_same_starttime
+  mismatch_status=$?
+  set -e
+  [[ ${mismatch_status} -eq 2 ]] || \
+    die "PID reuse guard did not reject a mismatched process identity"
+  kill -0 "${probe_pid}" || die "PID reuse guard killed the mismatched process"
+  old_pid_starttime="${saved_starttime}"
+  probe_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}")"
+  probe_hash="$(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $1 }')"
+  probe_enabled_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"
+  rm -f -- "${UNIT_PATH}"
+
+  set +e
+  AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS=1 \
+    AUTOSTREAM_WORKER_INSTALLER_TEST_PREFLIGHT_PROBE=1 \
+    bash "$0" > "${WORK_DIR}/preflight-cleanup-probe.out" 2>&1
+  probe_status=$?
+  set -e
+  [[ ${probe_status} -ne 0 ]] || \
+    die "preflight cleanup probe unexpectedly passed"
+  grep -Fx -- \
+    "worker installer integration test: runner is not clean at ${RUNTIME_UNIT_PATH}" \
+    "${WORK_DIR}/preflight-cleanup-probe.out" >/dev/null || \
+    die "preflight cleanup probe did not stop at the runtime unit conflict"
+  [[ -f ${RUNTIME_UNIT_PATH} && ! -L ${RUNTIME_UNIT_PATH} ]] || \
+    die "preflight failure removed the existing runtime unit"
+  [[ $(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}") == "${probe_identity}" ]] || \
+    die "preflight failure replaced the existing runtime unit"
+  [[ $(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $1 }') == \
+    "${probe_hash}" ]] || \
+    die "preflight failure changed the existing runtime unit"
+  [[ $(systemctl show --property MainPID --value "${UNIT}") == "${probe_pid}" ]] || \
+    die "preflight failure replaced the existing service process"
+  kill -0 "${probe_pid}" || die "preflight failure stopped the existing service process"
+  [[ $(systemctl is-enabled "${UNIT}" 2>/dev/null || true) == \
+    "${probe_enabled_state}" ]] || \
+    die "preflight failure changed the existing service enablement"
+  assert_loaded_runtime_unit "/usr/bin/sleep" "" "preflight failure"
+
+  current_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}")"
+  [[ ${current_identity} == "${runtime_unit_identity}" ]] || \
+    die "preflight cleanup sentinel runtime unit was replaced externally"
+  systemctl stop "${UNIT}"
+  current_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}")"
+  [[ ${current_identity} == "${runtime_unit_identity}" ]] || \
+    die "preflight cleanup sentinel runtime unit was replaced externally"
+  fixture_owns_service=false
+  old_pid=""
+  old_pid_starttime=""
+  rm -f -- "${RUNTIME_UNIT_PATH}"
+  fixture_owns_runtime_unit=false
+  runtime_unit_identity=""
+  sync -f -- /run/systemd/system
+  systemctl daemon-reload
+  [[ $(systemctl show --property LoadState --value "${UNIT}") == "not-found" ]] || \
+    die "preflight cleanup sentinel remained loaded"
+}
 
 cleanup() {
   local exit_code=$?
+  local current_identity=""
+  local active_state=""
+  local load_state=""
+  local kill_status=0
+  local cleanup_failed=false
+  local runtime_identity_matches=false
+  local should_reload=false
+
   set +e
-  systemctl stop "${UNIT}" >/dev/null 2>&1
-  systemctl disable "${UNIT}" >/dev/null 2>&1
-  rm -f -- "${UNIT_PATH}"
-  systemctl daemon-reload >/dev/null 2>&1
-  if [[ -n ${old_pid} ]]; then
-    kill "${old_pid}" >/dev/null 2>&1
+  if [[ ${fixture_owns_runtime_unit} == true &&
+    -f ${RUNTIME_UNIT_PATH} && ! -L ${RUNTIME_UNIT_PATH} ]]; then
+    current_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}" 2>/dev/null)"
+    if [[ -n ${runtime_unit_identity} &&
+      ${current_identity} == "${runtime_unit_identity}" ]]; then
+      runtime_identity_matches=true
+    else
+      printf '%s\n' "worker installer integration test cleanup: owned runtime unit identity changed" >&2
+      cleanup_failed=true
+    fi
+  elif [[ ${fixture_owns_runtime_unit} == true ]]; then
+    printf '%s\n' "worker installer integration test cleanup: owned runtime unit is missing or unsafe" >&2
+    cleanup_failed=true
+    [[ ! -e ${RUNTIME_UNIT_PATH} && ! -L ${RUNTIME_UNIT_PATH} ]] && should_reload=true
   fi
-  rm -f -- "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}" "${ENV_PATH}" "${TARGET_LOCK}"
-  rm -rf -- \
-    "${STATE_DIR}" \
-    "${MANAGED_ROOT}" \
-    "${INSTALL_BACKUP_ROOT}" \
-    "${WORK_DIR}"
-  rmdir \
-    /var/backups/autostream/install-migrations \
-    /var/backups/autostream \
-    /var/lib/autostream \
-    /opt/autostream \
-    /etc/autostream \
-    /run/autostream-updater >/dev/null 2>&1
-  if [[ ${created_autostream_user} == true ]]; then
-    userdel autostream >/dev/null 2>&1
-    groupdel autostream >/dev/null 2>&1
+  if [[ ${fixture_owns_service} == true &&
+    ${runtime_identity_matches} == true ]]; then
+    current_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}" 2>/dev/null)"
+    if [[ ${current_identity} != "${runtime_unit_identity}" ]]; then
+      runtime_identity_matches=false
+      printf '%s\n' "worker installer integration test cleanup: runtime unit identity changed before service cleanup" >&2
+      cleanup_failed=true
+    else
+      if systemctl stop "${UNIT}" >/dev/null 2>&1; then
+        old_pid=""
+        old_pid_starttime=""
+      else
+        printf '%s\n' "worker installer integration test cleanup: could not stop owned service" >&2
+        cleanup_failed=true
+      fi
+      if ! systemctl disable "${UNIT}" >/dev/null 2>&1; then
+        printf '%s\n' "worker installer integration test cleanup: could not disable owned service" >&2
+        cleanup_failed=true
+      fi
+    fi
+  fi
+  if [[ ${fixture_owns_service} == true && -n ${old_pid} ]]; then
+    kill_recorded_process_if_same_starttime
+    kill_status=$?
+    case ${kill_status} in
+      0)
+        ;;
+      2)
+        printf '%s\n' "worker installer integration test cleanup: refusing to kill a reused PID" >&2
+        ;;
+      *)
+        printf '%s\n' "worker installer integration test cleanup: could not terminate recorded service process" >&2
+        cleanup_failed=true
+        ;;
+    esac
+  fi
+  if [[ ${fixture_owns_runtime_unit} == true &&
+    ${runtime_identity_matches} == true ]]; then
+    current_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}" 2>/dev/null)"
+    if [[ ${current_identity} != "${runtime_unit_identity}" ]]; then
+      runtime_identity_matches=false
+      printf '%s\n' "worker installer integration test cleanup: runtime unit identity changed before removal" >&2
+      cleanup_failed=true
+    else
+      if rm -f -- "${RUNTIME_UNIT_PATH}" &&
+        [[ ! -e ${RUNTIME_UNIT_PATH} && ! -L ${RUNTIME_UNIT_PATH} ]]; then
+        should_reload=true
+      else
+        printf '%s\n' "worker installer integration test cleanup: could not remove owned runtime unit" >&2
+        cleanup_failed=true
+      fi
+    fi
+  fi
+  if [[ -n ${runtime_unit_staging} ]]; then
+    if ! rm -f -- "${runtime_unit_staging}"; then
+      printf '%s\n' "worker installer integration test cleanup: could not remove runtime staging file" >&2
+      cleanup_failed=true
+    fi
+  fi
+  if [[ ${fixture_owns_paths} == true ]]; then
+    if ! rm -f -- "${UNIT_PATH}"; then
+      printf '%s\n' "worker installer integration test cleanup: could not remove private systemd unit" >&2
+      cleanup_failed=true
+    fi
+  fi
+  if [[ ${should_reload} == true ]]; then
+    if ! sync -f -- /run/systemd/system ||
+      ! systemctl daemon-reload >/dev/null 2>&1; then
+      printf '%s\n' "worker installer integration test cleanup: could not reload systemd after runtime cleanup" >&2
+      cleanup_failed=true
+    fi
+  fi
+  if [[ ${fixture_owns_service} == true || ${fixture_owns_runtime_unit} == true ]]; then
+    active_state="$(systemctl show --property ActiveState --value "${UNIT}" 2>/dev/null)"
+    if [[ ${active_state} != "inactive" ]]; then
+      printf '%s\n' "worker installer integration test cleanup: service did not become inactive" >&2
+      cleanup_failed=true
+    fi
+    load_state="$(systemctl show --property LoadState --value "${UNIT}" 2>/dev/null)"
+    if [[ ${load_state} != "not-found" ]]; then
+      printf '%s\n' "worker installer integration test cleanup: service unit remained loaded" >&2
+      cleanup_failed=true
+    fi
+  fi
+  if [[ ${fixture_owns_paths} == true ]]; then
+    rm -f -- "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}" "${ENV_PATH}" "${TARGET_LOCK}"
+    rm -rf -- \
+      "${STATE_DIR}" \
+      "${MANAGED_ROOT}" \
+      "${INSTALL_BACKUP_ROOT}"
+    rmdir \
+      /var/backups/autostream/install-migrations \
+      /var/backups/autostream \
+      /var/lib/autostream \
+      /opt/autostream \
+      /etc/autostream \
+      /run/autostream-updater >/dev/null 2>&1
+    if [[ ${created_autostream_user} == true ]]; then
+      userdel autostream >/dev/null 2>&1
+      groupdel autostream >/dev/null 2>&1
+    fi
+  fi
+  rm -rf -- "${WORK_DIR}"
+  if [[ ${cleanup_failed} == true && ${exit_code} -eq 0 ]]; then
+    exit_code=1
   fi
   exit "${exit_code}"
 }
@@ -129,6 +544,7 @@ chmod 0755 "${WORK_DIR}"
 
 for path in \
   "${UNIT_PATH}" \
+  "${RUNTIME_UNIT_PATH}" \
   "${PUBLIC_BINARY}" \
   "${PUBLIC_ALIAS}" \
   "${ENV_PATH}" \
@@ -138,9 +554,17 @@ for path in \
   "${TARGET_LOCK}"; do
   [[ ! -e ${path} && ! -L ${path} ]] || die "runner is not clean at ${path}"
 done
+loaded_unit_state="$(systemctl show --property LoadState --value "${UNIT}" 2>/dev/null || true)"
+[[ ${loaded_unit_state} == "not-found" ]] || \
+  die "runner service is already loaded: ${UNIT} (${loaded_unit_state:-unknown})"
 if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
   die "runner already has an autostream account"
 fi
+if [[ ${AUTOSTREAM_WORKER_INSTALLER_TEST_PREFLIGHT_PROBE:-} == "1" ]]; then
+  die "preflight probe unexpectedly reached the mutation boundary"
+fi
+run_preflight_cleanup_probe
+fixture_owns_paths=true
 created_autostream_user=true
 
 install -d -o root -g root -m 0755 \
@@ -351,17 +775,24 @@ ExecStart=/usr/bin/sleep infinity
 WantedBy=multi-user.target
 EOF
 chmod 0644 "${UNIT_PATH}"
+create_runtime_unit_no_clobber "${UNIT_PATH}"
 systemctl daemon-reload
+fixture_owns_service=true
 systemctl start "${UNIT}"
 old_pid="$(systemctl show --property MainPID --value "${UNIT}")"
 [[ ${old_pid} =~ ^[1-9][0-9]*$ ]] || die "legacy service did not start"
+if ! old_pid_starttime="$(read_process_starttime "${old_pid}")"; then
+  die "could not record the legacy service process identity"
+fi
 kill -0 "${old_pid}" || die "legacy service PID is not alive"
+assert_loaded_runtime_unit "/usr/bin/sleep" "" "legacy startup"
 legacy_unit_file_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"
 [[ ${legacy_unit_file_state} == "disabled" ]] || \
   die "legacy fixture must begin disabled, got ${legacy_unit_file_state:-unknown}"
 
 env_before="$(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }')"
 unit_before="$(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }')"
+runtime_unit_before="$(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $1 }')"
 
 (
   exec 8>"${TARGET_LOCK}"
@@ -394,6 +825,7 @@ grep -Fx -- \
   die "lock contention mutated the host backup state"
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
   die "lock contention mutated the host running process"
+assert_legacy_runtime_unit "lock contention"
 systemctl is-enabled --quiet "${UNIT}" && die "lock contention enabled the service"
 
 set +e
@@ -424,6 +856,7 @@ grep -Fx -- "${LEGACY_ALIAS_CONTENT}" "${PUBLIC_ALIAS}" >/dev/null || \
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
   die "failed migration replaced the running legacy process"
 kill -0 "${old_pid}" || die "failed migration stopped the running legacy process"
+assert_legacy_runtime_unit "failed migration"
 systemctl is-enabled --quiet "${UNIT}" && die "failed migration unexpectedly enabled the service"
 
 for retained in \
@@ -487,6 +920,7 @@ grep -Fx -- "${LEGACY_ALIAS_CONTENT}" "${PUBLIC_ALIAS}" >/dev/null || \
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
   die "sync failure replaced the running legacy process"
 kill -0 "${old_pid}" || die "sync failure stopped the running legacy process"
+assert_legacy_runtime_unit "sync failure"
 systemctl is-enabled --quiet "${UNIT}" && die "sync failure enabled the service"
 for retained in \
   "${RETAINED_DIR}/autostream-worker" \
@@ -509,6 +943,12 @@ chmod 0755 "${LOG_SYNC}"
 unshare --mount --propagation private bash -c \
   "mount --bind '${LOG_SYNC}' /usr/bin/sync && '${EXTRACTED_ROOT}/install-autostream-worker'" \
   > "${WORK_DIR}/migration.out" 2>&1
+replace_owned_runtime_unit_atomically "${UNIT_PATH}"
+systemctl daemon-reload
+assert_loaded_runtime_unit "${PUBLIC_BINARY}" "autostream" "successful migration"
+[[ $(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $1 }') == \
+  "$(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }')" ]] || \
+  die "successful migration did not synchronize the managed runtime unit"
 grep -F -- \
   "install-autostream-worker: resuming interrupted public-path migration from verified backup: ${RETAINED_DIR}/worker" \
   "${WORK_DIR}/migration.out" >/dev/null || \
@@ -554,6 +994,10 @@ systemctl is-enabled --quiet "${UNIT}" && die "successful migration unexpectedly
 "${EXTRACTED_ROOT}/install-autostream-worker" > "${WORK_DIR}/idempotent.out"
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
   die "idempotent reinstall replaced the running legacy process"
+assert_loaded_runtime_unit "${PUBLIC_BINARY}" "autostream" "idempotent reinstall"
+[[ $(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $1 }') == \
+  "$(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }')" ]] || \
+  die "idempotent reinstall changed the loaded runtime unit"
 [[ $(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }') == "${env_before}" ]] || \
   die "idempotent reinstall changed the existing environment"
 systemctl is-enabled --quiet "${UNIT}" && die "idempotent reinstall unexpectedly enabled the service"
