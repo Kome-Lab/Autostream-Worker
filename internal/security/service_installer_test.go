@@ -137,10 +137,22 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 	fixture := string(body)
 	for _, marker := range []string{
 		`AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS`,
+		`autostream-worker-installer-test-scratch /mnt`,
+		`install -d -o root -g root -m 0755 /mnt/usr-lower /mnt/usr-upper /mnt/usr-upper/local`,
+		`install -d -o root -g root -m 0700 /mnt/usr-work`,
+		`mount --rbind /usr /mnt/usr-lower`,
+		`mount --make-rprivate /mnt/usr-lower`,
+		`lowerdir=/mnt/usr-lower,upperdir=/mnt/usr-upper,workdir=/mnt/usr-work`,
+		`autostream-worker-installer-test-usr-overlay`,
+		`grep -Eq ' /usr .* - overlay autostream-worker-installer-test-usr-overlay '`,
 		`autostream-worker-installer-test /usr/local/bin`,
 		`autostream-worker-installer-test-opt /opt`,
+		`isolated /mnt scratch mount is missing`,
+		`isolated /usr overlay mount is missing`,
 		`isolated /usr/local/bin mount is missing`,
 		`isolated /opt mount is missing`,
+		`could not create an isolated safe /usr fixture`,
+		`could not create an isolated safe /usr/local fixture`,
 		`could not create an isolated safe /usr/local/bin fixture`,
 		`could not create an isolated safe /opt fixture`,
 		`mount --bind '${FAIL_SYSTEMCTL}' /usr/bin/systemctl`,
@@ -168,6 +180,28 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 	workDirIndex := strings.Index(fixture, `work_dir=""`)
 	if namespaceIndex < 0 || workDirIndex < 0 || namespaceIndex >= workDirIndex {
 		t.Fatal("installer integration fixture must enter its isolated mount namespace before creating mutable state")
+	}
+	scratchIndex := strings.Index(
+		fixture,
+		`autostream-worker-installer-test-scratch /mnt`,
+	)
+	outerStrictIndex := strings.LastIndex(fixture, "set -euo pipefail")
+	lowerIndex := strings.Index(fixture, `mount --rbind /usr /mnt/usr-lower`)
+	privateIndex := strings.Index(fixture, `mount --make-rprivate /mnt/usr-lower`)
+	overlayIndex := strings.Index(fixture, `autostream-worker-installer-test-usr-overlay`)
+	childMountIndex := strings.Index(
+		fixture,
+		`autostream-worker-installer-test /usr/local/bin`,
+	)
+	if outerStrictIndex < 0 || scratchIndex < 0 || lowerIndex < 0 || privateIndex < 0 ||
+		overlayIndex < 0 || childMountIndex < 0 ||
+		namespaceIndex >= outerStrictIndex ||
+		outerStrictIndex >= scratchIndex ||
+		scratchIndex >= lowerIndex ||
+		lowerIndex >= privateIndex ||
+		privateIndex >= overlayIndex ||
+		overlayIndex >= childMountIndex {
+		t.Fatal("installer integration fixture must isolate /mnt and overlay /usr before child mounts")
 	}
 	const safeAccountReset = "userdel autostream\nif getent group autostream >/dev/null 2>&1; then\n  groupdel autostream\nfi"
 	if count := strings.Count(fixture, safeAccountReset); count != 1 {

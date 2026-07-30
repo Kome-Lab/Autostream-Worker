@@ -15,6 +15,15 @@ die() {
 
 if [[ ${AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS:-} != "1" ]]; then
   exec unshare --mount --propagation private bash -c '
+    set -euo pipefail
+    mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
+      autostream-worker-installer-test-scratch /mnt
+    install -d -o root -g root -m 0755 /mnt/usr-lower /mnt/usr-upper /mnt/usr-upper/local
+    install -d -o root -g root -m 0700 /mnt/usr-work
+    mount --rbind /usr /mnt/usr-lower
+    mount --make-rprivate /mnt/usr-lower
+    mount -t overlay -o nodev,nosuid,lowerdir=/mnt/usr-lower,upperdir=/mnt/usr-upper,workdir=/mnt/usr-work \
+      autostream-worker-installer-test-usr-overlay /usr
     mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
       autostream-worker-installer-test /usr/local/bin
     mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
@@ -22,10 +31,18 @@ if [[ ${AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS:-} != "1" ]]; then
     exec env AUTOSTREAM_WORKER_INSTALLER_TEST_MOUNT_NS=1 bash "$1"
   ' autostream-worker-installer-test-mount "$0"
 fi
+grep -Eq ' /mnt .* - tmpfs autostream-worker-installer-test-scratch ' \
+  /proc/self/mountinfo || die "isolated /mnt scratch mount is missing"
+grep -Eq ' /usr .* - overlay autostream-worker-installer-test-usr-overlay ' \
+  /proc/self/mountinfo || die "isolated /usr overlay mount is missing"
 grep -Eq ' /usr/local/bin .* - tmpfs autostream-worker-installer-test ' \
   /proc/self/mountinfo || die "isolated /usr/local/bin mount is missing"
 grep -Eq ' /opt .* - tmpfs autostream-worker-installer-test-opt ' \
   /proc/self/mountinfo || die "isolated /opt mount is missing"
+[[ $(stat -c '%U:%G:%a' -- /usr) == "root:root:755" ]] || \
+  die "could not create an isolated safe /usr fixture"
+[[ $(stat -c '%U:%G:%a' -- /usr/local) == "root:root:755" ]] || \
+  die "could not create an isolated safe /usr/local fixture"
 [[ $(stat -c '%U:%G:%a' -- /usr/local/bin) == "root:root:755" ]] || \
   die "could not create an isolated safe /usr/local/bin fixture"
 [[ $(stat -c '%U:%G:%a' -- /opt) == "root:root:755" ]] || \
