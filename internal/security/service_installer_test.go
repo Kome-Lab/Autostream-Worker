@@ -579,9 +579,13 @@ func TestWorkerInstallerPrevalidatesAccountAndBindsPermanentLock(t *testing.T) {
 		`exec 9<>"${TARGET_LOCK}"`,
 		`readonly SHARED_HOST_SETUP_LOCK="/run/autostream-updater/.autostream-runtime-host-setup.lock"`,
 		`exec 8<>"${SHARED_HOST_SETUP_LOCK}"`,
+		`-f /proc/self/fd/8`,
+		`$(stat -Lc '%U:%G:%a' -- /proc/self/fd/8) == "root:root:600"`,
 		`shared host-setup lock identity changed after acquisition`,
 		`chmod 0600 /proc/self/fd/9`,
 		`chown root:root /proc/self/fd/9`,
+		`-f /proc/self/fd/9`,
+		`$(stat -Lc '%U:%G:%a' -- /proc/self/fd/9) == "root:root:600"`,
 		`updater target lock identity changed after acquisition`,
 		`updater target lock is permanent installer coordination state`,
 	} {
@@ -594,6 +598,9 @@ func TestWorkerInstallerPrevalidatesAccountAndBindsPermanentLock(t *testing.T) {
 	}
 	if strings.Contains(installer, `exec 8>"${SHARED_HOST_SETUP_LOCK}"`) {
 		t.Fatal("Worker shared lock acquisition must not truncate the permanent lock inode")
+	}
+	if strings.Contains(installer, `stat -Lc '%F:%U:%G:%a'`) {
+		t.Fatal("Worker lock validation must not depend on GNU stat's content-sensitive file-type description")
 	}
 	sharedLockIndex := strings.Index(installer, `flock -n 8 || die "another AutoStream installer is provisioning shared host state"`)
 	targetLockIndex := strings.Index(installer, `flock -n 9 || die "another privileged update is already active for ${UNIT_NAME}"`)

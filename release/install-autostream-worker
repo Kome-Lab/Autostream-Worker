@@ -461,6 +461,12 @@ rollback_unit_and_environment() {
   local unit_recovered=true
   local failed=false
 
+  if [[ ${unit_installed} != true &&
+    ${previous_unit_exists} != true &&
+    ${created_env} != true ]]; then
+    return 0
+  fi
+
   if [[ ${unit_installed} == true ]]; then
     if [[ ${previous_unit_exists} == true ]]; then
       unit_recovered=false
@@ -1157,13 +1163,15 @@ chown root:root /proc/self/fd/8
 chmod 0600 /proc/self/fd/8
 shared_lock_fd_identity="$(stat -Lc '%d:%i' -- /proc/self/fd/8)"
 [[ -f ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} &&
-  $(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/8) == "regular file:root:root:600" &&
+  -f /proc/self/fd/8 &&
+  $(stat -Lc '%U:%G:%a' -- /proc/self/fd/8) == "root:root:600" &&
   $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" &&
   ${shared_lock_fd_identity} == "$(stat -c '%d:%i' -- "${SHARED_HOST_SETUP_LOCK}")" ]] || \
   die "shared host-setup lock identity changed while being opened"
 flock -n 8 || die "another AutoStream installer is provisioning shared host state"
 [[ -f ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} &&
-  $(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/8) == "regular file:root:root:600" &&
+  -f /proc/self/fd/8 &&
+  $(stat -Lc '%U:%G:%a' -- /proc/self/fd/8) == "root:root:600" &&
   $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" &&
   ${shared_lock_fd_identity} == "$(stat -c '%d:%i' -- "${SHARED_HOST_SETUP_LOCK}")" ]] || \
   die "shared host-setup lock identity changed after acquisition"
@@ -1186,13 +1194,15 @@ chown root:root /proc/self/fd/9
 chmod 0600 /proc/self/fd/9
 target_lock_fd_identity="$(stat -Lc '%d:%i' -- /proc/self/fd/9)"
 [[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} &&
-  $(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/9) == "regular file:root:root:600" &&
+  -f /proc/self/fd/9 &&
+  $(stat -Lc '%U:%G:%a' -- /proc/self/fd/9) == "root:root:600" &&
   $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" &&
   ${target_lock_fd_identity} == "$(stat -c '%d:%i' -- "${TARGET_LOCK}")" ]] || \
   die "updater target lock identity changed while being opened"
 flock -n 9 || die "another privileged update is already active for ${UNIT_NAME}"
 [[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} &&
-  $(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/9) == "regular file:root:root:600" &&
+  -f /proc/self/fd/9 &&
+  $(stat -Lc '%U:%G:%a' -- /proc/self/fd/9) == "root:root:600" &&
   $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" &&
   ${target_lock_fd_identity} == "$(stat -c '%d:%i' -- "${TARGET_LOCK}")" ]] || \
   die "updater target lock identity changed after acquisition"
