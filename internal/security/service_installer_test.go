@@ -342,6 +342,7 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 		`sync failure retained a state directory that was absent before installation`,
 		`sync failure did not restore exact live path metadata and content`,
 		`GID 0 service-group rejection created the autostream service account`,
+		`groupdel --force autostream`,
 		`fresh daemon-reload rollback retained the installer-created account`,
 		`fresh daemon-reload rollback retained a transactional path`,
 		`fresh daemon-reload rollback did not retain only the permanent safe lock state`,

@@ -997,7 +997,7 @@ for path in \
   [[ ! -e ${path} && ! -L ${path} ]] || \
     die "GID 0 service-group rejection mutated the host: ${path}"
 done
-groupdel autostream
+groupdel --force autostream
 
 assert_fresh_account_signal_rollback() {
   local scenario=$1
