@@ -16,57 +16,39 @@ internal paths by hand.
 
 - Linux amd64 or arm64 matching the downloaded archive.
 - Root access through `sudo`.
-- Authenticated GitHub CLI (`gh`) on the server.
 - `jq`, `sha256sum`, `tar`, and standard Ubuntu system tools.
 - An existing `/etc/autostream/worker.env`, when present, owned by `root:root`
   with mode `0600` or `0640`.
-- The following four files downloaded together from the same authenticated,
-  official immutable GitHub Release:
-  - `autostream-worker_<VERSION>_linux_<ARCH>.tar.gz`
-  - `autostream-worker_<VERSION>_linux_<ARCH>.tar.gz.sha256`
-  - `release-manifest.json`
-  - `release-manifest.json.sha256`
+- Only the matching
+  `autostream-worker_<VERSION>_linux_<ARCH>.tar.gz` archive is required on the
+  server. Keep it next to the extracted directory while the installer runs.
 
-Download those four files to `/tmp`, then copy them into a root-owned staging
-directory:
+## Verify before upload
 
-```bash
-sudo install -d -o root -g root -m 0755 /opt/autostream/releases
-sudo install -d -o root -g root -m 0755 /opt/autostream/releases/artifacts
-sudo install -o root -g root -m 0644 /tmp/autostream-worker_vX.Y.Z_linux_amd64.tar.gz /opt/autostream/releases/artifacts/autostream-worker_vX.Y.Z_linux_amd64.tar.gz
-sudo install -o root -g root -m 0644 /tmp/autostream-worker_vX.Y.Z_linux_amd64.tar.gz.sha256 /opt/autostream/releases/artifacts/autostream-worker_vX.Y.Z_linux_amd64.tar.gz.sha256
-sudo install -o root -g root -m 0644 /tmp/release-manifest.json /opt/autostream/releases/artifacts/release-manifest.json
-sudo install -o root -g root -m 0644 /tmp/release-manifest.json.sha256 /opt/autostream/releases/artifacts/release-manifest.json.sha256
-cd /opt/autostream/releases/artifacts
-```
-
-## Verify official provenance
-
-As the ordinary login user, verify that both the root-owned archive and
-manifest copies were produced by the official release workflow:
+On an administration workstation with authenticated GitHub CLI access, verify
+the one archive before transferring it to the server:
 
 ```bash
 gh attestation verify autostream-worker_vX.Y.Z_linux_amd64.tar.gz \
   --repo Kome-Lab/Autostream-Worker \
   --signer-workflow Kome-Lab/Autostream-Worker/.github/workflows/release-host.yml \
   --deny-self-hosted-runners
-gh attestation verify release-manifest.json \
-  --repo Kome-Lab/Autostream-Worker \
-  --signer-workflow Kome-Lab/Autostream-Worker/.github/workflows/release-host.yml \
-  --deny-self-hosted-runners
 ```
 
-Do not continue if either verification fails. The direct archive attestation
-authenticates the installer before root executes it. The separately attested
-manifest binds that same archive by its exact name, size, architecture, and
-SHA-256 digest.
+Do not upload or execute an archive if verification fails. Internal checksums
+detect accidental corruption but are not a substitute for this provenance
+check. Transfer the verified archive over an authenticated channel.
 
 ## Install
 
-Extract the root-owned archive, enter its directory, and run the bundled
-installer:
+On the server, copy the one uploaded archive into a root-owned staging
+directory, extract it, and run the bundled installer:
 
 ```bash
+sudo install -d -o root -g root -m 0755 /opt/autostream/releases
+sudo install -d -o root -g root -m 0755 /opt/autostream/releases/artifacts
+sudo install -o root -g root -m 0644 /tmp/autostream-worker_vX.Y.Z_linux_amd64.tar.gz /opt/autostream/releases/artifacts/autostream-worker_vX.Y.Z_linux_amd64.tar.gz
+cd /opt/autostream/releases/artifacts
 sudo test ! -e autostream-worker_vX.Y.Z_linux_amd64
 sudo test ! -L autostream-worker_vX.Y.Z_linux_amd64
 sudo tar --no-same-owner --no-same-permissions -xzf autostream-worker_vX.Y.Z_linux_amd64.tar.gz
@@ -74,8 +56,14 @@ cd autostream-worker_vX.Y.Z_linux_amd64
 sudo ./install-autostream-worker
 ```
 
-The installer verifies the archive checksum, manifest, inner checksums,
-architecture, and binary version. It then:
+No `.sha256` sidecar or external `release-manifest.json` is needed for this
+manual path. Those files remain published for compatible automatic updaters,
+but this installer ignores them even when they are present.
+
+The installer takes a stable copy of the adjacent archive, records its
+SHA-256 digest, and verifies archive path safety, the exact inner checksum file
+set, `artifact-manifest.json`, host architecture, and the binary version,
+commit, and build date. It then:
 
 - creates the `autostream` system account when absent;
 - installs the verified rollback baseline under `/opt/autostream/worker`;

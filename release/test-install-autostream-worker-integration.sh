@@ -146,15 +146,24 @@ readonly ARTIFACTS_DIR="${WORK_DIR}/artifacts"
 readonly EXTRACTED_ROOT="${ARTIFACTS_DIR}/${ARTIFACT_ID}"
 readonly ARCHIVE="${ARTIFACTS_DIR}/${ARTIFACT_ID}.tar.gz"
 readonly REAL_SYSTEMCTL_COPY="${WORK_DIR}/systemctl.real"
+readonly REAL_GROUPADD_COPY="${WORK_DIR}/groupadd.real"
+readonly REAL_USERADD_COPY="${WORK_DIR}/useradd.real"
 readonly REAL_MKTEMP_COPY="${WORK_DIR}/mktemp.real"
 readonly REAL_SYNC_COPY="${WORK_DIR}/sync.real"
 readonly FAIL_SYSTEMCTL="${WORK_DIR}/systemctl.fail"
+readonly SIGNAL_SYSTEMCTL="${WORK_DIR}/systemctl.signal"
+readonly SIGNAL_GROUPADD="${WORK_DIR}/groupadd.signal"
+readonly SIGNAL_USERADD="${WORK_DIR}/useradd.signal"
 readonly FAIL_MKTEMP="${WORK_DIR}/mktemp.fail"
 readonly FAIL_SYNC="${WORK_DIR}/sync.fail"
 readonly LOG_SYNC="${WORK_DIR}/sync.log"
 readonly SYSTEMCTL_CALL_LOG="${WORK_DIR}/systemctl.calls"
 readonly SYSTEMCTL_MOUNT_MARKER="${WORK_DIR}/systemctl.mount.ok"
 readonly MKTEMP_REACHED_MARKER="${WORK_DIR}/mktemp.reached"
+readonly GROUPADD_SIGNAL_MARKER="${WORK_DIR}/groupadd.signal.reached"
+readonly USERADD_SIGNAL_MARKER="${WORK_DIR}/useradd.signal.reached"
+readonly SIGNAL_REACHED_MARKER="${WORK_DIR}/signal.reached"
+readonly SIGNAL_MATCH_COUNT="${WORK_DIR}/signal.match-count"
 readonly SYNC_REACHED_MARKER="${WORK_DIR}/sync.reached"
 readonly SYNC_MATCH_COUNT="${WORK_DIR}/sync.match-count"
 readonly SYNC_CALL_LOG="${WORK_DIR}/sync.calls"
@@ -169,12 +178,14 @@ readonly PUBLIC_BINARY="/usr/local/bin/autostream-worker"
 readonly PUBLIC_ALIAS="/usr/local/bin/worker"
 readonly ENV_PATH="/etc/autostream/worker.env"
 readonly STATE_DIR="/var/lib/autostream/worker"
+readonly STATE_SENTINEL="${STATE_DIR}/rollback-sentinel.txt"
 readonly MANAGED_ROOT="/opt/autostream/worker"
 readonly INSTALL_BACKUP_ROOT="/var/backups/autostream/install-migrations/worker"
 target_lock_id="$(printf '%s' "${UNIT}" | sha256sum | awk 'NR == 1 { print substr($1, 1, 12) }')"
 [[ ${target_lock_id} =~ ^[0-9a-f]{12}$ ]] || die "could not derive updater target lock ID"
 readonly TARGET_LOCK_ID="${target_lock_id}"
 readonly TARGET_LOCK="/run/autostream-updater/.autostream-updater-${TARGET_LOCK_ID}.lock"
+readonly SHARED_HOST_SETUP_LOCK="/run/autostream-updater/.autostream-runtime-host-setup.lock"
 readonly LEGACY_UNIT_CONTENT="worker-installer-integration-legacy-unit"
 readonly LEGACY_BINARY_CONTENT="worker-installer-integration-legacy-binary"
 readonly LEGACY_ALIAS_CONTENT="worker-installer-integration-legacy-alias"
@@ -184,6 +195,7 @@ created_autostream_user=false
 fixture_owns_paths=false
 fixture_owns_runtime_unit=false
 fixture_owns_service=false
+late_preflight_public_path_owned=false
 runtime_unit_identity=""
 runtime_unit_staging=""
 old_pid=""
@@ -416,6 +428,15 @@ cleanup() {
   local should_reload=false
 
   set +e
+  if [[ ${late_preflight_public_path_owned} == true ]]; then
+    if [[ -d ${PUBLIC_BINARY} && ! -L ${PUBLIC_BINARY} &&
+      -z $(find "${PUBLIC_BINARY}" -mindepth 1 -print -quit) ]]; then
+      rmdir -- "${PUBLIC_BINARY}" || cleanup_failed=true
+    else
+      printf '%s\n' "worker installer integration test cleanup: late-preflight public path changed" >&2
+      cleanup_failed=true
+    fi
+  fi
   if [[ ${fixture_owns_runtime_unit} == true &&
     -f ${RUNTIME_UNIT_PATH} && ! -L ${RUNTIME_UNIT_PATH} ]]; then
     current_identity="$(stat -c '%d:%i' -- "${RUNTIME_UNIT_PATH}" 2>/dev/null)"
@@ -516,7 +537,12 @@ cleanup() {
     fi
   fi
   if [[ ${fixture_owns_paths} == true ]]; then
-    rm -f -- "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}" "${ENV_PATH}" "${TARGET_LOCK}"
+    rm -f -- \
+      "${PUBLIC_BINARY}" \
+      "${PUBLIC_ALIAS}" \
+      "${ENV_PATH}" \
+      "${TARGET_LOCK}" \
+      "${SHARED_HOST_SETUP_LOCK}"
     rm -rf -- \
       "${STATE_DIR}" \
       "${MANAGED_ROOT}" \
@@ -551,6 +577,7 @@ for path in \
   "${STATE_DIR}" \
   "${MANAGED_ROOT}" \
   "${INSTALL_BACKUP_ROOT}" \
+  "${SHARED_HOST_SETUP_LOCK}" \
   "${TARGET_LOCK}"; do
   [[ ! -e ${path} && ! -L ${path} ]] || die "runner is not clean at ${path}"
 done
@@ -578,8 +605,8 @@ cat > "${EXTRACTED_ROOT}/bin/autostream-worker" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "--version" ]; then
   printf '%s\n' 'autostream-worker v9.9.9'
-  printf '%s\n' 'commit: integration-test'
-  printf '%s\n' 'build_date: integration-test'
+  printf '%s\n' 'commit: 0123456789abcdef0123456789abcdef01234567'
+  printf '%s\n' 'build_date: 2026-01-01T00:00:00Z'
   exit 0
 fi
 exit 99
@@ -605,6 +632,31 @@ EOF
 printf '%s\n' 'AUTOSTREAM_BIND_ADDR=127.0.0.1:18084' \
   > "${EXTRACTED_ROOT}/.env.example"
 printf '%s\n' 'integration fixture' > "${EXTRACTED_ROOT}/README.install.md"
+jq -n \
+  --arg version "${VERSION}" \
+  --arg name "${ARTIFACT_ID}.tar.gz" \
+  --arg root "${ARTIFACT_ID}" \
+  '{
+    schema_version: 1,
+    component: "worker",
+    source_version: $version,
+    commit: "0123456789abcdef0123456789abcdef01234567",
+    build_date: "2026-01-01T00:00:00Z",
+    platform: {
+      os: "linux",
+      arch: "amd64"
+    },
+    archive: {
+      name: $name,
+      root: $root
+    },
+    compatibility: {
+      minimum_agent_version: "v1.0.0",
+      minimum_panel_version: null,
+      rollback_compatible: true,
+      database_schema: "none"
+    }
+  }' > "${EXTRACTED_ROOT}/artifact-manifest.json"
 
 (
   cd -- "${EXTRACTED_ROOT}"
@@ -613,51 +665,206 @@ printf '%s\n' 'integration fixture' > "${EXTRACTED_ROOT}/README.install.md"
     xargs -0 sha256sum > checksums.txt
 )
 tar -C "${ARTIFACTS_DIR}" -czf "${ARCHIVE}" "${ARTIFACT_ID}"
-(
-  cd -- "${ARTIFACTS_DIR}"
-  sha256sum "${ARTIFACT_ID}.tar.gz" > "${ARTIFACT_ID}.tar.gz.sha256"
-)
 archive_sha256="$(sha256sum "${ARCHIVE}" | awk 'NR == 1 { print $1 }')"
-archive_size="$(stat -c %s "${ARCHIVE}")"
 readonly RETAINED_DIR="${INSTALL_BACKUP_ROOT}/${VERSION}-${archive_sha256:0:12}"
-jq -n \
-  --arg version "${VERSION}" \
-  --arg name "${ARTIFACT_ID}.tar.gz" \
-  --arg sha256 "${archive_sha256}" \
-  --argjson size "${archive_size}" \
-  '{
-    schema_version: 1,
-    release_id: $version,
-    channel: "host",
-    published_at: "2026-01-01T00:00:00Z",
-    minimum_agent_version: "v1.0.0",
-    components: [{
-      service: "worker",
-      source_version: $version,
-      commit: "0123456789abcdef0123456789abcdef01234567",
-      rollback_compatible: true,
-      database_schema: "none",
-      artifacts: [{
-        os: "linux",
-        arch: "amd64",
-        name: $name,
-        sha256: $sha256,
-        size: $size
-      }, {
-        os: "linux",
-        arch: "arm64",
-        name: ("autostream-worker_" + $version + "_linux_arm64.tar.gz"),
-        sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        size: 12345
-      }]
-    }]
-  }' > "${ARTIFACTS_DIR}/release-manifest.json"
-(
-  cd -- "${ARTIFACTS_DIR}"
-  sha256sum release-manifest.json > release-manifest.json.sha256
-)
+[[ ! -e ${ARCHIVE}.sha256 && ! -L ${ARCHIVE}.sha256 ]] || \
+  die "archive-only fixture unexpectedly contains an archive checksum sidecar"
+[[ ! -e ${ARTIFACTS_DIR}/release-manifest.json &&
+  ! -L ${ARTIFACTS_DIR}/release-manifest.json ]] || \
+  die "archive-only fixture unexpectedly contains an external release manifest"
+[[ ! -e ${ARTIFACTS_DIR}/release-manifest.json.sha256 &&
+  ! -L ${ARTIFACTS_DIR}/release-manifest.json.sha256 ]] || \
+  die "archive-only fixture unexpectedly contains an external manifest checksum sidecar"
+
+readonly VALID_ARCHIVE="${WORK_DIR}/${ARTIFACT_ID}.valid.tar.gz"
+readonly VARIANT_PARENT="${WORK_DIR}/variant"
+readonly VARIANT_ROOT="${VARIANT_PARENT}/${ARTIFACT_ID}"
+install -o root -g root -m 0600 "${ARCHIVE}" "${VALID_ARCHIVE}"
+
+prepare_variant_tree() {
+  rm -rf -- "${VARIANT_PARENT}"
+  install -d -o root -g root -m 0700 "${VARIANT_PARENT}"
+  cp -a -- "${EXTRACTED_ROOT}" "${VARIANT_ROOT}"
+}
+
+replace_variant_manifest() {
+  local filter=$1
+  local next_manifest="${WORK_DIR}/artifact-manifest.next"
+
+  jq "${filter}" "${VARIANT_ROOT}/artifact-manifest.json" > "${next_manifest}"
+  install -o root -g root -m 0644 \
+    "${next_manifest}" \
+    "${VARIANT_ROOT}/artifact-manifest.json"
+  rm -f -- "${next_manifest}"
+}
+
+regenerate_variant_checksums() {
+  local next_checksums="${WORK_DIR}/variant-checksums.next"
+
+  (
+    cd -- "${VARIANT_ROOT}"
+    find . -type f ! -path './checksums.txt' -print0 |
+      sort -z |
+      xargs -0 sha256sum > "${next_checksums}"
+  )
+  install -o root -g root -m 0644 \
+    "${next_checksums}" \
+    "${VARIANT_ROOT}/checksums.txt"
+  rm -f -- "${next_checksums}"
+}
+
+package_variant_archive() {
+  tar -C "${VARIANT_PARENT}" -czf "${ARCHIVE}" "${ARTIFACT_ID}"
+}
+
+package_noncanonical_duplicate_archive() {
+  local raw_archive="${WORK_DIR}/noncanonical-duplicate.tar"
+  local archive_list="${WORK_DIR}/noncanonical-duplicate.list"
+
+  rm -f -- "${raw_archive}" "${archive_list}"
+  tar -C "${VARIANT_PARENT}" -cf "${raw_archive}" "${ARTIFACT_ID}"
+  tar -C "${VARIANT_PARENT}" -rf "${raw_archive}" \
+    --transform="s#^${ARTIFACT_ID}/\\.env\\.example\$#${ARTIFACT_ID}/./.env.example#" \
+    "${ARTIFACT_ID}/.env.example"
+  gzip -c "${raw_archive}" > "${ARCHIVE}"
+  tar -tzf "${ARCHIVE}" > "${archive_list}"
+  grep -Fx -- "${ARTIFACT_ID}/.env.example" "${archive_list}" > /dev/null || \
+    die "noncanonical duplicate fixture is missing its canonical entry"
+  grep -Fx -- "${ARTIFACT_ID}/./.env.example" "${archive_list}" > /dev/null || \
+    die "noncanonical duplicate fixture is missing its alias entry"
+  rm -f -- "${raw_archive}" "${archive_list}"
+}
+
+restore_valid_archive() {
+  install -o root -g root -m 0600 "${VALID_ARCHIVE}" "${ARCHIVE}"
+}
+
+assert_preflight_rejection_kept_host_clean() {
+  local scenario=$1
+
+  for path in \
+    "${PUBLIC_BINARY}" \
+    "${PUBLIC_ALIAS}" \
+    "${ENV_PATH}" \
+    "${UNIT_PATH}" \
+    "${STATE_DIR}" \
+    "${MANAGED_ROOT}" \
+    "${INSTALL_BACKUP_ROOT}" \
+    "${SHARED_HOST_SETUP_LOCK}" \
+    "${TARGET_LOCK}"; do
+    [[ ! -e ${path} && ! -L ${path} ]] || \
+      die "${scenario} rejection mutated the host: ${path}"
+  done
+  [[ -z $(find /var/tmp -mindepth 1 -maxdepth 1 \
+    -name 'autostream-worker-install.*' -print -quit) ]] || \
+    die "${scenario} rejection retained production staging"
+  if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+    die "${scenario} rejection created the autostream service account"
+  fi
+}
+
+expect_preflight_rejection() {
+  local scenario=$1
+  local expected_message=$2
+  local output_path="${WORK_DIR}/${scenario}.out"
+  local status
+
+  set +e
+  "${EXTRACTED_ROOT}/install-autostream-worker" > "${output_path}" 2>&1
+  status=$?
+  set -e
+  [[ ${status} -ne 0 ]] || \
+    die "${scenario} artifact unexpectedly passed preflight"
+  grep -F -- "${expected_message}" "${output_path}" >/dev/null || \
+    die "${scenario} rejection did not report the expected error"
+  assert_preflight_rejection_kept_host_clean "${scenario}"
+  restore_valid_archive
+}
+
+prepare_variant_tree
+replace_variant_manifest '.source_version = "v9.9.8"'
+regenerate_variant_checksums
+package_variant_archive
+expect_preflight_rejection \
+  "manifest-version-mismatch" \
+  "artifact-manifest.json does not describe this exact Worker artifact"
+
+prepare_variant_tree
+replace_variant_manifest '.platform.arch = "arm64"'
+regenerate_variant_checksums
+package_variant_archive
+expect_preflight_rejection \
+  "manifest-architecture-mismatch" \
+  "artifact-manifest.json does not describe this exact Worker artifact"
+
+prepare_variant_tree
+replace_variant_manifest \
+  '.commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+regenerate_variant_checksums
+package_variant_archive
+expect_preflight_rejection \
+  "binary-commit-mismatch" \
+  "Worker binary commit does not match artifact-manifest.json"
+
+prepare_variant_tree
+printf '%s\n' 'corrupt unchecked payload' >> "${VARIANT_ROOT}/.env.example"
+package_variant_archive
+expect_preflight_rejection \
+  "inner-checksum-mismatch" \
+  "./.env.example: FAILED"
+
+prepare_variant_tree
+package_noncanonical_duplicate_archive
+expect_preflight_rejection \
+  "noncanonical-duplicate-path" \
+  "release archive contains an unsafe path: ${ARTIFACT_ID}/./.env.example"
+
+install -d -o root -g root -m 0755 "${PUBLIC_BINARY}"
+late_preflight_public_path_owned=true
+set +e
+"${EXTRACTED_ROOT}/install-autostream-worker" \
+  > "${WORK_DIR}/late-host-preflight.out" 2>&1
+late_host_preflight_status=$?
+set -e
+[[ ${late_host_preflight_status} -eq 1 ]] || \
+  die "late host preflight fixture unexpectedly succeeded"
+grep -Fx -- \
+  "install-autostream-worker: existing public path is not a regular file: ${PUBLIC_BINARY}" \
+  "${WORK_DIR}/late-host-preflight.out" >/dev/null || \
+  die "late host preflight fixture did not reach the public-path rejection"
+[[ -d ${PUBLIC_BINARY} && ! -L ${PUBLIC_BINARY} &&
+  $(stat -c '%U:%G:%a' -- "${PUBLIC_BINARY}") == "root:root:755" &&
+  -z $(find "${PUBLIC_BINARY}" -mindepth 1 -print -quit) ]] || \
+  die "late host preflight changed the rejected public path"
+if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+  die "late host preflight created the autostream service account"
+fi
+for path in \
+  "${PUBLIC_ALIAS}" \
+  "${ENV_PATH}" \
+  "${UNIT_PATH}" \
+  "${STATE_DIR}" \
+  "${MANAGED_ROOT}" \
+  "${INSTALL_BACKUP_ROOT}" \
+  "${SHARED_HOST_SETUP_LOCK}" \
+  "${TARGET_LOCK}" \
+  /opt/autostream \
+  /etc/autostream \
+  /var/lib/autostream \
+  /var/backups/autostream \
+  /run/autostream-updater; do
+  [[ ! -e ${path} && ! -L ${path} ]] || \
+    die "late host preflight created a persistent path: ${path}"
+done
+[[ -z $(find /var/tmp -mindepth 1 -maxdepth 1 \
+  -name 'autostream-worker-install.*' -print -quit) ]] || \
+  die "late host preflight retained production staging"
+rmdir -- "${PUBLIC_BINARY}"
+late_preflight_public_path_owned=false
 
 install -o root -g root -m 0755 /usr/bin/systemctl "${REAL_SYSTEMCTL_COPY}"
+install -o root -g root -m 0755 /usr/sbin/groupadd "${REAL_GROUPADD_COPY}"
+install -o root -g root -m 0755 /usr/sbin/useradd "${REAL_USERADD_COPY}"
 install -o root -g root -m 0755 /usr/bin/mktemp "${REAL_MKTEMP_COPY}"
 install -o root -g root -m 0755 /usr/bin/sync "${REAL_SYNC_COPY}"
 cat > "${FAIL_SYSTEMCTL}" <<EOF
@@ -669,6 +876,49 @@ fi
 exec "${REAL_SYSTEMCTL_COPY}" "\$@"
 EOF
 chmod 0755 "${FAIL_SYSTEMCTL}"
+
+cat > "${SIGNAL_SYSTEMCTL}" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "${SYSTEMCTL_CALL_LOG}"
+if [[ \$# -eq 1 && \$1 == "daemon-reload" ]]; then
+  signal_count=0
+  if [[ -f "${SIGNAL_MATCH_COUNT}" ]]; then
+    read -r signal_count < "${SIGNAL_MATCH_COUNT}"
+  fi
+  signal_count=\$((signal_count + 1))
+  printf '%s\n' "\${signal_count}" > "${SIGNAL_MATCH_COUNT}"
+  printf '%s\n' 'production-daemon-reload-reached' > "${SIGNAL_REACHED_MARKER}"
+  if [[ \${signal_count} -le 2 ]]; then
+    kill -TERM "\${PPID}"
+  fi
+fi
+exec "${REAL_SYSTEMCTL_COPY}" "\$@"
+EOF
+chmod 0755 "${SIGNAL_SYSTEMCTL}"
+
+cat > "${SIGNAL_GROUPADD}" <<EOF
+#!/bin/bash
+"${REAL_GROUPADD_COPY}" "\$@"
+command_status=\$?
+if [[ \${command_status} -eq 0 && \${!#} == "autostream" ]]; then
+  printf '%s\n' 'groupadd-completed' > "${GROUPADD_SIGNAL_MARKER}"
+  kill -TERM "\${PPID}"
+fi
+exit "\${command_status}"
+EOF
+chmod 0755 "${SIGNAL_GROUPADD}"
+
+cat > "${SIGNAL_USERADD}" <<EOF
+#!/bin/bash
+"${REAL_USERADD_COPY}" "\$@"
+command_status=\$?
+if [[ \${command_status} -eq 0 && \${!#} == "autostream" ]]; then
+  printf '%s\n' 'useradd-completed' > "${USERADD_SIGNAL_MARKER}"
+  kill -TERM "\${PPID}"
+fi
+exit "\${command_status}"
+EOF
+chmod 0755 "${SIGNAL_USERADD}"
 
 cat > "${FAIL_MKTEMP}" <<EOF
 #!/bin/bash
@@ -706,6 +956,7 @@ for path in \
   "${STATE_DIR}" \
   "${MANAGED_ROOT}" \
   "${INSTALL_BACKUP_ROOT}" \
+  "${SHARED_HOST_SETUP_LOCK}" \
   "${TARGET_LOCK}"; do
   [[ ! -e ${path} && ! -L ${path} ]] || \
     die "mktemp failure mutated the host: ${path}"
@@ -717,7 +968,196 @@ if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; the
   die "mktemp failure mutated the host by creating the service account"
 fi
 
+groupadd --non-unique --gid 0 autostream
+set +e
+"${EXTRACTED_ROOT}/install-autostream-worker" \
+  > "${WORK_DIR}/gid-zero-preflight.out" 2>&1
+gid_zero_status=$?
+set -e
+[[ ${gid_zero_status} -ne 0 ]] || \
+  die "GID 0 service-group fixture unexpectedly succeeded"
+grep -Fx -- \
+  "install-autostream-worker: autostream service group must have a non-root numeric GID" \
+  "${WORK_DIR}/gid-zero-preflight.out" >/dev/null || \
+  die "GID 0 service-group rejection did not report the exact error"
+[[ $(getent group autostream | awk -F: 'NR == 1 { print $3 }') == "0" ]] || \
+  die "GID 0 service-group rejection changed the pre-existing group"
+id autostream >/dev/null 2>&1 && \
+  die "GID 0 service-group rejection created the autostream service account"
+for path in \
+  "${UNIT_PATH}" \
+  "${PUBLIC_BINARY}" \
+  "${PUBLIC_ALIAS}" \
+  "${ENV_PATH}" \
+  "${STATE_DIR}" \
+  "${MANAGED_ROOT}" \
+  "${INSTALL_BACKUP_ROOT}" \
+  "${SHARED_HOST_SETUP_LOCK}" \
+  "${TARGET_LOCK}"; do
+  [[ ! -e ${path} && ! -L ${path} ]] || \
+    die "GID 0 service-group rejection mutated the host: ${path}"
+done
+groupdel autostream
+
+assert_fresh_account_signal_rollback() {
+  local scenario=$1
+  local status=$2
+  local marker_path=$3
+  local marker_content=$4
+  local path
+
+  [[ ${status} -eq 143 ]] || \
+    die "${scenario} TERM rollback did not return status 143"
+  grep -Fx -- "${marker_content}" "${marker_path}" >/dev/null || \
+    die "${scenario} TERM rollback did not reach the account mutation boundary"
+  if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+    die "${scenario} TERM rollback retained the installer-created account"
+  fi
+  for path in \
+    "${UNIT_PATH}" \
+    "${PUBLIC_BINARY}" \
+    "${PUBLIC_ALIAS}" \
+    "${ENV_PATH}" \
+    "${STATE_DIR}" \
+    "${MANAGED_ROOT}" \
+    "${INSTALL_BACKUP_ROOT}" \
+    /opt/autostream \
+    /etc/autostream \
+    /var/lib/autostream \
+    /var/backups/autostream; do
+    [[ ! -e ${path} && ! -L ${path} ]] || \
+      die "${scenario} TERM rollback retained a transactional path: ${path}"
+  done
+  [[ -d /run/autostream-updater &&
+    ! -L /run/autostream-updater &&
+    $(stat -c '%U:%G:%a' -- /run/autostream-updater) == "root:root:700" &&
+    -f ${SHARED_HOST_SETUP_LOCK} &&
+    ! -L ${SHARED_HOST_SETUP_LOCK} &&
+    $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" &&
+    -f ${TARGET_LOCK} &&
+    ! -L ${TARGET_LOCK} &&
+    $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" &&
+    $(find /run/autostream-updater -mindepth 1 -maxdepth 1 | wc -l) -eq 2 ]] || \
+    die "${scenario} TERM rollback did not retain only permanent safe lock state"
+  [[ -z $(find /var/tmp -mindepth 1 -maxdepth 1 \
+    -name 'autostream-worker-install.*' -print -quit) ]] || \
+    die "${scenario} TERM rollback retained production staging"
+}
+
+rm -f -- "${GROUPADD_SIGNAL_MARKER}"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${SIGNAL_GROUPADD}' /usr/sbin/groupadd && '${EXTRACTED_ROOT}/install-autostream-worker'" \
+  > "${WORK_DIR}/groupadd-term-rollback.out" 2>&1
+groupadd_term_status=$?
+set -e
+assert_fresh_account_signal_rollback \
+  "groupadd" \
+  "${groupadd_term_status}" \
+  "${GROUPADD_SIGNAL_MARKER}" \
+  "groupadd-completed"
+account_signal_locks_before="$(
+  printf 'shared|%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${SHARED_HOST_SETUP_LOCK}")"
+  sha256sum -- "${SHARED_HOST_SETUP_LOCK}" | awk 'NR == 1 { print $1 }'
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}")"
+  sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }'
+)"
+
+rm -f -- "${USERADD_SIGNAL_MARKER}"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${SIGNAL_USERADD}' /usr/sbin/useradd && '${EXTRACTED_ROOT}/install-autostream-worker'" \
+  > "${WORK_DIR}/useradd-term-rollback.out" 2>&1
+useradd_term_status=$?
+set -e
+assert_fresh_account_signal_rollback \
+  "useradd" \
+  "${useradd_term_status}" \
+  "${USERADD_SIGNAL_MARKER}" \
+  "useradd-completed"
+[[ "$(
+  printf 'shared|%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${SHARED_HOST_SETUP_LOCK}")"
+  sha256sum -- "${SHARED_HOST_SETUP_LOCK}" | awk 'NR == 1 { print $1 }'
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}")"
+  sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }'
+)" == "${account_signal_locks_before}" ]] || \
+  die "useradd TERM rollback replaced or truncated a permanent lock"
+
+rm -f -- "${SYSTEMCTL_CALL_LOG}"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${FAIL_SYSTEMCTL}' /usr/bin/systemctl && '${EXTRACTED_ROOT}/install-autostream-worker'" \
+  > "${WORK_DIR}/fresh-daemon-reload-failure.out" 2>&1
+fresh_failure_status=$?
+set -e
+[[ ${fresh_failure_status} -ne 0 ]] || \
+  die "fresh daemon-reload rollback fixture unexpectedly succeeded"
+grep -Fx -- "daemon-reload" "${SYSTEMCTL_CALL_LOG}" >/dev/null || \
+  die "fresh daemon-reload rollback fixture did not reach the commit boundary"
+if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+  die "fresh daemon-reload rollback retained the installer-created account"
+fi
+for path in \
+  "${UNIT_PATH}" \
+  "${PUBLIC_BINARY}" \
+  "${PUBLIC_ALIAS}" \
+  "${ENV_PATH}" \
+  "${STATE_DIR}" \
+  "${MANAGED_ROOT}" \
+  "${INSTALL_BACKUP_ROOT}" \
+  /opt/autostream \
+  /etc/autostream \
+  /var/lib/autostream \
+  /var/backups/autostream; do
+  [[ ! -e ${path} && ! -L ${path} ]] || \
+    die "fresh daemon-reload rollback retained a transactional path: ${path}"
+done
+[[ -d /run/autostream-updater &&
+  ! -L /run/autostream-updater &&
+  $(stat -c '%U:%G:%a' -- /run/autostream-updater) == "root:root:700" &&
+  -f ${SHARED_HOST_SETUP_LOCK} &&
+  ! -L ${SHARED_HOST_SETUP_LOCK} &&
+  $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" &&
+  -f ${TARGET_LOCK} &&
+  ! -L ${TARGET_LOCK} &&
+  $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" ]] || \
+  die "fresh daemon-reload rollback did not retain only the permanent safe lock state"
+[[ -z $(find /var/tmp -mindepth 1 -maxdepth 1 \
+  -name 'autostream-worker-install.*' -print -quit) ]] || \
+  die "fresh daemon-reload rollback retained production staging"
+printf '%s\n' 'worker permanent lock sentinel' > "${TARGET_LOCK}"
+chmod 0600 "${TARGET_LOCK}"
+printf '%s\n' 'worker shared host-setup lock sentinel' > "${SHARED_HOST_SETUP_LOCK}"
+chmod 0600 "${SHARED_HOST_SETUP_LOCK}"
+permanent_lock_before="$(
+  printf 'shared|%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${SHARED_HOST_SETUP_LOCK}")"
+  sha256sum -- "${SHARED_HOST_SETUP_LOCK}" | awk 'NR == 1 { print $1 }'
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}")"
+  sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }'
+)"
+
+printf '%s\n' 'stale archive checksum sidecar must be ignored' > "${ARCHIVE}.sha256"
+printf '%s\n' '{"stale_external_manifest":true}' \
+  > "${ARTIFACTS_DIR}/release-manifest.json"
+printf '%s\n' 'stale manifest checksum sidecar must be ignored' \
+  > "${ARTIFACTS_DIR}/release-manifest.json.sha256"
 "${EXTRACTED_ROOT}/install-autostream-worker" > "${WORK_DIR}/fresh.out"
+[[ "$(
+  printf 'shared|%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${SHARED_HOST_SETUP_LOCK}")"
+  sha256sum -- "${SHARED_HOST_SETUP_LOCK}" | awk 'NR == 1 { print $1 }'
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}")"
+  sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }'
+)" == "${permanent_lock_before}" ]] || \
+  die "successful installation replaced or truncated the permanent updater lock"
+grep -Fx -- 'stale archive checksum sidecar must be ignored' \
+  "${ARCHIVE}.sha256" >/dev/null || \
+  die "fresh install changed the ignored archive checksum sidecar"
+grep -Fx -- '{"stale_external_manifest":true}' \
+  "${ARTIFACTS_DIR}/release-manifest.json" >/dev/null || \
+  die "fresh install changed the ignored external release manifest"
+grep -Fx -- 'stale manifest checksum sidecar must be ignored' \
+  "${ARTIFACTS_DIR}/release-manifest.json.sha256" >/dev/null || \
+  die "fresh install changed the ignored manifest checksum sidecar"
 [[ -L ${MANAGED_ROOT}/current ]] || die "fresh install did not create the managed current link"
 [[ -L ${PUBLIC_BINARY} && -L ${PUBLIC_ALIAS} ]] || \
   die "fresh install did not install stable public links"
@@ -756,7 +1196,10 @@ groupadd --system autostream
 useradd --system --gid autostream --home-dir /var/lib/autostream \
   --no-create-home --shell /usr/sbin/nologin autostream
 install -d -o root -g root -m 0755 /etc/autostream /var/lib/autostream
-install -d -o autostream -g autostream -m 0750 "${STATE_DIR}"
+install -d -o autostream -g autostream -m 0700 "${STATE_DIR}"
+printf '%s\n' 'worker state rollback sentinel' > "${STATE_SENTINEL}"
+chown autostream:autostream "${STATE_SENTINEL}"
+chmod 0600 "${STATE_SENTINEL}"
 printf '%s\n' "${LEGACY_BINARY_CONTENT}" > "${PUBLIC_BINARY}"
 chmod 0755 "${PUBLIC_BINARY}"
 printf '%s\n' "${LEGACY_ALIAS_CONTENT}" > "${PUBLIC_ALIAS}"
@@ -793,9 +1236,63 @@ legacy_unit_file_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"
 env_before="$(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }')"
 unit_before="$(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }')"
 runtime_unit_before="$(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $1 }')"
+legacy_binary_before="$(
+  printf '%s|' "$(stat -c '%u:%g:%a' -- "${PUBLIC_BINARY}")"
+  sha256sum -- "${PUBLIC_BINARY}" | awk 'NR == 1 { print $1 }'
+)"
+legacy_alias_before="$(
+  printf '%s|' "$(stat -c '%u:%g:%a' -- "${PUBLIC_ALIAS}")"
+  sha256sum -- "${PUBLIC_ALIAS}" | awk 'NR == 1 { print $1 }'
+)"
+legacy_unit_before="$(
+  printf '%s|' "$(stat -c '%u:%g:%a' -- "${UNIT_PATH}")"
+  sha256sum -- "${UNIT_PATH}" | awk 'NR == 1 { print $1 }'
+)"
+state_dir_before="$(stat -c '%d:%i:%u:%g:%a' -- "${STATE_DIR}")"
+state_tree_before="$(
+  find "${STATE_DIR}" -mindepth 1 \
+    -printf '%P|%y|%u|%g|%m|%s\n' |
+    LC_ALL=C sort
+)"
+state_sentinel_before="$(sha256sum "${STATE_SENTINEL}" | awk 'NR == 1 { print $1 }')"
+shared_contention_lock_before="$(
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${SHARED_HOST_SETUP_LOCK}")"
+  sha256sum -- "${SHARED_HOST_SETUP_LOCK}" | awk 'NR == 1 { print $1 }'
+)"
 
 (
-  exec 8>"${TARGET_LOCK}"
+  exec 7<>"${SHARED_HOST_SETUP_LOCK}"
+  flock -n 7
+  set +e
+  "${EXTRACTED_ROOT}/install-autostream-worker" \
+    > "${WORK_DIR}/shared-lock-contention.out" 2>&1
+  printf '%s\n' "$?" > "${WORK_DIR}/shared-lock-contention.status"
+)
+shared_contention_status="$(< "${WORK_DIR}/shared-lock-contention.status")"
+[[ ${shared_contention_status} -eq 1 ]] || \
+  die "installer ignored shared host-setup lock contention"
+grep -Fx -- \
+  "install-autostream-worker: another AutoStream installer is provisioning shared host state" \
+  "${WORK_DIR}/shared-lock-contention.out" >/dev/null || \
+  die "shared host-setup lock contention did not report the exact installer error"
+[[ "$(
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${SHARED_HOST_SETUP_LOCK}")"
+  sha256sum -- "${SHARED_HOST_SETUP_LOCK}" | awk 'NR == 1 { print $1 }'
+)" == "${shared_contention_lock_before}" ]] || \
+  die "shared host-setup contention replaced or truncated the permanent lock"
+[[ ! -e ${MANAGED_ROOT}/current && ! -L ${MANAGED_ROOT}/current &&
+  ! -e ${INSTALL_BACKUP_ROOT} && ! -L ${INSTALL_BACKUP_ROOT} ]] || \
+  die "shared host-setup lock contention mutated transactional host state"
+
+printf '%s\n' 'worker contention lock sentinel' > "${TARGET_LOCK}"
+chmod 0600 "${TARGET_LOCK}"
+contention_lock_before="$(
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}")"
+  sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }'
+)"
+
+(
+  exec 8<>"${TARGET_LOCK}"
   flock -n 8
   set +e
   "${EXTRACTED_ROOT}/install-autostream-worker" \
@@ -804,6 +1301,11 @@ runtime_unit_before="$(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $
 )
 contention_status="$(< "${WORK_DIR}/lock-contention.status")"
 [[ ${contention_status} -eq 1 ]] || die "installer ignored updater lock contention"
+[[ "$(
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}")"
+  sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }'
+)" == "${contention_lock_before}" ]] || \
+  die "lock contention replaced or truncated the permanent updater lock"
 grep -Fx -- \
   "install-autostream-worker: another privileged update is already active for ${UNIT}" \
   "${WORK_DIR}/lock-contention.out" >/dev/null || \
@@ -828,6 +1330,66 @@ grep -Fx -- \
 assert_legacy_runtime_unit "lock contention"
 systemctl is-enabled --quiet "${UNIT}" && die "lock contention enabled the service"
 
+signal_locks_before="$(
+  printf 'shared|%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${SHARED_HOST_SETUP_LOCK}")"
+  sha256sum -- "${SHARED_HOST_SETUP_LOCK}" | awk 'NR == 1 { print $1 }'
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}")"
+  sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }'
+)"
+rm -f -- "${SIGNAL_REACHED_MARKER}" "${SIGNAL_MATCH_COUNT}" "${SYSTEMCTL_CALL_LOG}"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${SIGNAL_SYSTEMCTL}' /usr/bin/systemctl && '${EXTRACTED_ROOT}/install-autostream-worker'" \
+  > "${WORK_DIR}/term-signal-rollback.out" 2>&1
+term_signal_status=$?
+set -e
+[[ ${term_signal_status} -eq 143 ]] || \
+  die "TERM signal rollback did not return status 143"
+grep -Fx -- "production-daemon-reload-reached" "${SIGNAL_REACHED_MARKER}" >/dev/null || \
+  die "TERM signal rollback did not reach the commit boundary"
+[[ -f ${SIGNAL_MATCH_COUNT} && $(< "${SIGNAL_MATCH_COUNT}") == "2" ]] || \
+  die "TERM signal rollback cleanup did not survive a repeated TERM"
+[[ ! -e ${MANAGED_ROOT}/current && ! -L ${MANAGED_ROOT}/current &&
+  ! -e ${MANAGED_ROOT} && ! -L ${MANAGED_ROOT} ]] || \
+  die "TERM signal rollback retained a transactional managed path"
+[[ "$(
+  printf '%s|' "$(stat -c '%u:%g:%a' -- "${PUBLIC_BINARY}")"
+  sha256sum -- "${PUBLIC_BINARY}" | awk 'NR == 1 { print $1 }'
+)" == "${legacy_binary_before}" &&
+  "$(
+    printf '%s|' "$(stat -c '%u:%g:%a' -- "${PUBLIC_ALIAS}")"
+    sha256sum -- "${PUBLIC_ALIAS}" | awk 'NR == 1 { print $1 }'
+  )" == "${legacy_alias_before}" &&
+  "$(
+    printf '%s|' "$(stat -c '%u:%g:%a' -- "${UNIT_PATH}")"
+    sha256sum -- "${UNIT_PATH}" | awk 'NR == 1 { print $1 }'
+  )" == "${legacy_unit_before}" &&
+  $(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }') == "${env_before}" ]] || \
+  die "TERM signal rollback did not restore exact live path metadata and content"
+[[ -d ${STATE_DIR} && ! -L ${STATE_DIR} &&
+  $(stat -c '%d:%i:%u:%g:%a' -- "${STATE_DIR}") == "${state_dir_before}" &&
+  -f ${STATE_SENTINEL} && ! -L ${STATE_SENTINEL} &&
+  $(sha256sum "${STATE_SENTINEL}" | awk 'NR == 1 { print $1 }') == \
+    "${state_sentinel_before}" &&
+  "$(find "${STATE_DIR}" -mindepth 1 \
+    -printf '%P|%y|%u|%g|%m|%s\n' | LC_ALL=C sort)" == "${state_tree_before}" ]] || \
+  die "TERM signal rollback changed existing state"
+[[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
+  die "TERM signal rollback changed the running legacy process"
+kill -0 "${old_pid}" || die "TERM signal rollback stopped the running legacy process"
+assert_legacy_runtime_unit "TERM signal rollback"
+systemctl is-enabled --quiet "${UNIT}" && die "TERM signal rollback enabled the service"
+[[ "$(
+  printf 'shared|%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${SHARED_HOST_SETUP_LOCK}")"
+  sha256sum -- "${SHARED_HOST_SETUP_LOCK}" | awk 'NR == 1 { print $1 }'
+  printf '%s|' "$(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}")"
+  sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }'
+)" == "${signal_locks_before}" ]] || \
+  die "TERM signal rollback replaced or truncated a permanent lock"
+[[ -z $(find /var/tmp -mindepth 1 -maxdepth 1 \
+  -name 'autostream-worker-install.*' -print -quit) ]] || \
+  die "TERM signal rollback retained production staging"
+
 set +e
 unshare --mount --propagation private bash -c \
   "mount --bind '${FAIL_SYSTEMCTL}' /usr/bin/systemctl && printf '%s\n' mounted > '${SYSTEMCTL_MOUNT_MARKER}' && '${EXTRACTED_ROOT}/install-autostream-worker'" \
@@ -849,10 +1411,32 @@ grep -Fx -- "${LEGACY_BINARY_CONTENT}" "${PUBLIC_BINARY}" >/dev/null || \
   die "failed migration changed the legacy binary"
 grep -Fx -- "${LEGACY_ALIAS_CONTENT}" "${PUBLIC_ALIAS}" >/dev/null || \
   die "failed migration changed the legacy alias"
+[[ "$(
+  printf '%s|' "$(stat -c '%u:%g:%a' -- "${PUBLIC_BINARY}")"
+  sha256sum -- "${PUBLIC_BINARY}" | awk 'NR == 1 { print $1 }'
+)" == "${legacy_binary_before}" &&
+  "$(
+    printf '%s|' "$(stat -c '%u:%g:%a' -- "${PUBLIC_ALIAS}")"
+    sha256sum -- "${PUBLIC_ALIAS}" | awk 'NR == 1 { print $1 }'
+  )" == "${legacy_alias_before}" &&
+  "$(
+    printf '%s|' "$(stat -c '%u:%g:%a' -- "${UNIT_PATH}")"
+    sha256sum -- "${UNIT_PATH}" | awk 'NR == 1 { print $1 }'
+  )" == "${legacy_unit_before}" ]] || \
+  die "failed migration did not restore exact live path metadata and content"
 [[ $(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }') == "${env_before}" ]] || \
   die "failed migration changed the existing environment"
 [[ $(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }') == "${unit_before}" ]] || \
   die "failed migration did not restore the systemd unit"
+[[ -d ${STATE_DIR} && ! -L ${STATE_DIR} &&
+  $(stat -c '%d:%i:%u:%g:%a' -- "${STATE_DIR}") == "${state_dir_before}" ]] || \
+  die "failed migration changed existing state directory metadata"
+[[ -f ${STATE_SENTINEL} && ! -L ${STATE_SENTINEL} &&
+  $(sha256sum "${STATE_SENTINEL}" | awk 'NR == 1 { print $1 }') == \
+    "${state_sentinel_before}" &&
+  "$(find "${STATE_DIR}" -mindepth 1 \
+    -printf '%P|%y|%u|%g|%m|%s\n' | LC_ALL=C sort)" == "${state_tree_before}" ]] || \
+  die "failed migration changed existing state directory content"
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
   die "failed migration replaced the running legacy process"
 kill -0 "${old_pid}" || die "failed migration stopped the running legacy process"
@@ -866,6 +1450,22 @@ for retained in \
   [[ -f ${retained} && ! -L ${retained} ]] || \
     die "failed migration did not retain durable retry backup: ${retained}"
 done
+retained_backups_before="$(
+  for retained in \
+    "${RETAINED_DIR}/autostream-worker" \
+    "${RETAINED_DIR}/worker" \
+    "${RETAINED_DIR}/autostream-worker.service"; do
+    printf '%s|%s|' \
+      "${retained}" \
+      "$(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${retained}")"
+    sha256sum -- "${retained}" | awk 'NR == 1 { print $1 }'
+  done
+)"
+
+rm -f -- "${STATE_SENTINEL}"
+rmdir -- "${STATE_DIR}"
+[[ ! -e ${STATE_DIR} && ! -L ${STATE_DIR} ]] || \
+  die "could not prepare the absent-state rollback fixture"
 
 cat > "${FAIL_SYNC}" <<EOF
 #!/bin/bash
@@ -913,10 +1513,25 @@ grep -Fx -- "${LEGACY_BINARY_CONTENT}" "${PUBLIC_BINARY}" >/dev/null || \
   die "sync failure changed the legacy binary"
 grep -Fx -- "${LEGACY_ALIAS_CONTENT}" "${PUBLIC_ALIAS}" >/dev/null || \
   die "sync failure changed the legacy alias"
+[[ "$(
+  printf '%s|' "$(stat -c '%u:%g:%a' -- "${PUBLIC_BINARY}")"
+  sha256sum -- "${PUBLIC_BINARY}" | awk 'NR == 1 { print $1 }'
+)" == "${legacy_binary_before}" &&
+  "$(
+    printf '%s|' "$(stat -c '%u:%g:%a' -- "${PUBLIC_ALIAS}")"
+    sha256sum -- "${PUBLIC_ALIAS}" | awk 'NR == 1 { print $1 }'
+  )" == "${legacy_alias_before}" &&
+  "$(
+    printf '%s|' "$(stat -c '%u:%g:%a' -- "${UNIT_PATH}")"
+    sha256sum -- "${UNIT_PATH}" | awk 'NR == 1 { print $1 }'
+  )" == "${legacy_unit_before}" ]] || \
+  die "sync failure did not restore exact live path metadata and content"
 [[ $(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }') == "${env_before}" ]] || \
   die "sync failure changed the existing environment"
 [[ $(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }') == "${unit_before}" ]] || \
   die "sync failure did not restore the systemd unit"
+[[ ! -e ${STATE_DIR} && ! -L ${STATE_DIR} ]] || \
+  die "sync failure retained a state directory that was absent before installation"
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
   die "sync failure replaced the running legacy process"
 kill -0 "${old_pid}" || die "sync failure stopped the running legacy process"
@@ -929,7 +1544,51 @@ for retained in \
   [[ -f ${retained} && ! -L ${retained} ]] || \
     die "sync failure discarded recoverable legacy backup: ${retained}"
 done
+[[ "$(
+  for retained in \
+    "${RETAINED_DIR}/autostream-worker" \
+    "${RETAINED_DIR}/worker" \
+    "${RETAINED_DIR}/autostream-worker.service"; do
+    printf '%s|%s|' \
+      "${retained}" \
+      "$(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${retained}")"
+    sha256sum -- "${retained}" | awk 'NR == 1 { print $1 }'
+  done
+)" == "${retained_backups_before}" ]] || \
+  die "sync failure changed a pre-existing durable backup inode, metadata, or content"
 
+chown autostream:autostream "${RETAINED_DIR}/autostream-worker"
+tampered_backup_identity="$(
+  stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${RETAINED_DIR}/autostream-worker"
+)"
+tampered_backup_digest="$(
+  sha256sum -- "${RETAINED_DIR}/autostream-worker" | awk 'NR == 1 { print $1 }'
+)"
+set +e
+"${EXTRACTED_ROOT}/install-autostream-worker" \
+  > "${WORK_DIR}/nonroot-backup-rejection.out" 2>&1
+nonroot_backup_status=$?
+set -e
+[[ ${nonroot_backup_status} -ne 0 ]] || \
+  die "non-root-owned pre-existing backup fixture unexpectedly succeeded"
+grep -F -- \
+  "ownership is not root:root" \
+  "${WORK_DIR}/nonroot-backup-rejection.out" >/dev/null || \
+  die "non-root-owned pre-existing backup rejection did not report the exact conflict"
+[[ $(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${RETAINED_DIR}/autostream-worker") == \
+    "${tampered_backup_identity}" &&
+  $(sha256sum -- "${RETAINED_DIR}/autostream-worker" | awk 'NR == 1 { print $1 }') == \
+    "${tampered_backup_digest}" ]] || \
+  die "non-root-owned backup rejection changed the conflicting backup"
+[[ ! -e ${MANAGED_ROOT}/current && ! -L ${MANAGED_ROOT}/current &&
+  ! -e ${STATE_DIR} && ! -L ${STATE_DIR} ]] || \
+  die "non-root-owned backup rejection retained transactional host state"
+chown root:root "${RETAINED_DIR}/autostream-worker"
+
+install -d -o autostream -g autostream -m 0700 "${STATE_DIR}"
+printf '%s\n' 'worker state rollback sentinel' > "${STATE_SENTINEL}"
+chown autostream:autostream "${STATE_SENTINEL}"
+chmod 0600 "${STATE_SENTINEL}"
 rm -f -- "${PUBLIC_ALIAS}"
 sync -f /usr/local/bin
 
