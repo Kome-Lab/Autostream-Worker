@@ -1083,6 +1083,46 @@ assert_fresh_account_signal_rollback \
 )" == "${account_signal_locks_before}" ]] || \
   die "useradd TERM rollback replaced or truncated a permanent lock"
 
+groupadd --system autostream
+preexisting_group_record_before="$(getent group autostream)"
+preexisting_group_database_digest_before="$(
+  sha256sum -- /etc/group | awk 'NR == 1 { print $1 }'
+)"
+preexisting_gshadow_database_digest_before="$(
+  sha256sum -- /etc/gshadow | awk 'NR == 1 { print $1 }'
+)"
+[[ -n ${preexisting_group_record_before} &&
+  ${preexisting_group_database_digest_before} =~ ^[0-9a-f]{64}$ &&
+  ${preexisting_gshadow_database_digest_before} =~ ^[0-9a-f]{64}$ ]] || \
+  die "could not snapshot the pre-existing autostream group fixture"
+id autostream >/dev/null 2>&1 && \
+  die "pre-existing autostream group fixture unexpectedly has a user"
+rm -f -- "${USERADD_SIGNAL_MARKER}"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${SIGNAL_USERADD}' /usr/sbin/useradd && '${EXTRACTED_ROOT}/install-autostream-worker'" \
+  > "${WORK_DIR}/preexisting-group-useradd-term-rollback.out" 2>&1
+preexisting_group_useradd_term_status=$?
+set -e
+[[ ${preexisting_group_useradd_term_status} -eq 143 ]] || \
+  die "pre-existing group useradd TERM transaction exited with ${preexisting_group_useradd_term_status}, expected 143"
+grep -Fx -- "useradd-completed" "${USERADD_SIGNAL_MARKER}" >/dev/null || \
+  die "pre-existing group useradd TERM transaction did not reach useradd"
+id autostream >/dev/null 2>&1 && \
+  die "pre-existing group useradd TERM transaction retained the installer-created user"
+[[ $(getent group autostream 2>/dev/null || true) == "${preexisting_group_record_before}" ]] || \
+  die "pre-existing group useradd TERM transaction changed the autostream group"
+[[ $(sha256sum -- /etc/group | awk 'NR == 1 { print $1 }') == \
+    "${preexisting_group_database_digest_before}" &&
+  $(sha256sum -- /etc/gshadow | awk 'NR == 1 { print $1 }') == \
+    "${preexisting_gshadow_database_digest_before}" ]] || \
+  die "pre-existing group useradd TERM transaction changed the local group databases"
+if getent passwd autostream-install-rollback >/dev/null 2>&1 ||
+  getent group autostream-install-rollback >/dev/null 2>&1; then
+  die "pre-existing group useradd TERM transaction retained the reserved rollback account name"
+fi
+groupdel autostream
+
 rm -f -- "${SYSTEMCTL_CALL_LOG}"
 set +e
 unshare --mount --propagation private bash -c \

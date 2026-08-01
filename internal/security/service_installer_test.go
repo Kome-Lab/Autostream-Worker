@@ -359,6 +359,13 @@ func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing
 		`mount --bind '${SIGNAL_USERADD}' /usr/sbin/useradd`,
 		`assert_fresh_account_signal_rollback`,
 		`useradd TERM rollback replaced or truncated a permanent lock`,
+		`preexisting_group_record_before=`,
+		`preexisting_group_database_digest_before=`,
+		`preexisting_gshadow_database_digest_before=`,
+		`pre-existing group useradd TERM transaction exited with ${preexisting_group_useradd_term_status}, expected 143`,
+		`pre-existing group useradd TERM transaction changed the autostream group`,
+		`pre-existing group useradd TERM transaction changed the local group databases`,
+		`pre-existing group useradd TERM transaction retained the reserved rollback account name`,
 		`sync failure changed a pre-existing durable backup inode, metadata, or content`,
 		`non-root-owned pre-existing backup fixture unexpectedly succeeded`,
 		`non-root-owned backup rejection changed the conflicting backup`,
@@ -559,8 +566,19 @@ func TestWorkerInstallerPrevalidatesAccountAndBindsPermanentLock(t *testing.T) {
 		t.Fatal("Worker must validate a non-root numeric service GID before user creation and bind the user to it")
 	}
 	for _, marker := range []string{
+		`readonly AUTOSTREAM_USER_ROLLBACK_LOGIN="autostream-install-rollback"`,
 		`created_autostream_group=false`,
+		`preexisting_autostream_group_record=""`,
 		`created_autostream_user=false`,
+		`autostream_user_rollback_login_ready=false`,
+		`local_account_member_fields_are_clear()`,
+		`local_account_database_matches_digests()`,
+		`prepare_autostream_user_rollback_login()`,
+		`remove_created_autostream_user_preserving_group()`,
+		`usermod --login "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" autostream`,
+		`userdel "${AUTOSTREAM_USER_ROLLBACK_LOGIN}"`,
+		`sha256sum -- /etc/group`,
+		`sha256sum -- /etc/gshadow`,
 		`rollback_autostream_account`,
 		`if [[ -z ${current_group} ]]; then`,
 		`rollback_journaled_directories`,
@@ -602,6 +620,18 @@ func TestWorkerInstallerPrevalidatesAccountAndBindsPermanentLock(t *testing.T) {
 	}
 	if strings.Contains(installer, `stat -Lc '%F:%U:%G:%a'`) {
 		t.Fatal("Worker lock validation must not depend on GNU stat's content-sensitive file-type description")
+	}
+	if strings.Contains(installer, `userdel autostream`) {
+		t.Fatal("Worker rollback must not pass the protected autostream group name to userdel")
+	}
+	accountRenameIndex := strings.Index(installer,
+		`if usermod --login "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" autostream`)
+	accountDeleteIndex := strings.Index(installer,
+		`if userdel "${AUTOSTREAM_USER_ROLLBACK_LOGIN}"`)
+	groupDeleteIndex := strings.LastIndex(installer, `groupdel autostream`)
+	if accountRenameIndex < 0 || accountDeleteIndex < 0 || groupDeleteIndex < 0 ||
+		accountRenameIndex >= accountDeleteIndex || accountDeleteIndex >= groupDeleteIndex {
+		t.Fatal("Worker rollback must rename and delete only the invocation-created user before deleting an invocation-created group")
 	}
 	sharedLockIndex := strings.Index(installer, `flock -n 8 || die "another AutoStream installer is provisioning shared host state"`)
 	targetLockIndex := strings.Index(installer, `flock -n 9 || die "another privileged update is already active for ${UNIT_NAME}"`)
