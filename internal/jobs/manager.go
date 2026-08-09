@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -20,7 +21,12 @@ var (
 	ErrCaptionProfileInvalid     = errors.New("caption profile is invalid")
 	ErrCaptionRuntimeUnavailable = errors.New("caption transcription runtime is unavailable")
 	ErrCaptionAudioUnavailable   = errors.New("caption audio transcription is unavailable")
+	ErrStreamAlreadyStopped      = errors.New("stream job is already stopped")
+	ErrNoActiveStreamJob         = errors.New("no active stream job")
+	ErrStreamIDDoesNotMatchJob   = errors.New("stream_id does not match current job")
 )
+
+const maxStoppedStreamTargets = 64
 
 type StreamContext struct {
 	StreamID           string `json:"stream_id"`
@@ -66,11 +72,13 @@ type Manager struct {
 	captionFactory  CaptionSessionFactory
 	captionSession  CaptionSession
 
-	startedAt    time.Time
-	events       []events.OverlayEvent
-	eventCounts  map[string]int
-	sendFailures int
-	maxEvents    int
+	startedAt                time.Time
+	stoppedOrder             []stoppedTargetReceipt
+	stoppedTargetReceiptPath string
+	events                   []events.OverlayEvent
+	eventCounts              map[string]int
+	sendFailures             int
+	maxEvents                int
 }
 
 type Reporter interface {
@@ -116,16 +124,32 @@ func (deepgramSessionFactory) New(config deepgram.Config, apiKey []byte, handler
 }
 
 func NewManager(publisher encoder.Publisher, reporter Reporter) *Manager {
+	return newManager(publisher, reporter, "")
+}
+
+// NewManagerWithStoppedTargetReceiptFile retains a bounded set of recently
+// stopped stream IDs across process restarts. A delayed stop request can then
+// be safely acknowledged without touching a successor stream.
+func NewManagerWithStoppedTargetReceiptFile(publisher encoder.Publisher, reporter Reporter, path string) (*Manager, error) {
+	manager := newManager(publisher, reporter, path)
+	if err := manager.loadStoppedTargetReceipts(); err != nil {
+		return nil, err
+	}
+	return manager, nil
+}
+
+func newManager(publisher encoder.Publisher, reporter Reporter, stoppedTargetReceiptPath string) *Manager {
 	if publisher == nil {
 		publisher = encoder.NoopPublisher{}
 	}
 	return &Manager{
-		publisher:       publisher,
-		reporter:        reporter,
-		captionProfiles: map[string]control.RuntimeProfile{},
-		captionFactory:  deepgramSessionFactory{},
-		eventCounts:     map[string]int{},
-		maxEvents:       200,
+		publisher:                publisher,
+		reporter:                 reporter,
+		captionProfiles:          map[string]control.RuntimeProfile{},
+		captionFactory:           deepgramSessionFactory{},
+		stoppedTargetReceiptPath: strings.TrimSpace(stoppedTargetReceiptPath),
+		eventCounts:              map[string]int{},
+		maxEvents:                200,
 	}
 }
 
@@ -197,6 +221,11 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		m.mu.Unlock()
 		closeCaptionSession(captionSession)
 		return errors.New("a stream job is already active")
+	}
+	if err := m.forgetStoppedTargetLocked(stream.StreamID); err != nil {
+		m.mu.Unlock()
+		closeCaptionSession(captionSession)
+		return fmt.Errorf("clear stopped target receipt: %w", err)
 	}
 	m.current = stream
 	m.captionSession = captionSession
@@ -477,14 +506,23 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
 
+	streamID = strings.TrimSpace(streamID)
 	m.mu.Lock()
 	if m.current.StreamID == "" {
+		if streamID != "" && m.wasStoppedTargetLocked(streamID) {
+			m.mu.Unlock()
+			return ErrStreamAlreadyStopped
+		}
 		m.mu.Unlock()
-		return errors.New("no active stream job")
+		return ErrNoActiveStreamJob
 	}
 	if streamID != "" && streamID != m.current.StreamID {
+		if m.wasStoppedTargetLocked(streamID) {
+			m.mu.Unlock()
+			return ErrStreamAlreadyStopped
+		}
 		m.mu.Unlock()
-		return errors.New("stream_id does not match current job")
+		return ErrStreamIDDoesNotMatchJob
 	}
 	stoppedStreamID := m.current.StreamID
 	captionSession := m.captionSession
@@ -498,6 +536,10 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	}
 
 	m.mu.Lock()
+	if err := m.rememberStoppedTargetLocked(stoppedStreamID); err != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("persist stopped target receipt: %w", err)
+	}
 	m.current = StreamContext{}
 	m.startedAt = time.Time{}
 	m.mu.Unlock()
@@ -505,11 +547,65 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	return nil
 }
 
-func (m *Manager) Close(ctx context.Context) {
+func (m *Manager) wasStoppedTargetLocked(streamID string) bool {
+	cutoff := time.Now().UTC().Add(-stoppedTargetReceiptTTL)
+	for _, receipt := range m.stoppedOrder {
+		if receipt.StreamID == streamID {
+			return !receipt.StoppedAt.Before(cutoff)
+		}
+	}
+	return false
+}
+
+func (m *Manager) rememberStoppedTargetLocked(streamID string) error {
+	if streamID == "" {
+		return nil
+	}
+	receipts := m.withoutStoppedTargetLocked(streamID)
+	receipts = append(receipts, stoppedTargetReceipt{StreamID: streamID, StoppedAt: time.Now().UTC()})
+	if len(receipts) > maxStoppedStreamTargets {
+		receipts = receipts[len(receipts)-maxStoppedStreamTargets:]
+	}
+	if err := persistStoppedTargetReceipts(m.stoppedTargetReceiptPath, receipts); err != nil {
+		return err
+	}
+	m.setStoppedTargetReceiptsLocked(receipts)
+	return nil
+}
+
+func (m *Manager) forgetStoppedTargetLocked(streamID string) error {
+	if !m.wasStoppedTargetLocked(streamID) {
+		return nil
+	}
+	receipts := m.withoutStoppedTargetLocked(streamID)
+	if err := persistStoppedTargetReceipts(m.stoppedTargetReceiptPath, receipts); err != nil {
+		return err
+	}
+	m.setStoppedTargetReceiptsLocked(receipts)
+	return nil
+}
+
+func (m *Manager) withoutStoppedTargetLocked(streamID string) []stoppedTargetReceipt {
+	receipts := make([]stoppedTargetReceipt, 0, len(m.stoppedOrder))
+	cutoff := time.Now().UTC().Add(-stoppedTargetReceiptTTL)
+	for _, receipt := range m.stoppedOrder {
+		if receipt.StreamID != streamID && !receipt.StoppedAt.Before(cutoff) {
+			receipts = append(receipts, receipt)
+		}
+	}
+	return receipts
+}
+
+func (m *Manager) setStoppedTargetReceiptsLocked(receipts []stoppedTargetReceipt) {
+	m.stoppedOrder = append([]stoppedTargetReceipt(nil), receipts...)
+}
+
+func (m *Manager) Close(ctx context.Context) error {
 	streamID := m.CurrentStreamID()
 	if streamID != "" {
-		_ = m.Stop(ctx, streamID)
+		return m.Stop(ctx, streamID)
 	}
+	return nil
 }
 
 func (m *Manager) IngestCaptionAudio(ctx context.Context, streamID string, packets []deepgram.AudioPacket) error {

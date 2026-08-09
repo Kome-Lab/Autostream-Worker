@@ -143,6 +143,88 @@ func TestConfigRevisionFromEnvValidatesPositiveInteger(t *testing.T) {
 	}
 }
 
+func TestStopJobKeepsStoppedTargetIdempotentWithoutStoppingSuccessor(t *testing.T) {
+	manager := jobs.NewManager(encoder.NoopPublisher{}, observability.Client{})
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Stop(t.Context(), "stream-a"); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
+	stop := func(streamID string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/jobs/"+streamID+"/stop", nil)
+		req.Header.Set("Authorization", "Bearer service-token")
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		return res
+	}
+
+	if res := stop("stream-a"); res.Code != http.StatusAccepted || !strings.Contains(res.Body.String(), "already_stopped") {
+		t.Fatalf("stopped target before successor status=%d body=%s", res.Code, res.Body.String())
+	}
+	if res := stop("unknown-stream"); res.Code != http.StatusConflict {
+		t.Fatalf("unknown target without active stream status=%d body=%s", res.Code, res.Body.String())
+	}
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-b"}); err != nil {
+		t.Fatal(err)
+	}
+	if res := stop("stream-a"); res.Code != http.StatusAccepted || !strings.Contains(res.Body.String(), "already_stopped") {
+		t.Fatalf("stopped target after successor status=%d body=%s", res.Code, res.Body.String())
+	}
+	if got := manager.CurrentStreamID(); got != "stream-b" {
+		t.Fatalf("delayed stop changed successor: current stream = %q", got)
+	}
+	if res := stop("unknown-stream"); res.Code != http.StatusConflict {
+		t.Fatalf("unknown target with successor status=%d body=%s", res.Code, res.Body.String())
+	}
+	if got := manager.CurrentStreamID(); got != "stream-b" {
+		t.Fatalf("unknown stop changed successor: current stream = %q", got)
+	}
+}
+
+func TestStopJobKeepsStoppedTargetIdempotentAfterWorkerRestart(t *testing.T) {
+	receiptPath := filepath.Join(t.TempDir(), "stopped-target-receipts.json")
+	manager, err := jobs.NewManagerWithStoppedTargetReceiptFile(encoder.NoopPublisher{}, observability.Client{}, receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Stop(t.Context(), "stream-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	restartedManager, err := jobs.NewManagerWithStoppedTargetReceiptFile(encoder.NoopPublisher{}, observability.Client{}, receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restartedManager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-b"}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer("worker", restartedManager, TokenVerifier{PlainToken: "service-token"})
+	stop := func(streamID string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/jobs/"+streamID+"/stop", nil)
+		req.Header.Set("Authorization", "Bearer service-token")
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		return res
+	}
+
+	if res := stop("stream-a"); res.Code != http.StatusAccepted || !strings.Contains(res.Body.String(), "already_stopped") {
+		t.Fatalf("stopped target after restart status=%d body=%s", res.Code, res.Body.String())
+	}
+	if got := restartedManager.CurrentStreamID(); got != "stream-b" {
+		t.Fatalf("restart retry changed successor: current stream = %q", got)
+	}
+	if res := stop("unknown-stream"); res.Code != http.StatusConflict {
+		t.Fatalf("unknown target after restart status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
 func TestNewServerFailsClosedOnInvalidConfigRevision(t *testing.T) {
 	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "0")
 	defer func() {

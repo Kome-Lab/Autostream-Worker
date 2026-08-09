@@ -52,7 +52,14 @@ func main() {
 	if err := requireMatchingUpdaterIdentity(updaterIdentity, controlClient.Config.ServiceID); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
 		log.Fatalf("invalid updater identity: %v", err)
 	}
-	manager := jobs.NewManager(publisher, buildReporter(controlClient))
+	manager, err := jobs.NewManagerWithStoppedTargetReceiptFile(
+		publisher,
+		buildReporter(controlClient),
+		jobs.DefaultStoppedTargetReceiptPath,
+	)
+	if err != nil {
+		log.Fatalf("load stopped target receipts: %v", err)
+	}
 	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(resolveCtx context.Context, streamID, secretName string) (control.RuntimeSecret, error) {
 		return (control.Client{Config: control.ConfigFromEnv()}).ResolveRuntimeSecret(resolveCtx, streamID, secretName)
 	}), nil)
@@ -103,14 +110,18 @@ func main() {
 	}()
 	select {
 	case err := <-errCh:
-		manager.Close(context.Background())
+		if closeErr := manager.Close(context.Background()); closeErr != nil {
+			log.Printf("worker shutdown did not persist stopped target receipt: %v", closeErr)
+		}
 		if err != nil {
 			log.Fatal(err)
 		}
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		manager.Close(shutdownCtx)
+		if closeErr := manager.Close(shutdownCtx); closeErr != nil {
+			log.Printf("worker shutdown did not persist stopped target receipt: %v", closeErr)
+		}
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("worker shutdown failed: %v", err)
 			if closeErr := server.Close(); closeErr != nil {

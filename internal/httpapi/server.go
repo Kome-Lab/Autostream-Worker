@@ -305,7 +305,12 @@ func (s Server) stopJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "missing_or_invalid_service_token"})
 		return
 	}
-	if err := s.manager.Stop(r.Context(), r.PathValue("id")); err != nil {
+	streamID := strings.TrimSpace(r.PathValue("id"))
+	if err := s.manager.Stop(r.Context(), streamID); err != nil {
+		if errors.Is(err, jobs.ErrStreamAlreadyStopped) {
+			writeJSON(w, http.StatusAccepted, map[string]string{"status": "already_stopped"})
+			return
+		}
 		writeRequestError(w, err)
 		return
 	}

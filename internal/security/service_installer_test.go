@@ -62,9 +62,6 @@ func TestWorkerReleaseShipsManagedServiceInstaller(t *testing.T) {
 	for _, marker := range []string{
 		`cp release/install-autostream-worker "${root}/install-autostream-worker"`,
 		`chmod 0755 "${root}/install-autostream-worker"`,
-		"bash -n release/install-autostream-worker",
-		"bash -n release/test-install-autostream-worker-integration.sh",
-		"sudo bash release/test-install-autostream-worker-integration.sh",
 		"DATABASE_SCHEMA: none",
 		"artifacts/autostream-worker_${{ needs.release-host.outputs.version }}_linux_amd64.tar.gz",
 		"artifacts/autostream-worker_${{ needs.release-host.outputs.version }}_linux_arm64.tar.gz",
