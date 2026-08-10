@@ -17,13 +17,14 @@ import (
 )
 
 var (
-	ErrCaptionNotConfigured      = errors.New("caption transcription is not configured")
-	ErrCaptionProfileInvalid     = errors.New("caption profile is invalid")
-	ErrCaptionRuntimeUnavailable = errors.New("caption transcription runtime is unavailable")
-	ErrCaptionAudioUnavailable   = errors.New("caption audio transcription is unavailable")
-	ErrStreamAlreadyStopped      = errors.New("stream job is already stopped")
-	ErrNoActiveStreamJob         = errors.New("no active stream job")
-	ErrStreamIDDoesNotMatchJob   = errors.New("stream_id does not match current job")
+	ErrCaptionNotConfigured            = errors.New("caption transcription is not configured")
+	ErrCaptionProfileInvalid           = errors.New("caption profile is invalid")
+	ErrCaptionRuntimeUnavailable       = errors.New("caption transcription runtime is unavailable")
+	ErrCaptionAudioUnavailable         = errors.New("caption audio transcription is unavailable")
+	ErrStreamAlreadyStopped            = errors.New("stream job is already stopped")
+	ErrNoActiveStreamJob               = errors.New("no active stream job")
+	ErrStreamIDDoesNotMatchJob         = errors.New("stream_id does not match current job")
+	ErrStoppedTargetReceiptUnavailable = errors.New("stopped target receipt is unavailable")
 )
 
 const maxStoppedStreamTargets = 64
@@ -225,7 +226,7 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	if err := m.forgetStoppedTargetLocked(stream.StreamID); err != nil {
 		m.mu.Unlock()
 		closeCaptionSession(captionSession)
-		return fmt.Errorf("clear stopped target receipt: %w", err)
+		return fmt.Errorf("%w: %v", ErrStoppedTargetReceiptUnavailable, err)
 	}
 	m.current = stream
 	m.captionSession = captionSession
@@ -538,7 +539,7 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	m.mu.Lock()
 	if err := m.rememberStoppedTargetLocked(stoppedStreamID); err != nil {
 		m.mu.Unlock()
-		return fmt.Errorf("persist stopped target receipt: %w", err)
+		return fmt.Errorf("%w: %v", ErrStoppedTargetReceiptUnavailable, err)
 	}
 	m.current = StreamContext{}
 	m.startedAt = time.Time{}

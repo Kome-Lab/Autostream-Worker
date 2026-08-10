@@ -8,3 +8,8 @@ services:
       AUTOSTREAM_BIND_ADDR: 0.0.0.0:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}
     ports: !override
       - "127.0.0.1:${AUTOSTREAM_WORKER_PORT:-8084}:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}"
+    volumes:
+      - worker-stopped-target-receipts:/var/lib/autostream/worker
+
+volumes:
+  worker-stopped-target-receipts:

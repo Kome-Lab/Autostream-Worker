@@ -311,7 +311,7 @@ func (s Server) stopJob(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusAccepted, map[string]string{"status": "already_stopped"})
 			return
 		}
-		writeRequestError(w, err)
+		writeStopJobError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stopped"})
@@ -531,6 +531,19 @@ func writeRequestError(w http.ResponseWriter, err error) {
 		code = "validation_failed"
 	}
 	writeJSON(w, status, map[string]string{"code": code, "message": err.Error()})
+}
+
+func writeStopJobError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, jobs.ErrNoActiveStreamJob):
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "no_active_stream_job", "message": "no active stream job"})
+	case errors.Is(err, jobs.ErrStreamIDDoesNotMatchJob):
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "stream_id_mismatch", "message": "requested stream does not match the active job"})
+	case errors.Is(err, jobs.ErrStoppedTargetReceiptUnavailable):
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "stopped_target_receipt_unavailable", "message": "worker could not safely persist stopped stream state"})
+	default:
+		writeRequestError(w, err)
+	}
 }
 
 func securityHeaders(next http.Handler) http.Handler {

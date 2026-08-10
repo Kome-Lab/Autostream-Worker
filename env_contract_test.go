@@ -112,6 +112,24 @@ func TestHostAndContainerBindContract(t *testing.T) {
 	}
 }
 
+func TestProductionComposePersistsStoppedTargetReceiptDirectory(t *testing.T) {
+	const (
+		receiptVolume = "worker-stopped-target-receipts"
+		receiptPath   = "/var/lib/autostream/worker"
+	)
+
+	production := readFile(t, "docker-compose.prod.yml")
+	if !strings.Contains(production, "\nvolumes:\n  "+receiptVolume+":\n") {
+		t.Errorf("production compose must define named receipt volume %q", receiptVolume)
+	}
+	if !strings.Contains(production, "\n      - "+receiptVolume+":"+receiptPath+"\n") {
+		t.Errorf("production compose must mount %q at %q", receiptVolume, receiptPath)
+	}
+	if strings.Contains(production, receiptVolume+":"+receiptPath+":ro") {
+		t.Errorf("production compose must mount %q read-write so the worker can persist receipts", receiptVolume)
+	}
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	body, err := os.ReadFile(path)

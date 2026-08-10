@@ -164,7 +164,7 @@ func TestStopJobKeepsStoppedTargetIdempotentWithoutStoppingSuccessor(t *testing.
 	if res := stop("stream-a"); res.Code != http.StatusAccepted || !strings.Contains(res.Body.String(), "already_stopped") {
 		t.Fatalf("stopped target before successor status=%d body=%s", res.Code, res.Body.String())
 	}
-	if res := stop("unknown-stream"); res.Code != http.StatusConflict {
+	if res := stop("unknown-stream"); res.Code != http.StatusConflict || responseCode(t, res) != "no_active_stream_job" {
 		t.Fatalf("unknown target without active stream status=%d body=%s", res.Code, res.Body.String())
 	}
 	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-b"}); err != nil {
@@ -176,7 +176,7 @@ func TestStopJobKeepsStoppedTargetIdempotentWithoutStoppingSuccessor(t *testing.
 	if got := manager.CurrentStreamID(); got != "stream-b" {
 		t.Fatalf("delayed stop changed successor: current stream = %q", got)
 	}
-	if res := stop("unknown-stream"); res.Code != http.StatusConflict {
+	if res := stop("unknown-stream"); res.Code != http.StatusConflict || responseCode(t, res) != "stream_id_mismatch" {
 		t.Fatalf("unknown target with successor status=%d body=%s", res.Code, res.Body.String())
 	}
 	if got := manager.CurrentStreamID(); got != "stream-b" {
@@ -220,9 +220,50 @@ func TestStopJobKeepsStoppedTargetIdempotentAfterWorkerRestart(t *testing.T) {
 	if got := restartedManager.CurrentStreamID(); got != "stream-b" {
 		t.Fatalf("restart retry changed successor: current stream = %q", got)
 	}
-	if res := stop("unknown-stream"); res.Code != http.StatusConflict {
+	if res := stop("unknown-stream"); res.Code != http.StatusConflict || responseCode(t, res) != "stream_id_mismatch" {
 		t.Fatalf("unknown target after restart status=%d body=%s", res.Code, res.Body.String())
 	}
+}
+
+func TestStopJobReturnsSafeReceiptPersistenceFailure(t *testing.T) {
+	receiptPath := filepath.Join(t.TempDir(), "stopped-target-receipts.json")
+	manager, err := jobs.NewManagerWithStoppedTargetReceiptFile(encoder.NoopPublisher{}, observability.Client{}, receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(receiptPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
+	req := httptest.NewRequest(http.MethodPost, "/jobs/stream-a/stop", nil)
+	req.Header.Set("Authorization", "Bearer service-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	if res.Code != http.StatusServiceUnavailable || responseCode(t, res) != "stopped_target_receipt_unavailable" {
+		t.Fatalf("receipt persistence failure status=%d body=%s", res.Code, res.Body.String())
+	}
+	if strings.Contains(res.Body.String(), "regular non-symlink") {
+		t.Fatalf("receipt persistence detail leaked in response: %s", res.Body.String())
+	}
+	if got := manager.CurrentStreamID(); got != "stream-a" {
+		t.Fatalf("receipt persistence failure changed current stream: %q", got)
+	}
+}
+
+func responseCode(t *testing.T, res *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode JSON response: %v; body=%s", err, res.Body.String())
+	}
+	return body.Code
 }
 
 func TestNewServerFailsClosedOnInvalidConfigRevision(t *testing.T) {
