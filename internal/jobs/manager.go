@@ -717,10 +717,14 @@ func (m *Manager) Participants(ctx context.Context, streamID string, participant
 }
 
 func (m *Manager) ActiveSpeaker(ctx context.Context, streamID, userID, displayName string, now time.Time) (events.OverlayEvent, error) {
-	if strings.TrimSpace(userID) == "" {
+	return m.ActiveSpeakerState(ctx, streamID, userID, displayName, true, now)
+}
+
+func (m *Manager) ActiveSpeakerState(ctx context.Context, streamID, userID, displayName string, speaking bool, now time.Time) (events.OverlayEvent, error) {
+	if speaking && strings.TrimSpace(userID) == "" {
 		return events.OverlayEvent{}, errors.New("user_id is required")
 	}
-	return m.publish(ctx, events.ActiveSpeakerEvent(streamID, userID, displayName, now))
+	return m.publish(ctx, events.ActiveSpeakerStateEvent(streamID, userID, displayName, speaking, now))
 }
 
 func (m *Manager) CustomOverlay(ctx context.Context, streamID, eventType string, payload map[string]any, now time.Time) (events.OverlayEvent, error) {

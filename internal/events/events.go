@@ -32,6 +32,8 @@ func ParticipantListEvent(streamID string, participants []Participant, now time.
 		payloadParticipants = append(payloadParticipants, map[string]any{
 			"user_id":      participant.UserID,
 			"display_name": participant.DisplayName,
+			"avatar_url":   participant.AvatarURL,
+			"is_bot":       participant.IsBot,
 			"speaking":     participant.Speaking,
 		})
 	}
@@ -39,7 +41,11 @@ func ParticipantListEvent(streamID string, participants []Participant, now time.
 }
 
 func ActiveSpeakerEvent(streamID, userID, displayName string, now time.Time) OverlayEvent {
-	return newEvent(streamID, "overlay.active_speaker", map[string]any{"user_id": userID, "display_name": displayName}, now)
+	return ActiveSpeakerStateEvent(streamID, userID, displayName, true, now)
+}
+
+func ActiveSpeakerStateEvent(streamID, userID, displayName string, speaking bool, now time.Time) OverlayEvent {
+	return newEvent(streamID, "overlay.active_speaker", map[string]any{"user_id": userID, "display_name": displayName, "speaking": speaking}, now)
 }
 
 func CustomOverlayEvent(streamID, eventType string, payload map[string]any, now time.Time) OverlayEvent {
@@ -49,6 +55,8 @@ func CustomOverlayEvent(streamID, eventType string, payload map[string]any, now 
 type Participant struct {
 	UserID      string `json:"user_id"`
 	DisplayName string `json:"display_name,omitempty"`
+	AvatarURL   string `json:"avatar_url,omitempty"`
+	IsBot       bool   `json:"is_bot,omitempty"`
 	Speaking    bool   `json:"speaking"`
 }
 

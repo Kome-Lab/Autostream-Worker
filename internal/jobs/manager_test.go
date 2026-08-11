@@ -81,6 +81,21 @@ func TestManagerStartsAndPublishesEvent(t *testing.T) {
 	}
 }
 
+func TestManagerPublishesActiveSpeakerStopWithoutUserID(t *testing.T) {
+	pub := &fakePublisher{}
+	manager := NewManager(pub, observability.Client{})
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	event, err := manager.ActiveSpeakerState(t.Context(), "stream-01", "", "", false, testTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "overlay.active_speaker" || event.Payload["speaking"] != false || event.Payload["user_id"] != "" {
+		t.Fatalf("unexpected stop event: %#v", event)
+	}
+}
+
 func TestManagerForwardsJobScopedEncoderRoute(t *testing.T) {
 	pub := &fakePublisher{}
 	manager := NewManager(pub, observability.Client{})

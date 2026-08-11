@@ -26,12 +26,19 @@ func TestFinalCaptionEvent(t *testing.T) {
 }
 
 func TestParticipantListEvent(t *testing.T) {
-	ev := ParticipantListEvent("s1", []Participant{{UserID: "u1", DisplayName: "alice", Speaking: true}}, time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC))
+	ev := ParticipantListEvent("s1", []Participant{{UserID: "u1", DisplayName: "alice", AvatarURL: "https://cdn.discordapp.com/avatars/u1/a.png", IsBot: true, Speaking: true}}, time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC))
 	if ev.Type != "overlay.participants" {
 		t.Fatalf("unexpected type: %s", ev.Type)
 	}
 	participants, ok := ev.Payload["participants"].([]map[string]any)
-	if !ok || len(participants) != 1 || participants[0]["user_id"] != "u1" {
+	if !ok || len(participants) != 1 || participants[0]["user_id"] != "u1" || participants[0]["avatar_url"] == "" || participants[0]["is_bot"] != true || participants[0]["speaking"] != true {
 		t.Fatalf("unexpected participants payload: %#v", ev.Payload)
+	}
+}
+
+func TestActiveSpeakerStateEventCarriesSpeakingEdge(t *testing.T) {
+	ev := ActiveSpeakerStateEvent("s1", "u1", "alice", false, time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC))
+	if ev.Type != "overlay.active_speaker" || ev.Payload["user_id"] != "u1" || ev.Payload["speaking"] != false {
+		t.Fatalf("unexpected active speaker state payload: %#v", ev)
 	}
 }

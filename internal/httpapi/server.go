@@ -438,12 +438,17 @@ func (s Server) activeSpeakerEvent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		UserID      string `json:"user_id"`
 		DisplayName string `json:"display_name,omitempty"`
+		Speaking    *bool  `json:"speaking,omitempty"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
 		return
 	}
-	event, err := s.manager.ActiveSpeaker(r.Context(), r.PathValue("id"), req.UserID, req.DisplayName, time.Now().UTC())
+	speaking := true
+	if req.Speaking != nil {
+		speaking = *req.Speaking
+	}
+	event, err := s.manager.ActiveSpeakerState(r.Context(), r.PathValue("id"), req.UserID, req.DisplayName, speaking, time.Now().UTC())
 	writeEventResult(w, event, err)
 }
 
