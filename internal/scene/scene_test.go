@@ -99,6 +99,19 @@ func TestSceneBoundsDeduplicatesAndExpiresChatAndCaptions(t *testing.T) {
 	}
 }
 
+func TestSceneKeepsDefaultChatUntilItIsDisplacedOrTheStreamStops(t *testing.T) {
+	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
+	s := newTestScene(t, 854, 480, now)
+	s.Reset(1, "stream-01", "Dev")
+	apply(t, s, events.CustomOverlayEvent("stream-01", "overlay.discord_chat", map[string]any{
+		"message_id": "message-01", "author_id": "user-01", "content": "keep me",
+	}, now))
+
+	if got := s.Snapshot(now.Add(24 * time.Hour)); len(got.Chat) != 1 || got.Chat[0].MessageID != "message-01" {
+		t.Fatalf("default chat expired while the stream was still active: %#v", got.Chat)
+	}
+}
+
 func TestSceneResetAndClearFenceStreamState(t *testing.T) {
 	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
 	s := newTestScene(t, 854, 480, now)

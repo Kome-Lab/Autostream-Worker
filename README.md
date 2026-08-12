@@ -22,15 +22,18 @@ AUTOSTREAM_CONFIG_REVISION=1
 TZ=Asia/Tokyo
 ```
 
-Worker generates the 16:9 program scene before sending video to the assigned
-Encoder/Recorder. The host runtime requires FFmpeg with `libx264` and the
-`mpegts` muxer, plus a Japanese Noto font. `AUTOSTREAM_SCENE_FONT_FILE` is an
+Worker generates the 16:9 program scene as low-rate JPEG images and sends
+those images to the assigned Encoder/Recorder. Worker does not encode video or
+mux audio; Encoder/Recorder retains the latest image and performs the final
+configured-FPS CBR video encode, audio mux, preview, recording, and delivery.
+The Worker host therefore requires a Japanese Noto font but does not require
+FFmpeg. `AUTOSTREAM_SCENE_FONT_FILE` is an
 optional absolute-path override. When it is unset, Worker uses the exact path
 `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` so preserved legacy
 `worker.env` files remain upgrade-compatible. If the selected file is missing
 or invalid, startup fails closed; Worker never falls back to a non-Japanese
 basic font. On
-Debian/Ubuntu, install `ffmpeg`, `fontconfig`, and `fonts-noto-cjk`.
+Debian/Ubuntu, install `fontconfig` and `fonts-noto-cjk`.
 
 `AUTOSTREAM_CONFIG_REVISION` is a root-owned positive integer used by the local
 executor to bind `/updater/version` to the applied service configuration.

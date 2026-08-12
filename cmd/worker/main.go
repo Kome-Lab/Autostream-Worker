@@ -74,9 +74,6 @@ func main() {
 	}
 	defer sceneRenderer.Close()
 	manager.SetSceneRenderer(sceneRenderer)
-	if err := requireFFmpegBinary(ffmpegBinaryFromEnv()); err != nil {
-		log.Fatalf("initialize worker video output: %v", err)
-	}
 	manager.SetVideoOutput(newJobVideoOutput(manager))
 	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(resolveCtx context.Context, streamID, secretName string) (control.RuntimeSecret, error) {
 		return (control.Client{Config: control.ConfigFromEnv()}).ResolveRuntimeSecret(resolveCtx, streamID, secretName)

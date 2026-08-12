@@ -18,7 +18,7 @@ jobs:
       - name: Install Worker media runtime dependencies for the root fixture
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y ffmpeg fontconfig fonts-noto-cjk
+          sudo apt-get install --no-install-recommends -y fontconfig fonts-noto-cjk
       - name: Check service installer syntax
         run: |
           bash -n release/install-autostream-worker

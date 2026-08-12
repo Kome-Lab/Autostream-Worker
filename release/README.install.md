@@ -104,9 +104,10 @@ increment it after each configuration change. `AUTOSTREAM_BIND_ADDR` accepts an
 unprivileged port from `1024` through `65535`; the example uses
 `127.0.0.1:8084`.
 
-The host must provide FFmpeg with the `libx264` encoder and `mpegts` muxer, and
-a Japanese Noto font. Install the Debian/Ubuntu packages `ffmpeg`, `fontconfig`,
-and `fonts-noto-cjk`. Worker uses the path below when the variable is unset;
+The host must provide a Japanese Noto font. Worker only renders low-rate JPEG
+scene images; Encoder/Recorder performs video encoding and audio muxing, so
+FFmpeg is not required on the Worker host. Install the Debian/Ubuntu packages
+`fontconfig` and `fonts-noto-cjk`. Worker uses the path below when the variable is unset;
 keep it in `worker.env` only when an explicit override is desired:
 
 ```text

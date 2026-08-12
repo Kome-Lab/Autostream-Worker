@@ -198,7 +198,7 @@ func serviceCapabilities() map[string]any {
 		"participant_state":      true,
 		"active_speaker":         true,
 		"current_time_events":    true,
-		"scene_video_srt":        true,
+		"scene_frames_mjpeg_srt": true,
 		"health_endpoint":        true,
 		"job_endpoint":           true,
 	}

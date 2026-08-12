@@ -1,10 +1,11 @@
 package videoout
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"image"
+	"image/jpeg"
 	"io"
 	"strings"
 	"sync"
@@ -13,19 +14,20 @@ import (
 )
 
 var (
-	ErrAlreadyRunning     = errors.New("video output is already running")
-	ErrFrameShapeMismatch = errors.New("rendered frame shape does not match the video contract")
-	ErrStartupTimeout     = errors.New("video output startup timed out")
-	ErrTransportStopped   = errors.New("video output transport stopped")
+	ErrAlreadyRunning     = errors.New("scene frame output is already running")
+	ErrFrameShapeMismatch = errors.New("rendered frame shape does not match the scene frame contract")
+	ErrStartupTimeout     = errors.New("scene frame output startup timed out")
+	ErrTransportStopped   = errors.New("scene frame output transport stopped")
 )
 
 const (
 	defaultStartupTimeout = 8 * time.Second
-	defaultFFmpegBinary   = "ffmpeg"
+	defaultFrameInterval  = 500 * time.Millisecond
+	defaultJPEGQuality    = 90
 	defaultAvatarRefresh  = 15 * time.Minute
 	maxAvatarRefresh      = 24 * time.Hour
 	maxVideoDimension     = 3840
-	maxVideoFPS           = 60
+	maxEncodedFrameBytes  = 16 << 20
 )
 
 type Config struct {
@@ -36,9 +38,6 @@ type Config struct {
 	PBKeylen       int
 	Width          int
 	Height         int
-	FPS            int
-	BitrateKbps    int
-	FFmpegBinary   string
 	StartupTimeout time.Duration
 }
 
@@ -53,8 +52,9 @@ type AvatarRefresher interface {
 
 type Options struct {
 	Dialer         SRTDialer
-	ProcessFactory ProcessFactory
 	StartupTimeout time.Duration
+	FrameInterval  time.Duration
+	JPEGQuality    int
 	Now            func() time.Time
 	OnFailure      func(streamID string, generation uint64)
 }
@@ -67,12 +67,13 @@ type Status struct {
 }
 
 type Manager struct {
-	source    FrameSource
-	dialer    SRTDialer
-	procs     ProcessFactory
-	now       func() time.Time
-	timeout   time.Duration
-	onFailure func(streamID string, generation uint64)
+	source        FrameSource
+	dialer        SRTDialer
+	now           func() time.Time
+	timeout       time.Duration
+	frameInterval time.Duration
+	jpegQuality   int
+	onFailure     func(streamID string, generation uint64)
 
 	lifecycleMu sync.Mutex
 	mu          sync.Mutex
@@ -85,7 +86,6 @@ type session struct {
 	generation uint64
 	started    time.Time
 	cancel     context.CancelFunc
-	process    Process
 	conn       SRTConn
 	errors     chan error
 	first      chan struct{}
@@ -100,10 +100,6 @@ func NewManager(source FrameSource, options Options) *Manager {
 	if dialer == nil {
 		dialer = newGoSRTDialer()
 	}
-	processFactory := options.ProcessFactory
-	if processFactory == nil {
-		processFactory = execProcessFactory{}
-	}
 	now := options.Now
 	if now == nil {
 		now = time.Now
@@ -112,9 +108,17 @@ func NewManager(source FrameSource, options Options) *Manager {
 	if timeout <= 0 {
 		timeout = defaultStartupTimeout
 	}
+	interval := options.FrameInterval
+	if interval <= 0 {
+		interval = defaultFrameInterval
+	}
+	quality := options.JPEGQuality
+	if quality < 1 || quality > 100 {
+		quality = defaultJPEGQuality
+	}
 	return &Manager{
-		source: source, dialer: dialer, procs: processFactory, now: now, timeout: timeout,
-		onFailure: options.OnFailure,
+		source: source, dialer: dialer, now: now, timeout: timeout,
+		frameInterval: interval, jpegQuality: quality, onFailure: options.OnFailure,
 	}
 }
 
@@ -147,28 +151,13 @@ func (m *Manager) Start(ctx context.Context, config Config) error {
 	defer cancelStartup()
 	conn, err := m.dialer.Dial(startupCtx, destination.address, destination.options)
 	if err != nil {
-		return errors.New("video SRT connection failed")
-	}
-	process, err := m.procs.Start(config.FFmpegBinary, buildFFmpegArgs(config))
-	if err != nil {
-		_ = conn.Close()
-		return errors.New("video encoder process failed to start")
+		return errors.New("scene frame SRT connection failed")
 	}
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	s := &session{
-		streamID:   config.StreamID,
-		generation: config.Generation,
-		started:    m.now().UTC(),
-		cancel:     cancelRun,
-		process:    process,
-		conn:       conn,
-		errors:     make(chan error, 4),
-		first:      make(chan struct{}),
-		done:       make(chan struct{}),
+		streamID: config.StreamID, generation: config.Generation, started: m.now().UTC(),
+		cancel: cancelRun, conn: conn, errors: make(chan error, 2), first: make(chan struct{}), done: make(chan struct{}),
 	}
-	go s.waitProcess(runCtx)
-	go s.discardStderr()
-	go s.pumpMPEGTS(runCtx)
 	go m.renderFrames(runCtx, s, config)
 	go m.refreshAvatars(runCtx)
 
@@ -257,26 +246,13 @@ func (m *Manager) monitor(s *session) {
 func (m *Manager) normalizeConfig(config Config) (Config, error) {
 	config.StreamID = strings.TrimSpace(config.StreamID)
 	if config.StreamID == "" {
-		return Config{}, errors.New("video stream_id is required")
+		return Config{}, errors.New("scene frame stream_id is required")
 	}
 	if m.source == nil {
-		return Config{}, errors.New("video frame source is unavailable")
+		return Config{}, errors.New("scene frame source is unavailable")
 	}
 	if config.Width <= 0 || config.Height <= 0 || config.Width > maxVideoDimension || config.Height > maxVideoDimension || config.Width%2 != 0 || config.Height%2 != 0 {
-		return Config{}, errors.New("video dimensions must be positive, even, and at most 3840")
-	}
-	if config.FPS <= 0 || config.FPS > maxVideoFPS {
-		return Config{}, errors.New("video fps must be between 1 and 60")
-	}
-	if config.BitrateKbps <= 0 {
-		config.BitrateKbps = defaultBitrateKbps(config.Width, config.Height)
-	}
-	if config.BitrateKbps < 100 || config.BitrateKbps > 50000 {
-		return Config{}, errors.New("video bitrate is outside the supported range")
-	}
-	config.FFmpegBinary = strings.TrimSpace(config.FFmpegBinary)
-	if config.FFmpegBinary == "" {
-		config.FFmpegBinary = defaultFFmpegBinary
+		return Config{}, errors.New("scene frame dimensions must be positive, even, and at most 3840")
 	}
 	if config.StartupTimeout <= 0 {
 		config.StartupTimeout = m.timeout
@@ -285,19 +261,19 @@ func (m *Manager) normalizeConfig(config Config) (Config, error) {
 }
 
 func (m *Manager) renderFrames(ctx context.Context, s *session, config Config) {
-	interval := time.Second / time.Duration(config.FPS)
-	if err := m.renderFrame(s.process.Stdin(), config); err != nil {
+	defer close(s.done)
+	if err := m.renderFrame(s, config); err != nil {
 		s.signalError(err)
 		return
 	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(m.frameInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := m.renderFrame(s.process.Stdin(), config); err != nil {
+			if err := m.renderFrame(s, config); err != nil {
 				s.signalError(err)
 				return
 			}
@@ -305,66 +281,27 @@ func (m *Manager) renderFrames(ctx context.Context, s *session, config Config) {
 	}
 }
 
-func (m *Manager) renderFrame(writer io.Writer, config Config) error {
+func (m *Manager) renderFrame(s *session, config Config) error {
 	frame, err := m.source.RenderScene(m.now().UTC())
 	if err != nil || frame == nil {
-		return errors.New("video scene render failed")
+		return errors.New("scene frame render failed")
 	}
 	if frame.Bounds().Dx() != config.Width || frame.Bounds().Dy() != config.Height {
 		return ErrFrameShapeMismatch
 	}
-	rowBytes := config.Width * 4
-	for y := frame.Bounds().Min.Y; y < frame.Bounds().Max.Y; y++ {
-		offset := frame.PixOffset(frame.Bounds().Min.X, y)
-		if offset < 0 || offset+rowBytes > len(frame.Pix) {
-			return ErrFrameShapeMismatch
-		}
-		if err := writeFull(writer, frame.Pix[offset:offset+rowBytes]); err != nil {
-			return errors.New("video frame pipe failed")
-		}
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, frame, &jpeg.Options{Quality: m.jpegQuality}); err != nil {
+		return errors.New("scene frame JPEG encoding failed")
 	}
+	if encoded.Len() <= 0 || encoded.Len() > maxEncodedFrameBytes {
+		return errors.New("scene frame JPEG size is outside the supported range")
+	}
+	if err := writeFull(s.conn, encoded.Bytes()); err != nil {
+		return errors.New("scene frame SRT write failed")
+	}
+	s.bytes.Add(uint64(encoded.Len()))
+	s.firstOnce.Do(func() { close(s.first) })
 	return nil
-}
-
-func (s *session) waitProcess(ctx context.Context) {
-	err := s.process.Wait()
-	close(s.done)
-	if ctx.Err() != nil {
-		return
-	}
-	if err == nil {
-		err = ErrTransportStopped
-	} else {
-		err = errors.New("video encoder process stopped")
-	}
-	s.signalError(err)
-}
-
-func (s *session) discardStderr() {
-	_, _ = io.Copy(io.Discard, s.process.Stderr())
-}
-
-func (s *session) pumpMPEGTS(ctx context.Context) {
-	buffer := make([]byte, 32*1024)
-	for {
-		n, readErr := s.process.Stdout().Read(buffer)
-		if n > 0 {
-			if err := writeFull(s.conn, buffer[:n]); err != nil {
-				if ctx.Err() == nil {
-					s.signalError(errors.New("video SRT write failed"))
-				}
-				return
-			}
-			s.bytes.Add(uint64(n))
-			s.firstOnce.Do(func() { close(s.first) })
-		}
-		if readErr != nil {
-			if ctx.Err() == nil {
-				s.signalError(ErrTransportStopped)
-			}
-			return
-		}
-	}
 }
 
 func (s *session) signalError(err error) {
@@ -381,12 +318,8 @@ func (s *session) shutdown(ctx context.Context) error {
 	var shutdownErr error
 	s.stopOnce.Do(func() {
 		s.cancel()
-		_ = s.process.Stdin().Close()
-		_ = s.conn.Close()
-		_ = s.process.Stdout().Close()
-		_ = s.process.Stderr().Close()
-		if err := s.process.Kill(); err != nil {
-			shutdownErr = fmt.Errorf("stop video encoder: %w", err)
+		if err := s.conn.Close(); err != nil {
+			shutdownErr = err
 		}
 		select {
 		case <-s.done:

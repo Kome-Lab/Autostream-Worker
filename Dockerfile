@@ -11,10 +11,8 @@ RUN install -d -m 0750 -o 65532 -g 65532 /out/var/lib/autostream/worker
 
 FROM debian:trixie-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg fontconfig fonts-noto-cjk \
+    && apt-get install -y --no-install-recommends ca-certificates fontconfig fonts-noto-cjk \
     && test -r /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
-    && ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '[[:space:]]libx264([[:space:]]|$)' \
-    && ffmpeg -hide_banner -muxers 2>/dev/null | grep -Eq '[[:space:]]mpegts([[:space:]]|$)' \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/autostream-worker /usr/local/bin/autostream-worker
 COPY --from=build /out/autostream-worker /usr/local/bin/worker

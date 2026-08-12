@@ -22,7 +22,6 @@ const (
 	defaultMaxChat           = 8
 	defaultMaxCaptions       = 4
 	defaultMaxParticipants   = 64
-	defaultChatTTL           = 90 * time.Second
 	defaultInterimCaptionTTL = 6 * time.Second
 	defaultFinalCaptionTTL   = 15 * time.Second
 	seenMessageTTL           = 10 * time.Minute
@@ -139,8 +138,8 @@ func normalizeConfig(config Config) Config {
 	if config.MaxChat <= 0 {
 		config.MaxChat = defaultMaxChat
 	}
-	if config.ChatTTL <= 0 {
-		config.ChatTTL = defaultChatTTL
+	if config.ChatTTL < 0 {
+		config.ChatTTL = 0
 	}
 	if config.MaxCaptions <= 0 {
 		config.MaxCaptions = defaultMaxCaptions
@@ -423,10 +422,14 @@ func (s *Scene) applyChatLocked(payload map[string]any, now time.Time) error {
 		avatarURL = ""
 	}
 	isBot, _ := payload["is_bot"].(bool)
-	s.chat = append(s.chat, ChatMessage{
+	message := ChatMessage{
 		MessageID: messageID, AuthorID: authorID, DisplayName: displayName, AvatarURL: avatarURL,
-		IsBot: isBot, Content: content, CreatedAt: createdAt, ExpiresAt: now.Add(s.chatTTL),
-	})
+		IsBot: isBot, Content: content, CreatedAt: createdAt,
+	}
+	if s.chatTTL > 0 {
+		message.ExpiresAt = now.Add(s.chatTTL)
+	}
+	s.chat = append(s.chat, message)
 	s.seenMessages[messageID] = now.Add(seenMessageTTL)
 	if len(s.chat) > s.maxChat {
 		s.chat = append([]ChatMessage(nil), s.chat[len(s.chat)-s.maxChat:]...)
@@ -473,7 +476,7 @@ func (s *Scene) applyCaptionLocked(payload map[string]any, now time.Time, final 
 func (s *Scene) pruneLocked(now time.Time) {
 	chat := s.chat[:0]
 	for _, message := range s.chat {
-		if message.ExpiresAt.After(now) {
+		if message.ExpiresAt.IsZero() || message.ExpiresAt.After(now) {
 			chat = append(chat, message)
 		}
 	}
