@@ -35,14 +35,17 @@ func TestHostAndContainerBindContract(t *testing.T) {
 	}
 
 	dockerfile := readFile(t, "Dockerfile")
-	for _, required := range []string{"ffmpeg", "fontconfig", "fonts-noto-cjk", "NotoSansCJK-Regular.ttc", "libx264", "mpegts", "AUTOSTREAM_SCENE_FONT_FILE"} {
+	// Worker emits low-rate JPEG scene frames. The Encoder/Recorder owns the
+	// FFmpeg H.264/MPEG-TS encode and audio mux, so those packages must not be
+	// part of this Worker runtime contract.
+	for _, required := range []string{"fontconfig", "fonts-noto-cjk", "NotoSansCJK-Regular.ttc", "AUTOSTREAM_SCENE_FONT_FILE"} {
 		if !strings.Contains(dockerfile, required) {
 			t.Errorf("Dockerfile is missing scene runtime contract %q", required)
 		}
 	}
 
 	installer := readFile(t, "release/install-autostream-worker")
-	for _, required := range []string{"DEFAULT_SCENE_FONT_FILE", "FFmpeg libx264 encoder is unavailable", "FFmpeg mpegts muxer is unavailable"} {
+	for _, required := range []string{"DEFAULT_SCENE_FONT_FILE", "required Japanese Noto scene font is unavailable"} {
 		if !strings.Contains(installer, required) {
 			t.Errorf("installer is missing scene runtime preflight %q", required)
 		}
