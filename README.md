@@ -5,12 +5,10 @@ AutoStream の Worker service です。
 ## 役割
 
 - Control Panel から stream job context を受け取ります。
-- overlay、caption、participant、active-speaker、current-time event を生成します。
+- overlay、caption、participant、active-speaker、current-time event から16:9の配信映像を描画します。
 - Discord Bot の Discord Opus packet を受け取り、Deepgram のリアルタイム字幕を生成します。
-- 生成した event を Encoder/Recorder へ送信します。
+- 描画した映像をjob-scoped暗号化SRTで選択済みEncoder/Recorderへ送り、互換・診断用eventも転送します。
 - Control Panel へ heartbeat と signal を送信し、Control Panel 経由で Observability に反映します。
-
-video layer stream は MVP 後の後続タスクです。
 
 ## 主な環境変数
 
@@ -18,10 +16,21 @@ video layer stream は MVP 後の後続タスクです。
 AUTOSTREAM_NODE_CONFIG=/etc/autostream-worker/config.yml
 AUTOSTREAM_ENV=production
 AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG=true
+AUTOSTREAM_SCENE_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
 AUTOSTREAM_BIND_ADDR=127.0.0.1:8084
 AUTOSTREAM_CONFIG_REVISION=1
 TZ=Asia/Tokyo
 ```
+
+Worker generates the 16:9 program scene before sending video to the assigned
+Encoder/Recorder. The host runtime requires FFmpeg with `libx264` and the
+`mpegts` muxer, plus a Japanese Noto font. `AUTOSTREAM_SCENE_FONT_FILE` is an
+optional absolute-path override. When it is unset, Worker uses the exact path
+`/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` so preserved legacy
+`worker.env` files remain upgrade-compatible. If the selected file is missing
+or invalid, startup fails closed; Worker never falls back to a non-Japanese
+basic font. On
+Debian/Ubuntu, install `ffmpeg`, `fontconfig`, and `fonts-noto-cjk`.
 
 `AUTOSTREAM_CONFIG_REVISION` is a root-owned positive integer used by the local
 executor to bind `/updater/version` to the applied service configuration.
@@ -71,7 +80,7 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
 `AUTOSTREAM_NODE_CONFIG` には Control Panel の Node登録で生成した `config.yml` を指定します。Node Runtime Token と stream-scoped token の検証に使う `stream_ingest.signing_key` はこのファイルに入り、標準構成では `CONTROL_PANEL_TOKEN`、`AUTOSTREAM_STREAM_INGEST_SIGNING_KEY`、`OBSERVABILITY_TOKEN` を env に手入力しません。Worker から Observability へ直接送る互換fallbackを使う場合だけ、`OBSERVABILITY_URL` と `OBSERVABILITY_TOKEN=<OBSERVABILITY_INGEST_TOKEN>` を追加します。
 
-Encoder/Recorder への送信先 URL と worker-event token は、通常は Control Panel の stream job context で `encoder_recorder_url` / `stream_ingest_token` として渡されます。`ENCODER_RECORDER_URL` と `ENCODER_RECORDER_TOKEN` は local migration / dry-run 互換 fallback のみで使い、本番 env には置きません。
+Encoder/Recorder のevent送信先とworker-event tokenは、通常はControl Panelのstream job contextで `encoder_recorder_url` / `stream_ingest_token` として渡されます。映像用のSRT URL・passphrase・key lengthも同じstart処理内で一度だけ渡され、URLやargv、log、statusへ秘密を埋め込みません。`ENCODER_RECORDER_URL` と `ENCODER_RECORDER_TOKEN` はlocal migration / dry-run互換fallbackのみで使い、本番envには置きません。
 
 `AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG=true` または `AUTOSTREAM_ENV=production` の場合、Worker は Control Panel registration と runtime config 取得に失敗すると起動を停止します。runtime config に含まれる自 service の primary assignment だけを受け付け、standby または別 Worker に割り当てられた stream の `/jobs/start` は拒否します。
 

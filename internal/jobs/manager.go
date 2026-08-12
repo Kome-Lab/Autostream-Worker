@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"math"
 	"strings"
 	"sync"
@@ -25,17 +26,46 @@ var (
 	ErrNoActiveStreamJob               = errors.New("no active stream job")
 	ErrStreamIDDoesNotMatchJob         = errors.New("stream_id does not match current job")
 	ErrStoppedTargetReceiptUnavailable = errors.New("stopped target receipt is unavailable")
+	ErrVideoOutputUnavailable          = errors.New("worker video output is unavailable")
 )
 
 const maxStoppedStreamTargets = 64
 
 type StreamContext struct {
-	StreamID           string `json:"stream_id"`
-	StreamName         string `json:"stream_name,omitempty"`
-	EncoderRecorderURL string `json:"encoder_recorder_url,omitempty"`
-	StreamIngestToken  string `json:"stream_ingest_token,omitempty"`
-	OverlayProfileID   string `json:"overlay_profile_id,omitempty"`
-	CaptionProfileID   string `json:"caption_profile_id,omitempty"`
+	StreamID              string `json:"stream_id"`
+	StreamName            string `json:"stream_name,omitempty"`
+	EncoderRecorderURL    string `json:"encoder_recorder_url,omitempty"`
+	StreamIngestToken     string `json:"stream_ingest_token,omitempty"`
+	OverlayProfileID      string `json:"overlay_profile_id,omitempty"`
+	CaptionProfileID      string `json:"caption_profile_id,omitempty"`
+	EncoderProfileID      string `json:"encoder_profile_id,omitempty"`
+	VideoWidth            int    `json:"video_width,omitempty"`
+	VideoHeight           int    `json:"video_height,omitempty"`
+	VideoFPS              int    `json:"video_fps,omitempty"`
+	VideoIngestURL        string `json:"video_ingest_url,omitempty"`
+	VideoIngestPassphrase string `json:"video_ingest_passphrase,omitempty"`
+	VideoIngestPBKeylen   int    `json:"video_ingest_pbkeylen,omitempty"`
+}
+
+type VideoSceneConfig struct {
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+	FPS        int    `json:"fps"`
+	Generation uint64 `json:"-"`
+}
+
+type SceneRenderer interface {
+	Reset(generation uint64, streamID, streamName string)
+	Clear(streamID string)
+	Apply(generation uint64, event events.OverlayEvent) error
+	RenderSize(width, height int, at time.Time) (*image.RGBA, error)
+	AvatarRefreshInterval() time.Duration
+	RefreshAvatars()
+}
+
+type VideoOutput interface {
+	Start(context.Context, StreamContext, VideoSceneConfig) error
+	Stop(context.Context, string) error
 }
 
 type ProfileDefaults struct {
@@ -72,6 +102,10 @@ type Manager struct {
 	secretResolver  RuntimeSecretResolver
 	captionFactory  CaptionSessionFactory
 	captionSession  CaptionSession
+	sceneRenderer   SceneRenderer
+	sceneVideo      VideoSceneConfig
+	videoOutput     VideoOutput
+	jobGeneration   uint64
 
 	startedAt                time.Time
 	stoppedOrder             []stoppedTargetReceipt
@@ -164,6 +198,13 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	}
 	stream.StreamID = strings.TrimSpace(stream.StreamID)
 	stream.CaptionProfileID = strings.TrimSpace(stream.CaptionProfileID)
+	videoConfig, err := normalizeVideoSceneConfig(stream.VideoWidth, stream.VideoHeight, stream.VideoFPS)
+	if err != nil {
+		return err
+	}
+	if err := validateVideoOutputRequest(stream); err != nil {
+		return err
+	}
 
 	m.mu.Lock()
 	if !m.streamAssignedLocked(stream.StreamID) {
@@ -229,12 +270,53 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		return fmt.Errorf("%w: %v", ErrStoppedTargetReceiptUnavailable, err)
 	}
 	m.current = stream
+	m.jobGeneration++
+	generation := m.jobGeneration
 	m.captionSession = captionSession
+	m.sceneVideo = videoConfig
+	sceneRenderer := m.sceneRenderer
+	videoOutput := m.videoOutput
+	videoRequested := videoOutputRequested(stream)
+	if videoRequested && (sceneRenderer == nil || videoOutput == nil) {
+		m.current = StreamContext{}
+		m.captionSession = nil
+		m.sceneVideo = VideoSceneConfig{}
+		m.mu.Unlock()
+		closeCaptionSession(captionSession)
+		return ErrVideoOutputUnavailable
+	}
+	if sceneRenderer != nil {
+		sceneRenderer.Reset(generation, stream.StreamID, stream.StreamName)
+	}
 	m.startedAt = time.Now().UTC()
 	m.events = nil
 	m.eventCounts = map[string]int{}
 	m.sendFailures = 0
 	m.mu.Unlock()
+	if videoRequested {
+		videoStartConfig := videoConfig
+		videoStartConfig.Generation = generation
+		if err := videoOutput.Start(ctx, stream, videoStartConfig); err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = videoOutput.Stop(cleanupCtx, stream.StreamID)
+			cleanupCancel()
+			m.mu.Lock()
+			if m.current.StreamID == stream.StreamID {
+				m.current = StreamContext{}
+				m.captionSession = nil
+				m.sceneVideo = VideoSceneConfig{}
+				m.startedAt = time.Time{}
+				m.events = nil
+				m.eventCounts = map[string]int{}
+				m.sendFailures = 0
+			}
+			m.mu.Unlock()
+			sceneRenderer.Clear(stream.StreamID)
+			closeCaptionSession(captionSession)
+			m.report(ctx, stream.StreamID, "worker.video.start_failed", "failed", nil)
+			return ErrVideoOutputUnavailable
+		}
+	}
 	m.report(ctx, stream.StreamID, "worker.job.started", "running", nil)
 	return nil
 }
@@ -268,6 +350,68 @@ func (m *Manager) SetCaptionRuntime(resolver RuntimeSecretResolver, factory Capt
 		factory = deepgramSessionFactory{}
 	}
 	m.captionFactory = factory
+}
+
+func (m *Manager) SetSceneRenderer(renderer SceneRenderer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sceneRenderer = renderer
+}
+
+func (m *Manager) SetVideoOutput(output VideoOutput) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.videoOutput = output
+}
+
+// HandleVideoOutputFailure fails the matching active job closed after its
+// already-started video transport exits unexpectedly. The generation fence is
+// required because a stream ID may be reused after a stop/rearm cycle.
+func (m *Manager) HandleVideoOutputFailure(streamID string, generation uint64) {
+	streamID = strings.TrimSpace(streamID)
+	if streamID == "" || generation == 0 {
+		return
+	}
+
+	m.lifecycleMu.Lock()
+	m.mu.Lock()
+	if m.current.StreamID != streamID || m.jobGeneration != generation || !videoOutputRequested(m.current) {
+		m.mu.Unlock()
+		m.lifecycleMu.Unlock()
+		return
+	}
+	receiptErr := m.rememberStoppedTargetLocked(streamID)
+	if receiptErr != nil {
+		// Durability is uncertain, but the running process must still answer the
+		// Control Panel's immediate stop convergence idempotently.
+		m.rememberStoppedTargetInMemoryLocked(streamID, time.Now().UTC())
+	}
+	captionSession := m.captionSession
+	sceneRenderer := m.sceneRenderer
+	m.current = StreamContext{}
+	m.captionSession = nil
+	m.sceneVideo = VideoSceneConfig{}
+	m.startedAt = time.Time{}
+	m.jobGeneration++
+	m.mu.Unlock()
+
+	if sceneRenderer != nil {
+		sceneRenderer.Clear(streamID)
+	}
+	m.lifecycleMu.Unlock()
+
+	failureCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	attributes := map[string]any{"reason": "transport_stopped"}
+	if receiptErr != nil {
+		attributes["stopped_target_receipt"] = "unavailable"
+	}
+	m.report(failureCtx, streamID, "worker.video.output_failed", "failed", attributes)
+	if captionSession != nil {
+		if err := captionSession.Close(failureCtx); err != nil {
+			m.report(failureCtx, streamID, "worker.caption.stop_failed", "failed", nil)
+		}
+	}
 }
 
 func (m *Manager) ApplyRuntimeConfig(cfg control.RuntimeConfig) {
@@ -527,8 +671,16 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	}
 	stoppedStreamID := m.current.StreamID
 	captionSession := m.captionSession
+	videoOutput := m.videoOutput
+	videoRequested := videoOutputRequested(m.current)
 	m.captionSession = nil
 	m.mu.Unlock()
+
+	if videoRequested && videoOutput != nil {
+		if err := videoOutput.Stop(ctx, stoppedStreamID); err != nil {
+			m.report(ctx, stoppedStreamID, "worker.video.stop_failed", "failed", nil)
+		}
+	}
 
 	if captionSession != nil {
 		if err := captionSession.Close(ctx); err != nil {
@@ -542,8 +694,13 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 		return fmt.Errorf("%w: %v", ErrStoppedTargetReceiptUnavailable, err)
 	}
 	m.current = StreamContext{}
+	m.sceneVideo = VideoSceneConfig{}
 	m.startedAt = time.Time{}
+	sceneRenderer := m.sceneRenderer
 	m.mu.Unlock()
+	if sceneRenderer != nil {
+		sceneRenderer.Clear(stoppedStreamID)
+	}
 	m.report(ctx, stoppedStreamID, "worker.job.stopped", "stopped", nil)
 	return nil
 }
@@ -572,6 +729,19 @@ func (m *Manager) rememberStoppedTargetLocked(streamID string) error {
 	}
 	m.setStoppedTargetReceiptsLocked(receipts)
 	return nil
+}
+
+func (m *Manager) rememberStoppedTargetInMemoryLocked(streamID string, stoppedAt time.Time) {
+	streamID = strings.TrimSpace(streamID)
+	if streamID == "" {
+		return
+	}
+	receipts := m.withoutStoppedTargetLocked(streamID)
+	receipts = append(receipts, stoppedTargetReceipt{StreamID: streamID, StoppedAt: stoppedAt.UTC()})
+	if len(receipts) > maxStoppedStreamTargets {
+		receipts = receipts[len(receipts)-maxStoppedStreamTargets:]
+	}
+	m.setStoppedTargetReceiptsLocked(receipts)
 }
 
 func (m *Manager) forgetStoppedTargetLocked(streamID string) error {
@@ -643,6 +813,44 @@ func (m *Manager) CurrentStreamID() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.current.StreamID
+}
+
+func (m *Manager) SceneVideoConfig() (VideoSceneConfig, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sceneVideo, m.current.StreamID != "" && m.sceneRenderer != nil
+}
+
+func (m *Manager) RenderScene(at time.Time) (*image.RGBA, error) {
+	m.mu.Lock()
+	renderer := m.sceneRenderer
+	config := m.sceneVideo
+	active := m.current.StreamID != ""
+	m.mu.Unlock()
+	if !active || renderer == nil {
+		return nil, ErrNoActiveStreamJob
+	}
+	return renderer.RenderSize(config.Width, config.Height, at)
+}
+
+func (m *Manager) AvatarRefreshInterval() time.Duration {
+	m.mu.Lock()
+	renderer := m.sceneRenderer
+	m.mu.Unlock()
+	if renderer == nil {
+		return 15 * time.Minute
+	}
+	return renderer.AvatarRefreshInterval()
+}
+
+func (m *Manager) RefreshAvatars() {
+	m.mu.Lock()
+	renderer := m.sceneRenderer
+	active := m.current.StreamID != ""
+	m.mu.Unlock()
+	if active && renderer != nil {
+		renderer.RefreshAvatars()
+	}
 }
 
 func (m *Manager) Status() Status {
@@ -742,7 +950,16 @@ func (m *Manager) publish(ctx context.Context, event events.OverlayEvent) (event
 	}
 	encoderRecorderURL := m.current.EncoderRecorderURL
 	streamIngestToken := m.current.StreamIngestToken
+	sceneRenderer := m.sceneRenderer
+	generation := m.jobGeneration
 	m.mu.Unlock()
+
+	if sceneRenderer != nil {
+		if err := sceneRenderer.Apply(generation, event); err != nil {
+			m.report(ctx, event.StreamID, "worker.scene.apply_failed", "failed", map[string]any{"event_type": event.Type})
+			return events.OverlayEvent{}, errors.New("scene event apply failed")
+		}
+	}
 
 	err := m.publisher.Publish(ctx, encoder.Event{
 		ID:        event.ID,
@@ -765,6 +982,10 @@ func (m *Manager) publish(ctx context.Context, event events.OverlayEvent) (event
 	}
 
 	m.mu.Lock()
+	if m.current.StreamID != event.StreamID || m.jobGeneration != generation {
+		m.mu.Unlock()
+		return events.OverlayEvent{}, errors.New("stream job changed while publishing event")
+	}
 	m.events = append(m.events, event)
 	if len(m.events) > m.maxEvents {
 		m.events = append([]events.OverlayEvent(nil), m.events[len(m.events)-m.maxEvents:]...)
@@ -776,6 +997,36 @@ func (m *Manager) publish(ctx context.Context, event events.OverlayEvent) (event
 		m.metric(ctx, event.StreamID, metricName, "ok", float64(value), map[string]any{"event_type": event.Type})
 	}
 	return event, nil
+}
+
+func normalizeVideoSceneConfig(width, height, fps int) (VideoSceneConfig, error) {
+	if width == 0 && height == 0 {
+		width, height = 1920, 1080
+	}
+	if fps <= 0 {
+		fps = 30
+	}
+	if !((width == 1920 && height == 1080) || (width == 1280 && height == 720) || (width == 854 && height == 480)) {
+		return VideoSceneConfig{}, errors.New("video scene size must be 1920x1080, 1280x720, or 854x480")
+	}
+	if fps < 1 || fps > 60 {
+		return VideoSceneConfig{}, errors.New("video scene fps must be between 1 and 60")
+	}
+	return VideoSceneConfig{Width: width, Height: height, FPS: fps}, nil
+}
+
+func videoOutputRequested(stream StreamContext) bool {
+	return strings.TrimSpace(stream.VideoIngestURL) != "" || strings.TrimSpace(stream.VideoIngestPassphrase) != "" || stream.VideoIngestPBKeylen != 0
+}
+
+func validateVideoOutputRequest(stream StreamContext) error {
+	if !videoOutputRequested(stream) {
+		return nil
+	}
+	if strings.TrimSpace(stream.EncoderProfileID) == "" || strings.TrimSpace(stream.VideoIngestURL) == "" || strings.TrimSpace(stream.VideoIngestPassphrase) == "" || stream.VideoIngestPBKeylen == 0 {
+		return errors.New("encoder_profile_id and complete video ingest configuration are required together")
+	}
+	return nil
 }
 
 func (m *Manager) ensureStreamLocked(streamID string) error {

@@ -19,6 +19,7 @@ import (
 	"github.com/example/autostream-worker/internal/httpapi"
 	"github.com/example/autostream-worker/internal/jobs"
 	"github.com/example/autostream-worker/internal/observability"
+	"github.com/example/autostream-worker/internal/scene"
 	"github.com/example/autostream-worker/internal/version"
 )
 
@@ -60,6 +61,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("load stopped target receipts: %v", err)
 	}
+	fontFile := strings.TrimSpace(os.Getenv(scene.FontFileEnvironment))
+	if fontFile == "" {
+		// Preserve upgrades from event-only Worker releases whose existing
+		// root-owned worker.env predates the scene setting. The installer verifies
+		// this exact Noto file; a missing/invalid file still fails closed below.
+		fontFile = scene.DefaultFontFile
+	}
+	sceneRenderer, err := scene.New(scene.Config{FontFile: fontFile})
+	if err != nil {
+		log.Fatalf("initialize worker scene renderer: %v", err)
+	}
+	defer sceneRenderer.Close()
+	manager.SetSceneRenderer(sceneRenderer)
+	if err := requireFFmpegBinary(ffmpegBinaryFromEnv()); err != nil {
+		log.Fatalf("initialize worker video output: %v", err)
+	}
+	manager.SetVideoOutput(newJobVideoOutput(manager))
 	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(resolveCtx context.Context, streamID, secretName string) (control.RuntimeSecret, error) {
 		return (control.Client{Config: control.ConfigFromEnv()}).ResolveRuntimeSecret(resolveCtx, streamID, secretName)
 	}), nil)

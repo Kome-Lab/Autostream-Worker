@@ -32,9 +32,18 @@ die() {
 for command in \
   awk basename chmod chown cmp cp dirname find flock getent grep groupadd groupdel id install jq \
   ln mkdir mktemp mv readlink rm rmdir runuser sha256sum sort stat sync systemctl tar uname \
-  uniq useradd userdel usermod; do
+  uniq useradd userdel usermod ffmpeg; do
   command -v "${command}" >/dev/null 2>&1 || die "required command is unavailable: ${command}"
 done
+
+readonly DEFAULT_SCENE_FONT_FILE="/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+[[ -f ${DEFAULT_SCENE_FONT_FILE} && ! -L ${DEFAULT_SCENE_FONT_FILE} &&
+  -r ${DEFAULT_SCENE_FONT_FILE} ]] || \
+  die "required Japanese Noto scene font is unavailable: ${DEFAULT_SCENE_FONT_FILE}"
+ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '[[:space:]]libx264([[:space:]]|$)' || \
+  die "FFmpeg libx264 encoder is unavailable"
+ffmpeg -hide_banner -muxers 2>/dev/null | grep -Eq '[[:space:]]mpegts([[:space:]]|$)' || \
+  die "FFmpeg mpegts muxer is unavailable"
 
 service_was_active=false
 if systemctl is-active --quiet "${UNIT_NAME}"; then

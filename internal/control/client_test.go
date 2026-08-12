@@ -37,6 +37,9 @@ func TestRegisterPostsServiceRegistration(t *testing.T) {
 	if got.Capabilities["caption_audio_ingest"] != true || got.Capabilities["deepgram_transcription"] != true {
 		t.Fatalf("caption capabilities are missing: %#v", got.Capabilities)
 	}
+	if got.Capabilities["scene_video_srt"] != true {
+		t.Fatalf("scene video SRT capability is missing: %#v", got.Capabilities)
+	}
 	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH {
 		t.Fatalf("registration did not include runtime platform: %#v", got)
 	}

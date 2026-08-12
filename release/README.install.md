@@ -104,6 +104,18 @@ increment it after each configuration change. `AUTOSTREAM_BIND_ADDR` accepts an
 unprivileged port from `1024` through `65535`; the example uses
 `127.0.0.1:8084`.
 
+The host must provide FFmpeg with the `libx264` encoder and `mpegts` muxer, and
+a Japanese Noto font. Install the Debian/Ubuntu packages `ffmpeg`, `fontconfig`,
+and `fonts-noto-cjk`. Worker uses the path below when the variable is unset;
+keep it in `worker.env` only when an explicit override is desired:
+
+```text
+AUTOSTREAM_SCENE_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+```
+
+The Worker fails closed if the selected path is missing, unreadable, or
+invalid. It does not silently fall back to a basic font.
+
 Verify the installed command and health endpoint, replacing the port if needed:
 
 ```bash

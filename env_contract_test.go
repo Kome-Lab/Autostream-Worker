@@ -29,6 +29,24 @@ func TestHostAndContainerBindContract(t *testing.T) {
 		!strings.Contains(strings.ToLower(env), "root-owned") {
 		t.Error(".env.example must document the root-owned updater probe config revision")
 	}
+	if !strings.Contains(env, "AUTOSTREAM_SCENE_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc") ||
+		!strings.Contains(env, "no basic-font fallback") {
+		t.Error(".env.example must document the Japanese Noto scene font override and fail-closed behavior")
+	}
+
+	dockerfile := readFile(t, "Dockerfile")
+	for _, required := range []string{"ffmpeg", "fontconfig", "fonts-noto-cjk", "NotoSansCJK-Regular.ttc", "libx264", "mpegts", "AUTOSTREAM_SCENE_FONT_FILE"} {
+		if !strings.Contains(dockerfile, required) {
+			t.Errorf("Dockerfile is missing scene runtime contract %q", required)
+		}
+	}
+
+	installer := readFile(t, "release/install-autostream-worker")
+	for _, required := range []string{"DEFAULT_SCENE_FONT_FILE", "FFmpeg libx264 encoder is unavailable", "FFmpeg mpegts muxer is unavailable"} {
+		if !strings.Contains(installer, required) {
+			t.Errorf("installer is missing scene runtime preflight %q", required)
+		}
+	}
 
 	base := readFile(t, "docker-compose.yml")
 	for _, required := range []string{
