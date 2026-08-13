@@ -18,6 +18,10 @@ var (
 	ErrFrameShapeMismatch = errors.New("rendered frame shape does not match the scene frame contract")
 	ErrStartupTimeout     = errors.New("scene frame output startup timed out")
 	ErrTransportStopped   = errors.New("scene frame output transport stopped")
+	ErrSceneFrameRender   = errors.New("scene frame render failed")
+	ErrJPEGEncode         = errors.New("scene frame JPEG encoding failed")
+	ErrJPEGSize           = errors.New("scene frame JPEG size is outside the supported range")
+	ErrSRTWrite           = errors.New("scene frame SRT write failed")
 )
 
 const (
@@ -56,7 +60,7 @@ type Options struct {
 	FrameInterval  time.Duration
 	JPEGQuality    int
 	Now            func() time.Time
-	OnFailure      func(streamID string, generation uint64)
+	OnFailure      func(streamID string, generation uint64, errorClass string)
 }
 
 type Status struct {
@@ -73,7 +77,7 @@ type Manager struct {
 	timeout       time.Duration
 	frameInterval time.Duration
 	jpegQuality   int
-	onFailure     func(streamID string, generation uint64)
+	onFailure     func(streamID string, generation uint64, errorClass string)
 
 	lifecycleMu sync.Mutex
 	mu          sync.Mutex
@@ -225,9 +229,17 @@ func (m *Manager) Status() Status {
 }
 
 func (m *Manager) monitor(s *session) {
+	errorClass := "transport_stopped"
 	select {
+	case err := <-s.errors:
+		errorClass = classifyFailure(err)
 	case <-s.done:
-	case <-s.errors:
+		select {
+		case err := <-s.errors:
+			errorClass = classifyFailure(err)
+		default:
+			errorClass = classifyFailure(ErrTransportStopped)
+		}
 	}
 	m.lifecycleMu.Lock()
 	m.mu.Lock()
@@ -239,7 +251,7 @@ func (m *Manager) monitor(s *session) {
 	_ = s.shutdown(context.Background())
 	m.lifecycleMu.Unlock()
 	if failed && m.onFailure != nil {
-		go m.onFailure(s.streamID, s.generation)
+		go m.onFailure(s.streamID, s.generation, errorClass)
 	}
 }
 
@@ -284,24 +296,43 @@ func (m *Manager) renderFrames(ctx context.Context, s *session, config Config) {
 func (m *Manager) renderFrame(s *session, config Config) error {
 	frame, err := m.source.RenderScene(m.now().UTC())
 	if err != nil || frame == nil {
-		return errors.New("scene frame render failed")
+		return ErrSceneFrameRender
 	}
 	if frame.Bounds().Dx() != config.Width || frame.Bounds().Dy() != config.Height {
 		return ErrFrameShapeMismatch
 	}
 	var encoded bytes.Buffer
 	if err := jpeg.Encode(&encoded, frame, &jpeg.Options{Quality: m.jpegQuality}); err != nil {
-		return errors.New("scene frame JPEG encoding failed")
+		return ErrJPEGEncode
 	}
 	if encoded.Len() <= 0 || encoded.Len() > maxEncodedFrameBytes {
-		return errors.New("scene frame JPEG size is outside the supported range")
+		return ErrJPEGSize
 	}
 	if err := writeFull(s.conn, encoded.Bytes()); err != nil {
-		return errors.New("scene frame SRT write failed")
+		return ErrSRTWrite
 	}
 	s.bytes.Add(uint64(encoded.Len()))
 	s.firstOnce.Do(func() { close(s.first) })
 	return nil
+}
+
+func classifyFailure(err error) string {
+	switch {
+	case errors.Is(err, ErrSRTWrite):
+		return "srt_write"
+	case errors.Is(err, ErrSceneFrameRender):
+		return "scene_render"
+	case errors.Is(err, ErrFrameShapeMismatch):
+		return "frame_shape"
+	case errors.Is(err, ErrJPEGEncode):
+		return "jpeg_encode"
+	case errors.Is(err, ErrJPEGSize):
+		return "jpeg_size"
+	case errors.Is(err, ErrTransportStopped):
+		return "transport_stopped"
+	default:
+		return "unknown"
+	}
 }
 
 func (s *session) signalError(err error) {

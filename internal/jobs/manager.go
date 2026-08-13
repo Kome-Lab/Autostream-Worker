@@ -409,7 +409,7 @@ func (m *Manager) SetVideoOutput(output VideoOutput) {
 // HandleVideoOutputFailure fails the matching active job closed after its
 // already-started video transport exits unexpectedly. The generation fence is
 // required because a stream ID may be reused after a stop/rearm cycle.
-func (m *Manager) HandleVideoOutputFailure(streamID string, generation uint64) {
+func (m *Manager) HandleVideoOutputFailure(streamID string, generation uint64, errorClass string) {
 	streamID = strings.TrimSpace(streamID)
 	if streamID == "" || generation == 0 {
 		return
@@ -445,7 +445,8 @@ func (m *Manager) HandleVideoOutputFailure(streamID string, generation uint64) {
 
 	failureCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	attributes := map[string]any{"reason": "transport_stopped"}
+	errorClass = normalizeVideoOutputErrorClass(errorClass)
+	attributes := map[string]any{"reason": "transport_stopped", "error_class": errorClass}
 	if receiptErr != nil {
 		attributes["stopped_target_receipt"] = "unavailable"
 	}
@@ -454,6 +455,15 @@ func (m *Manager) HandleVideoOutputFailure(streamID string, generation uint64) {
 		if err := captionSession.Close(failureCtx); err != nil {
 			m.report(failureCtx, streamID, "worker.caption.stop_failed", "failed", nil)
 		}
+	}
+}
+
+func normalizeVideoOutputErrorClass(value string) string {
+	switch strings.TrimSpace(value) {
+	case "srt_write", "scene_render", "frame_shape", "jpeg_encode", "jpeg_size", "transport_stopped":
+		return strings.TrimSpace(value)
+	default:
+		return "unknown"
 	}
 }
 

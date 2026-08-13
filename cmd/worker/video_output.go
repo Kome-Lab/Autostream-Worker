@@ -13,7 +13,7 @@ type jobVideoOutput struct {
 
 type jobVideoSource interface {
 	videoout.FrameSource
-	HandleVideoOutputFailure(streamID string, generation uint64)
+	HandleVideoOutputFailure(streamID string, generation uint64, errorClass string)
 }
 
 func newJobVideoOutput(source jobVideoSource) jobs.VideoOutput {

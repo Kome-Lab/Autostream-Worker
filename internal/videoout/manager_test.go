@@ -71,18 +71,24 @@ func TestManagerRejectsConcurrentStart(t *testing.T) {
 
 func TestManagerReportsUnexpectedSRTFailureOnce(t *testing.T) {
 	conn := &recordingSRTConn{failAfterWrites: 1}
-	failures := make(chan string, 2)
+	type failureNotice struct {
+		stream string
+		class  string
+	}
+	failures := make(chan failureNotice, 2)
 	manager := NewManager(staticFrameSource{frame: image.NewRGBA(image.Rect(0, 0, 4, 2))}, Options{
 		Dialer: staticDialer{conn: conn}, StartupTimeout: time.Second, FrameInterval: time.Millisecond,
-		OnFailure: func(streamID string, generation uint64) { failures <- streamID },
+		OnFailure: func(streamID string, _ uint64, errorClass string) {
+			failures <- failureNotice{stream: streamID, class: errorClass}
+		},
 	})
 	if err := manager.Start(t.Context(), validTestConfig()); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case got := <-failures:
-		if got != "stream-01" {
-			t.Fatalf("failure stream = %q", got)
+		if got.stream != "stream-01" || got.class != "srt_write" {
+			t.Fatalf("failure notice = %#v", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("unexpected SRT failure was not reported")
@@ -98,7 +104,7 @@ func TestManagerDoesNotReportRequestedStopAsFailure(t *testing.T) {
 	failures := make(chan string, 1)
 	manager := NewManager(staticFrameSource{frame: image.NewRGBA(image.Rect(0, 0, 4, 2))}, Options{
 		Dialer: staticDialer{conn: &recordingSRTConn{}}, StartupTimeout: time.Second, FrameInterval: time.Hour,
-		OnFailure: func(streamID string, _ uint64) { failures <- streamID },
+		OnFailure: func(streamID string, _ uint64, _ string) { failures <- streamID },
 	})
 	if err := manager.Start(t.Context(), validTestConfig()); err != nil {
 		t.Fatal(err)

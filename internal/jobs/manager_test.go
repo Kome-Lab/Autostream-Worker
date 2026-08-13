@@ -165,7 +165,7 @@ func TestManagerVideoOutputFailureClearsOnlyMatchingActiveJob(t *testing.T) {
 	if generation == 0 {
 		t.Fatal("video start did not receive a job generation")
 	}
-	manager.HandleVideoOutputFailure(stream.StreamID, generation+1)
+	manager.HandleVideoOutputFailure(stream.StreamID, generation+1, "srt_write")
 	if got := manager.CurrentStreamID(); got != stream.StreamID {
 		t.Fatalf("stale generation cleared active stream: got %q", got)
 	}
@@ -173,7 +173,7 @@ func TestManagerVideoOutputFailureClearsOnlyMatchingActiveJob(t *testing.T) {
 		t.Fatalf("stale video failure cleared scene: %#v", scene.clears)
 	}
 
-	manager.HandleVideoOutputFailure(stream.StreamID, generation)
+	manager.HandleVideoOutputFailure(stream.StreamID, generation, "srt_write")
 	if got := manager.CurrentStreamID(); got != "" {
 		t.Fatalf("video failure left active stream: got %q", got)
 	}
@@ -206,7 +206,7 @@ func TestManagerVideoOutputFailureFailsClosedWhenStoppedReceiptCannotPersist(t *
 	if err := manager.Start(t.Context(), stream); err != nil {
 		t.Fatal(err)
 	}
-	manager.HandleVideoOutputFailure(stream.StreamID, output.scenes[0].Generation)
+	manager.HandleVideoOutputFailure(stream.StreamID, output.scenes[0].Generation, "srt_write")
 	if got := manager.CurrentStreamID(); got != "" {
 		t.Fatalf("receipt failure left a ghost active job: %q", got)
 	}
@@ -216,6 +216,9 @@ func TestManagerVideoOutputFailureFailsClosedWhenStoppedReceiptCannotPersist(t *
 	attributes := reporter.attrs[len(reporter.attrs)-1]
 	if attributes["stopped_target_receipt"] != "unavailable" {
 		t.Fatalf("receipt durability failure was not reported: %#v", attributes)
+	}
+	if attributes["error_class"] != "srt_write" {
+		t.Fatalf("video output error class was not reported: %#v", attributes)
 	}
 	if err := manager.Stop(t.Context(), stream.StreamID); !errors.Is(err, ErrStreamAlreadyStopped) {
 		t.Fatalf("same-process stop did not converge after receipt durability failure: %v", err)
