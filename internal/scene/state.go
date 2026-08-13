@@ -17,15 +17,17 @@ const (
 	FontFileEnvironment = "AUTOSTREAM_SCENE_FONT_FILE"
 	DefaultFontFile     = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 
-	defaultWidth             = 1920
-	defaultHeight            = 1080
-	defaultMaxChat           = 8
-	defaultMaxCaptions       = 4
-	defaultMaxParticipants   = 64
-	defaultInterimCaptionTTL = 6 * time.Second
-	defaultFinalCaptionTTL   = 15 * time.Second
-	seenMessageTTL           = 10 * time.Minute
-	maxSeenMessages          = 256
+	defaultWidth                     = 1920
+	defaultHeight                    = 1080
+	defaultMaxChat                   = 8
+	defaultMaxCaptions               = 4
+	defaultMaxParticipants           = 64
+	defaultConversationItems         = 12
+	defaultConversationReorderWindow = 500 * time.Millisecond
+	defaultInterimCaptionTTL         = 6 * time.Second
+	defaultFinalCaptionTTL           = 15 * time.Second
+	seenMessageTTL                   = 10 * time.Minute
+	maxSeenMessages                  = 256
 )
 
 var (
@@ -34,17 +36,21 @@ var (
 )
 
 type Config struct {
-	Width             int
-	Height            int
-	FontFile          string
-	Now               func() time.Time
-	MaxChat           int
-	ChatTTL           time.Duration
-	MaxCaptions       int
-	InterimCaptionTTL time.Duration
-	FinalCaptionTTL   time.Duration
-	MaxParticipants   int
-	Avatar            AvatarConfig
+	Width                     int
+	Height                    int
+	FontFile                  string
+	Now                       func() time.Time
+	MaxChat                   int
+	ChatTTL                   time.Duration
+	MaxCaptions               int
+	InterimCaptionTTL         time.Duration
+	FinalCaptionTTL           time.Duration
+	MaxParticipants           int
+	ConversationMaxItems      int
+	ConversationReorderWindow time.Duration
+	ShowVoiceTranscripts      bool
+	ShowLegacyCaptionBar      bool
+	Avatar                    AvatarConfig
 }
 
 type Participant struct {
@@ -67,11 +73,28 @@ type ChatMessage struct {
 }
 
 type Caption struct {
+	UtteranceID   string
+	Revision      int
 	SpeakerUserID string
+	SpeakerName   string
 	Text          string
 	Final         bool
 	CreatedAt     time.Time
 	ExpiresAt     time.Time
+}
+
+type ConversationItem struct {
+	ID          string
+	Kind        string
+	AuthorID    string
+	DisplayName string
+	AvatarURL   string
+	IsBot       bool
+	Text        string
+	Final       bool
+	Revision    int
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
 }
 
 type Snapshot struct {
@@ -81,23 +104,28 @@ type Snapshot struct {
 	Participants []Participant
 	Chat         []ChatMessage
 	Captions     []Caption
+	Conversation []ConversationItem
 }
 
 type Scene struct {
 	mu sync.Mutex
 
-	width             int
-	height            int
-	now               func() time.Time
-	maxChat           int
-	chatTTL           time.Duration
-	maxCaptions       int
-	interimCaptionTTL time.Duration
-	finalCaptionTTL   time.Duration
-	maxParticipants   int
-	fontFile          string
-	fonts             map[int]*fontSet
-	avatars           *avatarCache
+	width                     int
+	height                    int
+	now                       func() time.Time
+	maxChat                   int
+	chatTTL                   time.Duration
+	maxCaptions               int
+	interimCaptionTTL         time.Duration
+	finalCaptionTTL           time.Duration
+	maxParticipants           int
+	conversationMaxItems      int
+	conversationReorderWindow time.Duration
+	showVoiceTranscripts      bool
+	showLegacyCaptionBar      bool
+	fontFile                  string
+	fonts                     map[int]*fontSet
+	avatars                   *avatarCache
 
 	streamID       string
 	streamName     string
@@ -107,6 +135,7 @@ type Scene struct {
 	speakingIDs    map[string]bool
 	chat           []ChatMessage
 	captions       []Caption
+	conversation   []ConversationItem
 	seenMessages   map[string]time.Time
 }
 
@@ -123,9 +152,40 @@ func New(config Config) (*Scene, error) {
 		width: config.Width, height: config.Height, now: config.Now,
 		maxChat: config.MaxChat, chatTTL: config.ChatTTL,
 		maxCaptions: config.MaxCaptions, interimCaptionTTL: config.InterimCaptionTTL, finalCaptionTTL: config.FinalCaptionTTL,
-		maxParticipants: config.MaxParticipants, fontFile: config.FontFile, fonts: map[int]*fontSet{config.Height: fonts}, avatars: newAvatarCache(config.Avatar),
+		maxParticipants: config.MaxParticipants, conversationMaxItems: config.ConversationMaxItems,
+		conversationReorderWindow: config.ConversationReorderWindow, showVoiceTranscripts: config.ShowVoiceTranscripts,
+		showLegacyCaptionBar: config.ShowLegacyCaptionBar, fontFile: config.FontFile, fonts: map[int]*fontSet{config.Height: fonts}, avatars: newAvatarCache(config.Avatar),
 		participants: map[string]Participant{}, speakingIDs: map[string]bool{}, seenMessages: map[string]time.Time{},
 	}, nil
+}
+
+// ConfigureDisplay applies the per-job conversation policy without rebuilding
+// the renderer or losing the current font/avatar caches. Callers provide
+// already-validated profile values; zero values are ignored for duration/count
+// fields so an older caller cannot accidentally disable retention.
+func (s *Scene) ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts, showLegacyCaptionBar bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if maxItems > 0 {
+		s.conversationMaxItems = maxItems
+		if len(s.conversation) > maxItems {
+			s.conversation = append([]ConversationItem(nil), s.conversation[len(s.conversation)-maxItems:]...)
+		}
+	}
+	if reorderWindow >= 0 {
+		s.conversationReorderWindow = reorderWindow
+	}
+	if interimTTL > 0 {
+		s.interimCaptionTTL = interimTTL
+	}
+	if finalTTL > 0 {
+		s.finalCaptionTTL = finalTTL
+	}
+	s.showVoiceTranscripts = showVoiceTranscripts
+	s.showLegacyCaptionBar = showLegacyCaptionBar
 }
 
 func normalizeConfig(config Config) Config {
@@ -152,6 +212,19 @@ func normalizeConfig(config Config) Config {
 	}
 	if config.MaxParticipants <= 0 {
 		config.MaxParticipants = defaultMaxParticipants
+	}
+	if config.ConversationMaxItems <= 0 {
+		config.ConversationMaxItems = defaultConversationItems
+	}
+	if config.ConversationReorderWindow <= 0 {
+		config.ConversationReorderWindow = defaultConversationReorderWindow
+	}
+	// Voice transcripts are part of the unified conversation by default. A
+	// profile can still disable them when the renderer is constructed with an
+	// explicit scene policy; the zero-value path must remain useful for the
+	// existing Worker bootstrap.
+	if !config.ShowVoiceTranscripts {
+		config.ShowVoiceTranscripts = true
 	}
 	return config
 }
@@ -212,6 +285,7 @@ func (s *Scene) resetStateLocked() {
 	s.speakingIDs = map[string]bool{}
 	s.chat = nil
 	s.captions = nil
+	s.conversation = nil
 	s.seenMessages = map[string]time.Time{}
 }
 
@@ -275,6 +349,7 @@ func (s *Scene) Snapshot(at time.Time) Snapshot {
 		StreamID: s.streamID, StreamName: s.streamName,
 		CurrentTime: at.In(jstLocation()), Participants: participants,
 		Chat: append([]ChatMessage(nil), s.chat...), Captions: append([]Caption(nil), s.captions...),
+		Conversation: append([]ConversationItem(nil), s.conversation...),
 	}
 }
 
@@ -437,6 +512,7 @@ func (s *Scene) applyChatLocked(payload map[string]any, now time.Time) error {
 	if avatarURL != "" {
 		s.avatars.Prefetch(avatarURL)
 	}
+	s.insertConversationLocked(ConversationItem{ID: "chat:" + messageID, Kind: "chat", AuthorID: authorID, DisplayName: displayName, AvatarURL: avatarURL, IsBot: isBot, Text: content, CreatedAt: createdAt, ExpiresAt: message.ExpiresAt})
 	return nil
 }
 
@@ -446,30 +522,89 @@ func (s *Scene) applyCaptionLocked(payload map[string]any, now time.Time, final 
 		return errors.New("caption text is required")
 	}
 	speakerUserID := cleanText(stringValue(payload, "speaker_user_id"), 128)
+	utteranceID := cleanText(stringValue(payload, "utterance_id"), 160)
+	revision := intValue(payload, "revision")
+	speakerName := cleanText(preferredString(payload, "speaker_display_name", "display_name"), 80)
+	if speakerName == "" {
+		if participant, ok := s.participants[speakerUserID]; ok {
+			speakerName = participant.DisplayName
+		}
+	}
+	avatarURL := ""
+	isBot := false
+	if participant, ok := s.participants[speakerUserID]; ok {
+		if speakerName == "" {
+			speakerName = participant.DisplayName
+		}
+		avatarURL, isBot = participant.AvatarURL, participant.IsBot
+	}
+	if speakerName == "" {
+		speakerName = speakerUserID
+	}
+	sameCaptionIndex := -1
+	for i := len(s.captions) - 1; i >= 0; i-- {
+		caption := s.captions[i]
+		matches := false
+		if utteranceID != "" {
+			matches = caption.UtteranceID == utteranceID
+		} else {
+			// Legacy caption callers have no stable utterance key. Only the
+			// current interim for this speaker can be replaced in that mode;
+			// a final caption may belong to a later utterance.
+			matches = !caption.Final && caption.SpeakerUserID == speakerUserID
+		}
+		if matches {
+			sameCaptionIndex = i
+			break
+		}
+	}
+	if sameCaptionIndex >= 0 && utteranceID != "" {
+		existing := s.captions[sameCaptionIndex]
+		if !final && existing.Final {
+			// A late interim must never reopen a durable final utterance.
+			return nil
+		}
+		if revision > 0 && existing.Revision > revision {
+			return nil
+		}
+		if final && existing.Final && (revision == 0 || existing.Revision >= revision) {
+			// Equal or unversioned final deliveries are duplicate state, not a
+			// new caption row.
+			return nil
+		}
+	}
 	if final {
 		filtered := s.captions[:0]
 		for _, caption := range s.captions {
-			if caption.Final || caption.SpeakerUserID != speakerUserID {
-				filtered = append(filtered, caption)
+			if utteranceID != "" {
+				if caption.UtteranceID == utteranceID {
+					continue
+				}
+			} else if !caption.Final && caption.SpeakerUserID == speakerUserID {
+				continue
 			}
+			filtered = append(filtered, caption)
 		}
 		s.captions = filtered
 	} else {
-		for i := len(s.captions) - 1; i >= 0; i-- {
-			if !s.captions[i].Final && s.captions[i].SpeakerUserID == speakerUserID {
-				s.captions[i] = Caption{SpeakerUserID: speakerUserID, Text: text, CreatedAt: now, ExpiresAt: now.Add(s.interimCaptionTTL)}
-				return nil
-			}
+		if sameCaptionIndex >= 0 {
+			s.captions[sameCaptionIndex] = Caption{UtteranceID: utteranceID, Revision: revision, SpeakerUserID: speakerUserID, SpeakerName: speakerName, Text: text, CreatedAt: now, ExpiresAt: now.Add(s.interimCaptionTTL)}
+			s.upsertConversationVoiceLocked(utteranceID, speakerUserID, speakerName, avatarURL, isBot, text, false, revision, now, now.Add(s.interimCaptionTTL))
+			return nil
 		}
 	}
 	ttl := s.interimCaptionTTL
 	if final {
 		ttl = s.finalCaptionTTL
 	}
-	s.captions = append(s.captions, Caption{SpeakerUserID: speakerUserID, Text: text, Final: final, CreatedAt: now, ExpiresAt: now.Add(ttl)})
+	s.captions = append(s.captions, Caption{UtteranceID: utteranceID, Revision: revision, SpeakerUserID: speakerUserID, SpeakerName: speakerName, Text: text, Final: final, CreatedAt: now, ExpiresAt: now.Add(ttl)})
 	if len(s.captions) > s.maxCaptions {
 		s.captions = append([]Caption(nil), s.captions[len(s.captions)-s.maxCaptions:]...)
 	}
+	if final {
+		s.removeConversationVoiceLocked(utteranceID, speakerUserID)
+	}
+	s.upsertConversationVoiceLocked(utteranceID, speakerUserID, speakerName, avatarURL, isBot, text, final, revision, now, now.Add(ttl))
 	return nil
 }
 
@@ -488,6 +623,13 @@ func (s *Scene) pruneLocked(now time.Time) {
 		}
 	}
 	s.captions = captions
+	conversation := s.conversation[:0]
+	for _, item := range s.conversation {
+		if item.ExpiresAt.IsZero() || item.ExpiresAt.After(now) {
+			conversation = append(conversation, item)
+		}
+	}
+	s.conversation = conversation
 	for id, expiresAt := range s.seenMessages {
 		if !expiresAt.After(now) {
 			delete(s.seenMessages, id)
@@ -507,6 +649,56 @@ func (s *Scene) pruneLocked(now time.Time) {
 	}
 }
 
+func (s *Scene) insertConversationLocked(item ConversationItem) {
+	if item.ID == "" || item.Text == "" {
+		return
+	}
+	for i := range s.conversation {
+		if s.conversation[i].ID == item.ID {
+			s.conversation[i] = item
+			return
+		}
+	}
+	if len(s.conversation) == 0 || item.CreatedAt.Before(s.conversation[len(s.conversation)-1].CreatedAt.Add(-s.conversationReorderWindow)) {
+		s.conversation = append(s.conversation, item)
+	} else {
+		index := len(s.conversation)
+		for i := range s.conversation {
+			if item.CreatedAt.Before(s.conversation[i].CreatedAt) {
+				index = i
+				break
+			}
+		}
+		s.conversation = append(s.conversation, ConversationItem{})
+		copy(s.conversation[index+1:], s.conversation[index:])
+		s.conversation[index] = item
+	}
+	if len(s.conversation) > s.conversationMaxItems {
+		s.conversation = append([]ConversationItem(nil), s.conversation[len(s.conversation)-s.conversationMaxItems:]...)
+	}
+}
+
+func (s *Scene) removeConversationVoiceLocked(utteranceID, speakerUserID string) {
+	filtered := s.conversation[:0]
+	for _, item := range s.conversation {
+		if item.Kind == "voice" && ((utteranceID != "" && item.ID == "voice:"+utteranceID) || (utteranceID == "" && !item.Final && item.AuthorID == speakerUserID)) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	s.conversation = filtered
+}
+
+func (s *Scene) upsertConversationVoiceLocked(utteranceID, speakerUserID, speakerName, avatarURL string, isBot bool, text string, final bool, revision int, createdAt, expiresAt time.Time) {
+	if !s.showVoiceTranscripts {
+		return
+	}
+	if utteranceID == "" {
+		utteranceID = speakerUserID + ":active"
+	}
+	s.insertConversationLocked(ConversationItem{ID: "voice:" + utteranceID, Kind: "voice", AuthorID: speakerUserID, DisplayName: speakerName, AvatarURL: avatarURL, IsBot: isBot, Text: text, Final: final, Revision: revision, CreatedAt: createdAt, ExpiresAt: expiresAt})
+}
+
 func (s *Scene) Render(at time.Time) (*image.RGBA, error) {
 	return s.RenderSize(s.width, s.height, at)
 }
@@ -521,6 +713,32 @@ func preferredString(payload map[string]any, canonical, legacy string) string {
 		return value
 	}
 	return stringValue(payload, legacy)
+}
+
+func intValue(payload map[string]any, key string) int {
+	value, ok := payload[key]
+	if !ok {
+		return 0
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err == nil {
+			return int(parsed)
+		}
+	case string:
+		var parsed int
+		if _, err := fmt.Sscanf(strings.TrimSpace(typed), "%d", &parsed); err == nil {
+			return parsed
+		}
+	}
+	return 0
 }
 
 func cleanText(value string, maxRunes int) string {

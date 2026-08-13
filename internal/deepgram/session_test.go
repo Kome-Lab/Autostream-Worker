@@ -332,6 +332,32 @@ func TestSessionSeparatesReusedSSRCWhenSpeakerChanges(t *testing.T) {
 	}
 }
 
+func TestSessionSeparatesUnresolvedSSRCAcrossConnectionGenerations(t *testing.T) {
+	first := newFakeSocket()
+	second := newFakeSocket()
+	second.closeAfterCloseStream = true
+	dialer := &fakeDialer{results: []fakeDialResult{{socket: first}, {socket: second}}}
+	session, err := newSession(testConfig(0), []byte("dg-runtime-key"), func(context.Context, Transcript) error { return nil }, testOptions(dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close(t.Context())
+	if err := session.Ingest(t.Context(), AudioPacket{SSRC: 42, ConnectionGeneration: 1, Opus: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Ingest(t.Context(), AudioPacket{SSRC: 42, ConnectionGeneration: 2, Opus: []byte{2}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(dialer.snapshot()) != 2 {
+		t.Fatalf("unresolved SSRC reused an old generation connection: dials=%d", len(dialer.snapshot()))
+	}
+	select {
+	case <-first.closed:
+	default:
+		t.Fatal("old unresolved generation connection was not discarded")
+	}
+}
+
 func TestSessionCloseSendsCloseStreamForEverySSRCAndZerosKey(t *testing.T) {
 	first := newFakeSocket()
 	first.closeAfterCloseStream = true

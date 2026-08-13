@@ -42,12 +42,14 @@ type discordOpusIngestRequest struct {
 }
 
 type discordOpusIngestPacket struct {
-	SSRC       *uint32    `json:"ssrc"`
-	UserID     string     `json:"user_id,omitempty"`
-	Sequence   *uint16    `json:"sequence"`
-	Timestamp  *uint64    `json:"timestamp"`
-	ReceivedAt *time.Time `json:"received_at"`
-	OpusBase64 string     `json:"opus_base64"`
+	SSRC                 *uint32    `json:"ssrc"`
+	UserID               string     `json:"user_id,omitempty"`
+	JobGeneration        uint64     `json:"job_generation,omitempty"`
+	ConnectionGeneration uint64     `json:"connection_generation,omitempty"`
+	Sequence             *uint16    `json:"sequence"`
+	Timestamp            *uint64    `json:"timestamp"`
+	ReceivedAt           *time.Time `json:"received_at"`
+	OpusBase64           string     `json:"opus_base64"`
 }
 
 type TokenVerifier struct {
@@ -353,20 +355,31 @@ func (s Server) captionAudio(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		packets = append(packets, deepgram.AudioPacket{
-			SSRC:       *packet.SSRC,
-			UserID:     strings.TrimSpace(packet.UserID),
-			Sequence:   *packet.Sequence,
-			Timestamp:  *packet.Timestamp,
-			ReceivedAt: packet.ReceivedAt.UTC(),
-			Opus:       opus,
+			SSRC:                 *packet.SSRC,
+			UserID:               strings.TrimSpace(packet.UserID),
+			JobGeneration:        packet.JobGeneration,
+			ConnectionGeneration: packet.ConnectionGeneration,
+			Sequence:             *packet.Sequence,
+			Timestamp:            *packet.Timestamp,
+			ReceivedAt:           packet.ReceivedAt.UTC(),
+			Opus:                 opus,
 		})
 	}
-	if err := s.manager.IngestCaptionAudio(r.Context(), streamID, packets); err != nil {
+	jobGeneration := packets[0].JobGeneration
+	for _, packet := range packets[1:] {
+		if packet.JobGeneration != jobGeneration {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "mixed_job_generation"})
+			return
+		}
+	}
+	if err := s.manager.IngestCaptionAudioForGeneration(r.Context(), streamID, jobGeneration, packets); err != nil {
 		switch {
 		case errors.Is(err, jobs.ErrCaptionNotConfigured):
 			writeJSON(w, http.StatusConflict, map[string]string{"code": "caption_audio_disabled"})
 		case errors.Is(err, jobs.ErrCaptionAudioUnavailable):
 			writeJSON(w, http.StatusBadGateway, map[string]string{"code": "caption_provider_unavailable"})
+		case errors.Is(err, jobs.ErrJobGenerationMismatch):
+			writeJSON(w, http.StatusConflict, map[string]string{"code": "job_generation_mismatch"})
 		default:
 			writeRequestError(w, err)
 		}
@@ -405,12 +418,13 @@ func (s Server) captionEvent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Text          string `json:"text"`
 		SpeakerUserID string `json:"speaker_user_id,omitempty"`
+		JobGeneration uint64 `json:"job_generation,omitempty"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
 		return
 	}
-	event, err := s.manager.Caption(r.Context(), r.PathValue("id"), req.Text, req.SpeakerUserID, time.Now().UTC())
+	event, err := s.manager.CaptionForGeneration(r.Context(), r.PathValue("id"), req.JobGeneration, req.Text, req.SpeakerUserID, time.Now().UTC())
 	writeEventResult(w, event, err)
 }
 
@@ -420,13 +434,14 @@ func (s Server) participantsEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Participants []events.Participant `json:"participants"`
+		Participants  []events.Participant `json:"participants"`
+		JobGeneration uint64               `json:"job_generation,omitempty"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
 		return
 	}
-	event, err := s.manager.Participants(r.Context(), r.PathValue("id"), req.Participants, time.Now().UTC())
+	event, err := s.manager.ParticipantsForGeneration(r.Context(), r.PathValue("id"), req.JobGeneration, req.Participants, time.Now().UTC())
 	writeEventResult(w, event, err)
 }
 
@@ -436,9 +451,10 @@ func (s Server) activeSpeakerEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		UserID      string `json:"user_id"`
-		DisplayName string `json:"display_name,omitempty"`
-		Speaking    *bool  `json:"speaking,omitempty"`
+		UserID        string `json:"user_id"`
+		DisplayName   string `json:"display_name,omitempty"`
+		Speaking      *bool  `json:"speaking,omitempty"`
+		JobGeneration uint64 `json:"job_generation,omitempty"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
@@ -448,7 +464,7 @@ func (s Server) activeSpeakerEvent(w http.ResponseWriter, r *http.Request) {
 	if req.Speaking != nil {
 		speaking = *req.Speaking
 	}
-	event, err := s.manager.ActiveSpeakerState(r.Context(), r.PathValue("id"), req.UserID, req.DisplayName, speaking, time.Now().UTC())
+	event, err := s.manager.ActiveSpeakerStateForGeneration(r.Context(), r.PathValue("id"), req.JobGeneration, req.UserID, req.DisplayName, speaking, time.Now().UTC())
 	writeEventResult(w, event, err)
 }
 
@@ -458,14 +474,15 @@ func (s Server) customOverlayEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Type    string         `json:"type"`
-		Payload map[string]any `json:"payload"`
+		Type          string         `json:"type"`
+		Payload       map[string]any `json:"payload"`
+		JobGeneration uint64         `json:"job_generation,omitempty"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
 		return
 	}
-	event, err := s.manager.CustomOverlay(r.Context(), r.PathValue("id"), req.Type, req.Payload, time.Now().UTC())
+	event, err := s.manager.CustomOverlayForGeneration(r.Context(), r.PathValue("id"), req.JobGeneration, req.Type, req.Payload, time.Now().UTC())
 	writeEventResult(w, event, err)
 }
 
@@ -527,6 +544,12 @@ func writeRequestError(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, jobs.ErrCaptionAudioUnavailable):
 		writeJSON(w, http.StatusBadGateway, map[string]string{"code": "caption_provider_unavailable"})
+		return
+	case errors.Is(err, jobs.ErrJobGenerationMismatch):
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "job_generation_mismatch"})
+		return
+	case errors.Is(err, jobs.ErrStreamStopping):
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "stream_stopping"})
 		return
 	}
 	status := http.StatusConflict

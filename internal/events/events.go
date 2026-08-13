@@ -3,6 +3,7 @@ package events
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"time"
 )
 
@@ -24,6 +25,50 @@ func CaptionEvent(streamID, text, speakerUserID string, now time.Time) OverlayEv
 
 func FinalCaptionEvent(streamID, text, speakerUserID string, now time.Time) OverlayEvent {
 	return newEvent(streamID, "caption.final", map[string]any{"text": text, "speaker_user_id": speakerUserID}, now)
+}
+
+// CaptionTranscriptEvent is the versioned caption contract used by the live
+// Deepgram path. The compact CaptionEvent/FinalCaptionEvent constructors stay
+// available for older HTTP callers.
+func CaptionTranscriptEvent(streamID, text, speakerUserID, utteranceID, source string, revision int, final bool, startedAt, updatedAt, endedAt time.Time, confidence float64, finalizationReason string, now time.Time) OverlayEvent {
+	payload := map[string]any{
+		"version":             2,
+		"schema_version":      2,
+		"utterance_id":        utteranceID,
+		"revision":            revision,
+		"source":              source,
+		"speaker_user_id":     speakerUserID,
+		"text":                text,
+		"is_final":            final,
+		"confidence":          confidence,
+		"finalization_reason": finalizationReason,
+	}
+	if !startedAt.IsZero() {
+		payload["started_at"] = startedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if !updatedAt.IsZero() {
+		payload["updated_at"] = updatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if !endedAt.IsZero() {
+		payload["ended_at"] = endedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if strings.TrimSpace(source) == "" || strings.EqualFold(strings.TrimSpace(source), "deepgram") {
+		// The public event describes the application source, not the provider
+		// implementation. Keep the legacy version field above while emitting the
+		// v2 contract name used by downstream scene/archive consumers.
+		payload["source"] = "discord_voice"
+	}
+	if strings.TrimSpace(finalizationReason) == "" {
+		delete(payload, "finalization_reason")
+	}
+	return newEvent(streamID, mapCaptionEventType(final), payload, now)
+}
+
+func mapCaptionEventType(final bool) string {
+	if final {
+		return "caption.final"
+	}
+	return "caption.telop"
 }
 
 func ParticipantListEvent(streamID string, participants []Participant, now time.Time) OverlayEvent {

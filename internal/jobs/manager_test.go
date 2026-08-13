@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -222,16 +223,31 @@ func TestManagerVideoOutputFailureFailsClosedWhenStoppedReceiptCannotPersist(t *
 }
 
 type fakePublisher struct {
-	events []encoder.Event
-	err    error
+	events  []encoder.Event
+	err     error
+	mu      sync.Mutex
+	handler func(encoder.Event) error
 }
 
 func (f *fakePublisher) Publish(ctx context.Context, event encoder.Event) error {
+	if f.handler != nil {
+		if err := f.handler(event); err != nil {
+			return err
+		}
+	}
 	if f.err != nil {
 		return f.err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.events = append(f.events, event)
 	return nil
+}
+
+func (f *fakePublisher) snapshot() []encoder.Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]encoder.Event(nil), f.events...)
 }
 
 type fakeCaptionSession struct {
@@ -405,6 +421,38 @@ func TestManagerStartsSelectedCaptionProfileAndPublishesDeepgramResults(t *testi
 	}
 	if session.closed != 1 || resolveCalls != 1 {
 		t.Fatalf("unexpected caption lifecycle: closed=%d resolve_calls=%d", session.closed, resolveCalls)
+	}
+}
+
+func TestManagerRejectsLateCaptionResultFromPreviousGeneration(t *testing.T) {
+	manager := NewManager(&fakePublisher{}, observability.Client{})
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), nil)
+	var sessions []*fakeCaptionSession
+	manager.SetCaptionRuntime(manager.secretResolver, CaptionSessionFactoryFunc(func(_ deepgram.Config, _ []byte, handler deepgram.Handler) (CaptionSession, error) {
+		session := &fakeCaptionSession{handler: handler}
+		sessions = append(sessions, session)
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected first caption session, got %d", len(sessions))
+	}
+	oldHandler := sessions[0].handler
+	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := oldHandler(t.Context(), deepgram.Transcript{Text: "late old result", Final: true}); !errors.Is(err, ErrJobGenerationMismatch) {
+		t.Fatalf("late result from old generation was not fenced: %v", err)
 	}
 }
 
@@ -598,6 +646,144 @@ func TestManagerReportsPublishFailure(t *testing.T) {
 	if !sawFailureEvent || !sawFailureMetric {
 		t.Fatalf("missing failure observability signals: %#v", signals)
 	}
+}
+
+func TestManagerRetriesInitialParticipantsAfterEncoderReadiness(t *testing.T) {
+	var attempts int
+	pub := &fakePublisher{handler: func(event encoder.Event) error {
+		attempts++
+		if attempts <= 2 {
+			return encoder.NewRetryablePublishError(http.StatusConflict, "http_status")
+		}
+		return nil
+	}}
+	manager := NewManager(pub, nil)
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := manager.Participants(t.Context(), "stream-01", []events.Participant{{UserID: "user-01", DisplayName: "Alice"}}, testTime())
+	if err == nil {
+		t.Fatal("initial participant publish unexpectedly succeeded")
+	}
+	waitForManager(t, time.Second, func() bool { return len(pub.snapshot()) == 1 })
+	if attempts != 3 || pub.snapshot()[0].Type != "overlay.participants" {
+		t.Fatalf("participants were not retried to success: attempts=%d events=%#v", attempts, pub.snapshot())
+	}
+}
+
+func TestManagerCancelsRetryOnStopAndRejectsOldGeneration(t *testing.T) {
+	pub := &fakePublisher{handler: func(encoder.Event) error {
+		return encoder.NewRetryablePublishError(http.StatusServiceUnavailable, "http_status")
+	}}
+	manager := NewManager(pub, nil)
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = manager.CurrentTime(t.Context(), "stream-01", testTime())
+	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	old := encoder.Event{ID: "old", StreamID: "stream-01", Generation: 1, Type: "overlay.current_time"}
+	if manager.recordDeliveredWorkerEvent(old) {
+		t.Fatal("old generation was accepted after rearm")
+	}
+	if got := len(pub.snapshot()); got != 0 {
+		t.Fatalf("stale retry reached publisher after stop/rearm: %d", got)
+	}
+}
+
+func TestManagerSupersedesPendingActiveSpeakerStartWithStop(t *testing.T) {
+	var attempts []encoder.Event
+	var mu sync.Mutex
+	pub := &fakePublisher{handler: func(event encoder.Event) error {
+		mu.Lock()
+		attempts = append(attempts, event)
+		count := len(attempts)
+		mu.Unlock()
+		if count == 1 {
+			return encoder.NewRetryablePublishError(http.StatusConflict, "http_status")
+		}
+		return nil
+	}}
+	manager := NewManager(pub, nil)
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ActiveSpeakerState(t.Context(), "stream-01", "user-01", "Alice", true, testTime()); err == nil {
+		t.Fatal("expected active-speaker start to enter bounded retry")
+	}
+	if _, err := manager.ActiveSpeakerState(t.Context(), "stream-01", "user-01", "Alice", false, testTime().Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	waitForManager(t, time.Second, func() bool { return len(pub.snapshot()) == 1 })
+	mu.Lock()
+	defer mu.Unlock()
+	if len(attempts) != 2 || attempts[0].Payload["speaking"] != true || attempts[1].Payload["speaking"] != false {
+		t.Fatalf("active-speaker stop did not supersede the pending start: attempts=%#v", attempts)
+	}
+	if pub.snapshot()[0].Payload["speaking"] != false {
+		t.Fatalf("green-ring stop was not the converged event: %#v", pub.snapshot()[0])
+	}
+}
+
+func TestManagerRetriesTransportFailure(t *testing.T) {
+	attempts := 0
+	pub := &fakePublisher{handler: func(encoder.Event) error {
+		attempts++
+		if attempts == 1 {
+			return encoder.NewRetryablePublishError(0, "transport")
+		}
+		return nil
+	}}
+	manager := NewManager(pub, nil)
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.CustomOverlay(t.Context(), "stream-01", "overlay.discord_chat", map[string]any{"message_id": "msg-01", "text": "hello"}, testTime()); err == nil {
+		t.Fatal("expected transport failure to be reported to the caller")
+	}
+	waitForManager(t, time.Second, func() bool { return len(pub.snapshot()) == 1 })
+	if attempts != 2 || pub.snapshot()[0].Payload["message_id"] != "msg-01" {
+		t.Fatalf("transport failure was not retried: attempts=%d events=%#v", attempts, pub.snapshot())
+	}
+}
+
+func TestManagerStopsAtBoundedRetryLimit(t *testing.T) {
+	attempts := 0
+	pub := &fakePublisher{handler: func(encoder.Event) error {
+		attempts++
+		return encoder.NewRetryablePublishError(http.StatusServiceUnavailable, "http_status")
+	}}
+	manager := NewManager(pub, nil)
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Participants(t.Context(), "stream-01", []events.Participant{{UserID: "user-01"}}, testTime()); err == nil {
+		t.Fatal("expected bounded delivery failure")
+	}
+	waitForManager(t, 3*time.Second, func() bool { return attempts >= maxWorkerEventAttempts })
+	if attempts != maxWorkerEventAttempts {
+		t.Fatalf("retry limit was not enforced: attempts=%d want=%d", attempts, maxWorkerEventAttempts)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if attempts != maxWorkerEventAttempts {
+		t.Fatalf("retry continued past the bound: attempts=%d", attempts)
+	}
+}
+
+func waitForManager(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for manager condition")
 }
 
 func testTime() time.Time {

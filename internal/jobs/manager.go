@@ -25,6 +25,8 @@ var (
 	ErrStreamAlreadyStopped            = errors.New("stream job is already stopped")
 	ErrNoActiveStreamJob               = errors.New("no active stream job")
 	ErrStreamIDDoesNotMatchJob         = errors.New("stream_id does not match current job")
+	ErrJobGenerationMismatch           = errors.New("job generation does not match current job")
+	ErrStreamStopping                  = errors.New("stream job is stopping")
 	ErrStoppedTargetReceiptUnavailable = errors.New("stopped target receipt is unavailable")
 	ErrVideoOutputUnavailable          = errors.New("worker video output is unavailable")
 )
@@ -63,6 +65,22 @@ type SceneRenderer interface {
 	RefreshAvatars()
 }
 
+// sceneDisplayConfigurer is optional so existing renderers remain compatible
+// while the built-in scene can apply the selected caption profile's display
+// policy at the same job boundary as its Deepgram settings.
+type sceneDisplayConfigurer interface {
+	ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts, showLegacyCaptionBar bool)
+}
+
+type captionDisplayConfig struct {
+	maxItems             int
+	reorderWindow        time.Duration
+	interimTTL           time.Duration
+	finalTTL             time.Duration
+	showVoiceTranscripts bool
+	showLegacyCaptionBar bool
+}
+
 type VideoOutput interface {
 	Start(context.Context, StreamContext, VideoSceneConfig) error
 	Stop(context.Context, string) error
@@ -81,6 +99,7 @@ type AssignmentPolicy struct {
 type Status struct {
 	CurrentStreamID string         `json:"current_stream_id,omitempty"`
 	StreamName      string         `json:"stream_name,omitempty"`
+	JobGeneration   uint64         `json:"job_generation,omitempty"`
 	StartedAt       time.Time      `json:"started_at,omitempty"`
 	EventCount      int            `json:"event_count"`
 	EventCounts     map[string]int `json:"event_counts,omitempty"`
@@ -98,14 +117,22 @@ type Manager struct {
 	defaults    ProfileDefaults
 	assignments AssignmentPolicy
 
-	captionProfiles map[string]control.RuntimeProfile
-	secretResolver  RuntimeSecretResolver
-	captionFactory  CaptionSessionFactory
-	captionSession  CaptionSession
-	sceneRenderer   SceneRenderer
-	sceneVideo      VideoSceneConfig
-	videoOutput     VideoOutput
-	jobGeneration   uint64
+	captionProfiles  map[string]control.RuntimeProfile
+	secretResolver   RuntimeSecretResolver
+	captionFactory   CaptionSessionFactory
+	captionSession   CaptionSession
+	sceneRenderer    SceneRenderer
+	sceneVideo       VideoSceneConfig
+	videoOutput      VideoOutput
+	jobGeneration    uint64
+	stopping         bool
+	deliveryCtx      context.Context
+	deliveryCancel   context.CancelFunc
+	deliveryWake     chan struct{}
+	deliveryWG       sync.WaitGroup
+	pendingEvents    map[string]pendingWorkerEvent
+	latestEventByKey map[string]string
+	publisherMu      sync.Mutex
 
 	startedAt                time.Time
 	stoppedOrder             []stoppedTargetReceipt
@@ -185,6 +212,8 @@ func newManager(publisher encoder.Publisher, reporter Reporter, stoppedTargetRec
 		stoppedTargetReceiptPath: strings.TrimSpace(stoppedTargetReceiptPath),
 		eventCounts:              map[string]int{},
 		maxEvents:                200,
+		pendingEvents:            map[string]pendingWorkerEvent{},
+		latestEventByKey:         map[string]string{},
 	}
 }
 
@@ -218,15 +247,22 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	profile, profileSelected := m.captionProfiles[stream.CaptionProfileID]
 	resolver := m.secretResolver
 	factory := m.captionFactory
+	nextGeneration := m.jobGeneration + 1
 	m.mu.Unlock()
 
 	var captionSession CaptionSession
+	displayConfig := defaultCaptionDisplayConfig()
 	if stream.CaptionProfileID != "" {
 		if !profileSelected {
 			return m.captionStartFailed(ctx, stream.StreamID, stream.CaptionProfileID, "profile_not_found", ErrCaptionProfileInvalid)
 		}
 		config, secretName, err := captionConfig(profile)
 		if err != nil {
+			return m.captionStartFailed(ctx, stream.StreamID, stream.CaptionProfileID, "profile_invalid", ErrCaptionProfileInvalid)
+		}
+		var displayOK bool
+		displayConfig, displayOK = captionDisplayConfigFromProfile(profile.Config)
+		if !displayOK {
 			return m.captionStartFailed(ctx, stream.StreamID, stream.CaptionProfileID, "profile_invalid", ErrCaptionProfileInvalid)
 		}
 		if resolver == nil || factory == nil {
@@ -243,7 +279,7 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		apiKey := []byte(secret.Value)
 		secret.Value = ""
 		captionSession, err = factory.New(config, apiKey, func(resultCtx context.Context, transcript deepgram.Transcript) error {
-			_, publishErr := m.CaptionTranscript(resultCtx, stream.StreamID, transcript.Text, transcript.SpeakerUserID, transcript.Final, time.Now().UTC())
+			_, publishErr := m.CaptionTranscriptDetailedForGeneration(resultCtx, stream.StreamID, nextGeneration, transcript)
 			return publishErr
 		})
 		zeroBytes(apiKey)
@@ -272,6 +308,7 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	m.current = stream
 	m.jobGeneration++
 	generation := m.jobGeneration
+	m.startEventDeliveryLocked()
 	m.captionSession = captionSession
 	m.sceneVideo = videoConfig
 	sceneRenderer := m.sceneRenderer
@@ -282,8 +319,12 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		m.captionSession = nil
 		m.sceneVideo = VideoSceneConfig{}
 		m.mu.Unlock()
+		m.stopEventDelivery()
 		closeCaptionSession(captionSession)
 		return ErrVideoOutputUnavailable
+	}
+	if configurer, ok := sceneRenderer.(sceneDisplayConfigurer); ok {
+		configurer.ConfigureDisplay(displayConfig.maxItems, displayConfig.reorderWindow, displayConfig.interimTTL, displayConfig.finalTTL, displayConfig.showVoiceTranscripts, displayConfig.showLegacyCaptionBar)
 	}
 	if sceneRenderer != nil {
 		sceneRenderer.Reset(generation, stream.StreamID, stream.StreamName)
@@ -311,6 +352,7 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 				m.sendFailures = 0
 			}
 			m.mu.Unlock()
+			m.stopEventDelivery()
 			sceneRenderer.Clear(stream.StreamID)
 			closeCaptionSession(captionSession)
 			m.report(ctx, stream.StreamID, "worker.video.start_failed", "failed", nil)
@@ -394,6 +436,7 @@ func (m *Manager) HandleVideoOutputFailure(streamID string, generation uint64) {
 	m.startedAt = time.Time{}
 	m.jobGeneration++
 	m.mu.Unlock()
+	m.stopEventDelivery()
 
 	if sceneRenderer != nil {
 		sceneRenderer.Clear(streamID)
@@ -495,27 +538,88 @@ func captionConfig(profile control.RuntimeProfile) (deepgram.Config, string, err
 	language, languageOK := stringConfig(profile.Config, "language")
 	secretName, secretOK := stringConfig(profile.Config, "api_key_secret_name")
 	endpointingMS, endpointingOK := integerConfig(profile.Config, "endpointing_ms")
+	if !endpointingOK {
+		endpointingMS, endpointingOK = 300, true
+	}
 	delayMS, delayOK := integerConfig(profile.Config, "delay_ms")
+	if !delayOK {
+		delayMS, delayOK = 800, true
+	}
 	interimResults, interimOK := booleanConfig(profile.Config, "interim_results")
+	if !interimOK {
+		interimResults, interimOK = true, true
+	}
 	smartFormat, smartFormatOK := booleanConfig(profile.Config, "smart_format")
+	if !smartFormatOK {
+		smartFormat, smartFormatOK = true, true
+	}
+	utteranceEndMS, utteranceEndOK := integerConfigDefaultBounded(profile.Config, "utterance_end_ms", 1000, 100, 10000)
+	localFinalizeMS, localFinalizeOK := integerConfigDefaultBounded(profile.Config, "local_finalize_ms", 1500, 0, 10000)
+	speakerIdleCloseSeconds, speakerIdleCloseOK := integerConfigDefaultBounded(profile.Config, "speaker_idle_close_seconds", 8, 1, 120)
+	keepAliveSeconds, keepAliveOK := integerConfigDefaultBounded(profile.Config, "keepalive_interval_seconds", 4, 1, 60)
+	replayBufferMaxMS, replayBufferMaxOK := integerConfigDefaultBounded(profile.Config, "replay_buffer_max_ms", 2000, 0, 10000)
 	if !providerOK || !strings.EqualFold(provider, "deepgram") || !modelOK || model != "nova-3" ||
 		!languageOK || language == "" || !secretOK || secretName != "deepgram_api_key" ||
 		!endpointingOK || endpointingMS < 10 || endpointingMS > 5000 ||
-		!delayOK || delayMS < 0 || delayMS > 10000 || !interimOK || !smartFormatOK {
+		!delayOK || delayMS < 0 || delayMS > 10000 || !interimOK || !smartFormatOK ||
+		!utteranceEndOK || !localFinalizeOK || !speakerIdleCloseOK || !keepAliveOK || !replayBufferMaxOK {
 		return deepgram.Config{}, "", ErrCaptionProfileInvalid
 	}
 	config := deepgram.Config{
-		Model:          model,
-		Language:       language,
-		EndpointingMS:  endpointingMS,
-		InterimResults: interimResults,
-		SmartFormat:    smartFormat,
-		Delay:          time.Duration(delayMS) * time.Millisecond,
+		Model:             model,
+		Language:          language,
+		EndpointingMS:     endpointingMS,
+		UtteranceEndMS:    utteranceEndMS,
+		LocalFinalize:     time.Duration(localFinalizeMS) * time.Millisecond,
+		SpeakerIdleClose:  time.Duration(speakerIdleCloseSeconds) * time.Second,
+		KeepAliveInterval: time.Duration(keepAliveSeconds) * time.Second,
+		InterimResults:    interimResults,
+		SmartFormat:       smartFormat,
+		Keyterms:          stringListConfig(profile.Config, "keyterms"),
+		MIPOptOut:         booleanConfigDefault(profile.Config, "mip_opt_out", false),
+		ReplayBufferMax:   time.Duration(replayBufferMaxMS) * time.Millisecond,
+		Delay:             time.Duration(delayMS) * time.Millisecond,
 	}
 	if _, err := deepgram.ListenURL(config); err != nil {
 		return deepgram.Config{}, "", ErrCaptionProfileInvalid
 	}
 	return config, secretName, nil
+}
+
+func defaultCaptionDisplayConfig() captionDisplayConfig {
+	return captionDisplayConfig{
+		maxItems:             12,
+		reorderWindow:        500 * time.Millisecond,
+		interimTTL:           6 * time.Second,
+		finalTTL:             15 * time.Second,
+		showVoiceTranscripts: true,
+	}
+}
+
+func captionDisplayConfigFromProfile(config map[string]any) (captionDisplayConfig, bool) {
+	display := defaultCaptionDisplayConfig()
+	var ok bool
+	if display.maxItems, ok = integerConfigDefaultBounded(config, "conversation_max_items", display.maxItems, 1, 64); !ok {
+		return captionDisplayConfig{}, false
+	}
+	var reorderWindowMS int
+	if reorderWindowMS, ok = integerConfigDefaultBounded(config, "conversation_reorder_window_ms", 500, 0, 5000); !ok {
+		return captionDisplayConfig{}, false
+	}
+	var interimTTLSeconds int
+	if interimTTLSeconds, ok = integerConfigDefaultBounded(config, "voice_interim_ttl_seconds", 6, 1, 60); !ok {
+		return captionDisplayConfig{}, false
+	}
+	var finalTTLSeconds int
+	if finalTTLSeconds, ok = integerConfigDefaultBounded(config, "voice_final_ttl_seconds", 15, 1, 300); !ok {
+		return captionDisplayConfig{}, false
+	}
+	display.reorderWindow = time.Duration(reorderWindowMS) * time.Millisecond
+	display.interimTTL = time.Duration(interimTTLSeconds) * time.Second
+	display.finalTTL = time.Duration(finalTTLSeconds) * time.Second
+	display.showVoiceTranscripts = booleanConfigDefault(config, "show_voice_transcripts", true)
+	display.showLegacyCaptionBar = booleanConfigDefault(config, "show_legacy_caption_bar", false)
+	return display, true
 }
 
 func stringConfig(config map[string]any, key string) (string, bool) {
@@ -576,6 +680,58 @@ func integerConfig(config map[string]any, key string) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func integerConfigDefaultBounded(config map[string]any, key string, fallback, min, max int) (int, bool) {
+	if value, ok := integerConfig(config, key); ok {
+		if value < min || value > max {
+			return 0, false
+		}
+		return value, true
+	}
+	return fallback, true
+}
+
+func booleanConfigDefault(config map[string]any, key string, fallback bool) bool {
+	if value, ok := booleanConfig(config, key); ok {
+		return value
+	}
+	return fallback
+}
+
+func stringListConfig(config map[string]any, key string) []string {
+	value, ok := config[key]
+	if !ok {
+		return nil
+	}
+	var values []string
+	switch typed := value.(type) {
+	case []string:
+		values = append(values, typed...)
+	case []any:
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				values = append(values, text)
+			}
+		}
+	}
+	result := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > 128 {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+		if len(result) >= 20 {
+			break
+		}
+	}
+	return result
 }
 
 func cloneConfig(config map[string]any) map[string]any {
@@ -674,7 +830,14 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	videoOutput := m.videoOutput
 	videoRequested := videoOutputRequested(m.current)
 	m.captionSession = nil
+	// Mark the stop boundary before waiting for downstream stop operations. The
+	// current stream is retained until its durable stop receipt is written so a
+	// persistence failure preserves the existing retryable Stop semantics, but
+	// all new events are rejected while this fence is active.
+	m.stopping = true
+	m.jobGeneration++
 	m.mu.Unlock()
+	m.stopEventDelivery()
 
 	if videoRequested && videoOutput != nil {
 		if err := videoOutput.Stop(ctx, stoppedStreamID); err != nil {
@@ -696,6 +859,7 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	m.current = StreamContext{}
 	m.sceneVideo = VideoSceneConfig{}
 	m.startedAt = time.Time{}
+	m.stopping = false
 	sceneRenderer := m.sceneRenderer
 	m.mu.Unlock()
 	if sceneRenderer != nil {
@@ -780,6 +944,10 @@ func (m *Manager) Close(ctx context.Context) error {
 }
 
 func (m *Manager) IngestCaptionAudio(ctx context.Context, streamID string, packets []deepgram.AudioPacket) error {
+	return m.IngestCaptionAudioForGeneration(ctx, streamID, 0, packets)
+}
+
+func (m *Manager) IngestCaptionAudioForGeneration(ctx context.Context, streamID string, generation uint64, packets []deepgram.AudioPacket) error {
 	if len(packets) == 0 {
 		return errors.New("at least one opus packet is required")
 	}
@@ -787,6 +955,10 @@ func (m *Manager) IngestCaptionAudio(ctx context.Context, streamID string, packe
 	if err := m.ensureStreamLocked(streamID); err != nil {
 		m.mu.Unlock()
 		return err
+	}
+	if generation != 0 && generation != m.jobGeneration {
+		m.mu.Unlock()
+		return ErrJobGenerationMismatch
 	}
 	captionSession := m.captionSession
 	m.mu.Unlock()
@@ -866,6 +1038,7 @@ func (m *Manager) Status() Status {
 	if m.current.StreamID != "" {
 		status.CurrentStreamID = m.current.StreamID
 		status.StreamName = m.current.StreamName
+		status.JobGeneration = m.jobGeneration
 		status.StartedAt = m.startedAt
 	}
 	if len(m.events) > 0 {
@@ -903,11 +1076,19 @@ func (m *Manager) CurrentTime(ctx context.Context, streamID string, now time.Tim
 	return m.publish(ctx, events.CurrentTimeEvent(streamID, now))
 }
 
+func (m *Manager) CurrentTimeForGeneration(ctx context.Context, streamID string, generation uint64, now time.Time) (events.OverlayEvent, error) {
+	return m.publishWithGeneration(ctx, events.CurrentTimeEvent(streamID, now), generation)
+}
+
 func (m *Manager) Caption(ctx context.Context, streamID, text, speakerUserID string, now time.Time) (events.OverlayEvent, error) {
+	return m.CaptionForGeneration(ctx, streamID, 0, text, speakerUserID, now)
+}
+
+func (m *Manager) CaptionForGeneration(ctx context.Context, streamID string, generation uint64, text, speakerUserID string, now time.Time) (events.OverlayEvent, error) {
 	if strings.TrimSpace(text) == "" {
 		return events.OverlayEvent{}, errors.New("caption text is required")
 	}
-	return m.publish(ctx, events.CaptionEvent(streamID, text, speakerUserID, now))
+	return m.publishWithGeneration(ctx, events.CaptionEvent(streamID, text, speakerUserID, now), generation)
 }
 
 func (m *Manager) CaptionTranscript(ctx context.Context, streamID, text, speakerUserID string, final bool, now time.Time) (events.OverlayEvent, error) {
@@ -920,8 +1101,47 @@ func (m *Manager) CaptionTranscript(ctx context.Context, streamID, text, speaker
 	return m.publish(ctx, events.CaptionEvent(streamID, text, speakerUserID, now))
 }
 
+func (m *Manager) CaptionTranscriptDetailed(ctx context.Context, streamID string, transcript deepgram.Transcript) (events.OverlayEvent, error) {
+	return m.CaptionTranscriptDetailedForGeneration(ctx, streamID, 0, transcript)
+}
+
+// CaptionTranscriptDetailedForGeneration keeps a delayed result from a closed
+// Deepgram session out of a later rearm that happens to reuse the same stream
+// ID.
+func (m *Manager) CaptionTranscriptDetailedForGeneration(ctx context.Context, streamID string, generation uint64, transcript deepgram.Transcript) (events.OverlayEvent, error) {
+	if strings.TrimSpace(transcript.Text) == "" {
+		return events.OverlayEvent{}, errors.New("caption text is required")
+	}
+	now := transcript.UpdatedAt
+	if now.IsZero() {
+		now = transcript.ReceivedAt
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return m.publishWithGeneration(ctx, events.CaptionTranscriptEvent(
+		streamID,
+		transcript.Text,
+		transcript.SpeakerUserID,
+		transcript.UtteranceID,
+		transcript.Source,
+		transcript.Revision,
+		transcript.Final,
+		transcript.StartedAt,
+		now,
+		transcript.EndedAt,
+		transcript.Confidence,
+		transcript.FinalizationReason,
+		now,
+	), generation)
+}
+
 func (m *Manager) Participants(ctx context.Context, streamID string, participants []events.Participant, now time.Time) (events.OverlayEvent, error) {
 	return m.publish(ctx, events.ParticipantListEvent(streamID, participants, now))
+}
+
+func (m *Manager) ParticipantsForGeneration(ctx context.Context, streamID string, generation uint64, participants []events.Participant, now time.Time) (events.OverlayEvent, error) {
+	return m.publishWithGeneration(ctx, events.ParticipantListEvent(streamID, participants, now), generation)
 }
 
 func (m *Manager) ActiveSpeaker(ctx context.Context, streamID, userID, displayName string, now time.Time) (events.OverlayEvent, error) {
@@ -929,30 +1149,51 @@ func (m *Manager) ActiveSpeaker(ctx context.Context, streamID, userID, displayNa
 }
 
 func (m *Manager) ActiveSpeakerState(ctx context.Context, streamID, userID, displayName string, speaking bool, now time.Time) (events.OverlayEvent, error) {
+	return m.ActiveSpeakerStateForGeneration(ctx, streamID, 0, userID, displayName, speaking, now)
+}
+
+func (m *Manager) ActiveSpeakerStateForGeneration(ctx context.Context, streamID string, generation uint64, userID, displayName string, speaking bool, now time.Time) (events.OverlayEvent, error) {
 	if speaking && strings.TrimSpace(userID) == "" {
 		return events.OverlayEvent{}, errors.New("user_id is required")
 	}
-	return m.publish(ctx, events.ActiveSpeakerStateEvent(streamID, userID, displayName, speaking, now))
+	return m.publishWithGeneration(ctx, events.ActiveSpeakerStateEvent(streamID, userID, displayName, speaking, now), generation)
 }
 
 func (m *Manager) CustomOverlay(ctx context.Context, streamID, eventType string, payload map[string]any, now time.Time) (events.OverlayEvent, error) {
+	return m.CustomOverlayForGeneration(ctx, streamID, 0, eventType, payload, now)
+}
+
+func (m *Manager) CustomOverlayForGeneration(ctx context.Context, streamID string, generation uint64, eventType string, payload map[string]any, now time.Time) (events.OverlayEvent, error) {
 	if !strings.HasPrefix(eventType, "overlay.") && !strings.HasPrefix(eventType, "caption.") {
 		return events.OverlayEvent{}, errors.New("event type must start with overlay. or caption.")
 	}
-	return m.publish(ctx, events.CustomOverlayEvent(streamID, eventType, payload, now))
+	return m.publishWithGeneration(ctx, events.CustomOverlayEvent(streamID, eventType, payload, now), generation)
 }
 
 func (m *Manager) publish(ctx context.Context, event events.OverlayEvent) (events.OverlayEvent, error) {
+	return m.publishWithGeneration(ctx, event, 0)
+}
+
+func (m *Manager) publishWithGeneration(ctx context.Context, event events.OverlayEvent, expectedGeneration uint64) (events.OverlayEvent, error) {
 	m.mu.Lock()
 	if err := m.ensureStreamLocked(event.StreamID); err != nil {
 		m.mu.Unlock()
 		return events.OverlayEvent{}, err
 	}
+	if expectedGeneration != 0 && expectedGeneration != m.jobGeneration {
+		m.mu.Unlock()
+		return events.OverlayEvent{}, ErrJobGenerationMismatch
+	}
 	encoderRecorderURL := m.current.EncoderRecorderURL
 	streamIngestToken := m.current.StreamIngestToken
 	sceneRenderer := m.sceneRenderer
 	generation := m.jobGeneration
+	deliveryCtx := m.deliveryCtx
 	m.mu.Unlock()
+	if deliveryCtx == nil {
+		deliveryCtx = ctx
+	}
+	m.supersedePendingWorkerEvent(event, generation)
 
 	if sceneRenderer != nil {
 		if err := sceneRenderer.Apply(generation, event); err != nil {
@@ -961,40 +1202,29 @@ func (m *Manager) publish(ctx context.Context, event events.OverlayEvent) (event
 		}
 	}
 
-	err := m.publisher.Publish(ctx, encoder.Event{
-		ID:        event.ID,
-		StreamID:  event.StreamID,
-		Type:      event.Type,
-		Payload:   event.Payload,
-		Timestamp: event.Timestamp,
-		URL:       encoderRecorderURL,
-		Token:     streamIngestToken,
-	})
+	encoderEvent := encoder.Event{
+		ID:         event.ID,
+		StreamID:   event.StreamID,
+		Type:       event.Type,
+		Payload:    event.Payload,
+		Timestamp:  event.Timestamp,
+		URL:        encoderRecorderURL,
+		Token:      streamIngestToken,
+		Generation: generation,
+		Attempt:    1,
+	}
+	m.publisherMu.Lock()
+	err := m.publisher.Publish(deliveryCtx, encoderEvent)
+	m.publisherMu.Unlock()
 	if err != nil {
-		m.mu.Lock()
-		m.sendFailures++
-		failures := m.sendFailures
-		m.mu.Unlock()
-		attrs := map[string]any{"event_type": event.Type}
-		m.report(ctx, event.StreamID, "worker.event.send_failed", "failed", attrs)
-		m.metric(ctx, event.StreamID, "worker.event_send_failures_total", "warning", float64(failures), attrs)
+		class, status := encoder.PublishErrorMetadata(err)
+		retryable := encoder.IsRetryablePublishError(err)
+		m.recordWorkerEventFailure(ctx, encoderEvent, 1, retryable, class, status)
+		m.queueWorkerEventAfterFailure(encoderEvent, err)
 		return events.OverlayEvent{}, errors.New("event publish failed")
 	}
-
-	m.mu.Lock()
-	if m.current.StreamID != event.StreamID || m.jobGeneration != generation {
-		m.mu.Unlock()
+	if !m.recordDeliveredWorkerEvent(encoderEvent) {
 		return events.OverlayEvent{}, errors.New("stream job changed while publishing event")
-	}
-	m.events = append(m.events, event)
-	if len(m.events) > m.maxEvents {
-		m.events = append([]events.OverlayEvent(nil), m.events[len(m.events)-m.maxEvents:]...)
-	}
-	metrics := m.recordEventLocked(event.Type)
-	m.mu.Unlock()
-	m.report(ctx, event.StreamID, "worker.event.sent", "sent", map[string]any{"event_type": event.Type})
-	for metricName, value := range metrics {
-		m.metric(ctx, event.StreamID, metricName, "ok", float64(value), map[string]any{"event_type": event.Type})
 	}
 	return event, nil
 }
@@ -1032,6 +1262,9 @@ func validateVideoOutputRequest(stream StreamContext) error {
 func (m *Manager) ensureStreamLocked(streamID string) error {
 	if m.current.StreamID == "" {
 		return errors.New("no active stream job")
+	}
+	if m.stopping {
+		return ErrStreamStopping
 	}
 	if streamID == "" {
 		return errors.New("stream_id is required")

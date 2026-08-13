@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -445,6 +446,37 @@ func TestWorkerEventEndpointAcceptsSignedDiscordBotToken(t *testing.T) {
 	defer rejectRes.Body.Close()
 	if rejectRes.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected wrong stream token 401, got %d", rejectRes.StatusCode)
+	}
+}
+
+func TestWorkerEventEndpointRejectsOldJobGenerationAfterRearm(t *testing.T) {
+	publisher := &capturePublisher{}
+	manager := jobs.NewManager(publisher, observability.Client{})
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	oldGeneration := manager.Status().JobGeneration
+	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-01"}); err != nil {
+		t.Fatal(err)
+	}
+	newGeneration := manager.Status().JobGeneration
+	if newGeneration == oldGeneration {
+		t.Fatalf("rearm did not advance job generation: old=%d new=%d", oldGeneration, newGeneration)
+	}
+	handler := NewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
+	request := httptest.NewRequest(http.MethodPost, "/streams/stream-01/events/participants", strings.NewReader(`{"job_generation":`+strconv.FormatUint(oldGeneration, 10)+`,"participants":[]}`))
+	request.Header.Set("Authorization", "Bearer service-token")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || responseCode(t, response) != "job_generation_mismatch" {
+		t.Fatalf("old generation was not rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(publisher.events) != 0 {
+		t.Fatalf("old generation reached Encoder publisher: %#v", publisher.events)
 	}
 }
 
