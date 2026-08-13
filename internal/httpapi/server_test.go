@@ -107,6 +107,45 @@ auth:
 	}
 }
 
+func TestStatusEndpointUsesAuthoritativeNodeConfigServiceID(t *testing.T) {
+	t.Setenv("SERVICE_ID", "")
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(configPath, []byte(`panel:
+  url: "https://panel.example.com"
+node:
+  id: "worker-status-01"
+  name: "Worker Status"
+  type: "worker"
+api:
+  host: "127.0.0.1"
+  port: 8084
+  ssl_enabled: false
+auth:
+  token: "runtime-token"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
+
+	server := httptest.NewServer(NewServer(control.ServiceType, nil, TokenVerifier{}))
+	defer server.Close()
+	res, err := http.Get(server.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status endpoint returned %d", res.StatusCode)
+	}
+	var body Status
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ServiceID != "worker-status-01" {
+		t.Fatalf("status service ID = %q, want authoritative node ID", body.ServiceID)
+	}
+}
+
 func TestConfigRevisionFromEnvValidatesPositiveInteger(t *testing.T) {
 	for _, tt := range []struct {
 		name    string

@@ -266,7 +266,8 @@ func ConfigRevisionFromEnv() (int64, error) {
 }
 
 func (s Server) status(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, Status{ServiceType: s.serviceType, ServiceID: os.Getenv("SERVICE_ID"), Status: "ready", CheckedAt: time.Now().UTC(), Worker: s.manager.Status()})
+	serviceID := strings.TrimSpace(control.ConfigFromEnv().ServiceID)
+	writeJSON(w, http.StatusOK, Status{ServiceType: s.serviceType, ServiceID: serviceID, Status: "ready", CheckedAt: time.Now().UTC(), Worker: s.manager.Status()})
 }
 
 func (s Server) heartbeat(w http.ResponseWriter, r *http.Request) {

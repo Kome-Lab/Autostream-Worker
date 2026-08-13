@@ -47,12 +47,11 @@ func main() {
 	if _, err := updaterIdentity.ResolveFromEnv(); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
 		log.Fatalf("invalid updater identity: %v", err)
 	}
-	publisher := buildPublisher()
-
 	controlClient := control.Client{Config: control.ConfigFromEnv()}
 	if err := requireMatchingUpdaterIdentity(updaterIdentity, controlClient.Config.ServiceID); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
 		log.Fatalf("invalid updater identity: %v", err)
 	}
+	publisher := buildPublisher(controlClient.Config.ServiceID)
 	manager, err := jobs.NewManagerWithStoppedTargetReceiptFile(
 		publisher,
 		buildReporter(controlClient),
@@ -310,8 +309,15 @@ func envBool(key string, fallback bool) bool {
 	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
 }
 
-func buildPublisher() encoder.Publisher {
+func buildPublisher(serviceID string) encoder.Publisher {
 	cfg := encoder.ConfigFromEnv()
+	// The node config is the authoritative identity in production. The
+	// encoder client still has a legacy SERVICE_ID fallback for local
+	// compatibility, but using that fallback here would make signed
+	// stream-scoped tokens fail Encoder's service-id fence.
+	if serviceID = strings.TrimSpace(serviceID); serviceID != "" {
+		cfg.ServiceID = serviceID
+	}
 	if cfg.URL == "" || cfg.Token == "" {
 		log.Printf("static encoder route is incomplete; job-scoped encoder URL and signed ingest token will be preferred")
 	}

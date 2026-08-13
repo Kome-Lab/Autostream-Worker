@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/example/autostream-worker/internal/control"
+	"github.com/example/autostream-worker/internal/encoder"
 	"github.com/example/autostream-worker/internal/httpapi"
 )
 
@@ -80,6 +81,21 @@ func TestRequireMatchingUpdaterIdentityRejectsRegistrationIDDrift(t *testing.T) 
 	}
 	if err := requireMatchingUpdaterIdentity(latch, "worker-drifted"); !errors.Is(err, httpapi.ErrUpdaterIdentityDrift) {
 		t.Fatalf("registration identity drift error = %v", err)
+	}
+}
+
+func TestBuildPublisherUsesAuthoritativeServiceID(t *testing.T) {
+	t.Setenv("SERVICE_ID", "")
+	t.Setenv("ENCODER_RECORDER_URL", "https://encoder.example.com")
+	t.Setenv("ENCODER_RECORDER_TOKEN", "legacy-token")
+
+	publisher := buildPublisher("worker-stk-skylab-01")
+	client, ok := publisher.(encoder.Client)
+	if !ok {
+		t.Fatalf("publisher type = %T, want encoder.Client", publisher)
+	}
+	if client.Config.ServiceID != "worker-stk-skylab-01" {
+		t.Fatalf("publisher service ID = %q, want authoritative node ID", client.Config.ServiceID)
 	}
 }
 
