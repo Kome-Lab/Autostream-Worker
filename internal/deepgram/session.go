@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -32,28 +33,46 @@ var (
 )
 
 type Config struct {
-	Model          string
-	Language       string
-	EndpointingMS  int
-	InterimResults bool
-	SmartFormat    bool
-	Delay          time.Duration
+	Model             string
+	Language          string
+	EndpointingMS     int
+	UtteranceEndMS    int
+	LocalFinalize     time.Duration
+	SpeakerIdleClose  time.Duration
+	KeepAliveInterval time.Duration
+	InterimResults    bool
+	SmartFormat       bool
+	Keyterms          []string
+	MIPOptOut         bool
+	ReplayBufferMax   time.Duration
+	Delay             time.Duration
 }
 
 type AudioPacket struct {
-	SSRC       uint32
-	UserID     string
-	Sequence   uint16
-	Timestamp  uint64
-	ReceivedAt time.Time
-	Opus       []byte
+	SSRC                 uint32
+	UserID               string
+	JobGeneration        uint64
+	ConnectionGeneration uint64
+	Sequence             uint16
+	Timestamp            uint64
+	ReceivedAt           time.Time
+	Opus                 []byte
 }
 
 type Transcript struct {
-	Text          string
-	SpeakerUserID string
-	Final         bool
-	ReceivedAt    time.Time
+	Text               string
+	SpeakerUserID      string
+	UtteranceID        string
+	Revision           int
+	Final              bool
+	StartedAt          time.Time
+	UpdatedAt          time.Time
+	EndedAt            time.Time
+	Confidence         float64
+	FinalizationReason string
+	Source             string
+	AudioReceivedAt    time.Time
+	ReceivedAt         time.Time
 }
 
 type Handler func(context.Context, Transcript) error
@@ -67,11 +86,19 @@ type Session struct {
 
 	mu        sync.Mutex
 	closed    bool
-	conns     map[uint32]*speakerConnection
-	dialing   map[uint32]*dialCall
+	conns     map[connectionKey]*speakerConnection
+	dialing   map[connectionKey]*dialCall
 	dialWG    sync.WaitGroup
 	loopWG    sync.WaitGroup
 	closeOnce sync.Once
+}
+
+// A user and connection generation identify a speaker. SSRC is only retained
+// for packets that arrive before Discord has resolved the speaking user.
+type connectionKey struct {
+	UserID         string
+	Generation     uint64
+	UnresolvedSSRC uint32
 }
 
 type sessionOptions struct {
@@ -111,6 +138,17 @@ type speakerConnection struct {
 	session *Session
 	socket  socket
 	ssrc    uint32
+	key     connectionKey
+
+	stateMu           sync.Mutex
+	utteranceSeq      uint64
+	utteranceID       string
+	utteranceText     string
+	utteranceRevision int
+	utteranceStarted  time.Time
+	lastAudioAt       time.Time
+	lastResultAt      time.Time
+	lastConfidence    float64
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -123,17 +161,25 @@ type speakerConnection struct {
 }
 
 type queuedTranscript struct {
-	text       string
-	final      bool
-	receivedAt time.Time
+	text         string
+	final        bool
+	speechFinal  bool
+	utteranceEnd bool
+	receivedAt   time.Time
+	startedAt    time.Time
+	confidence   float64
 }
 
 type resultMessage struct {
-	Type    string `json:"type"`
-	IsFinal bool   `json:"is_final"`
-	Channel struct {
+	Type        string  `json:"type"`
+	IsFinal     bool    `json:"is_final"`
+	SpeechFinal bool    `json:"speech_final"`
+	Start       float64 `json:"start"`
+	Duration    float64 `json:"duration"`
+	Channel     struct {
 		Alternatives []struct {
-			Transcript string `json:"transcript"`
+			Transcript string  `json:"transcript"`
+			Confidence float64 `json:"confidence"`
 		} `json:"alternatives"`
 	} `json:"channel"`
 }
@@ -157,14 +203,17 @@ func newSession(config Config, apiKey []byte, handler Handler, options sessionOp
 	if err != nil {
 		return nil, errors.New("deepgram listen configuration is invalid")
 	}
+	if config.KeepAliveInterval > 0 {
+		options.keepAliveInterval = config.KeepAliveInterval
+	}
 	return &Session{
 		config:   config,
 		options:  options,
 		endpoint: endpoint,
 		handler:  handler,
 		apiKey:   append([]byte(nil), apiKey...),
-		conns:    map[uint32]*speakerConnection{},
-		dialing:  map[uint32]*dialCall{},
+		conns:    map[connectionKey]*speakerConnection{},
+		dialing:  map[connectionKey]*dialCall{},
 	}, nil
 }
 
@@ -218,6 +267,18 @@ func buildListenURL(endpoint string, config Config) (string, error) {
 	query.Set("interim_results", strconv.FormatBool(config.InterimResults))
 	query.Set("smart_format", strconv.FormatBool(config.SmartFormat))
 	query.Set("endpointing", strconv.Itoa(config.EndpointingMS))
+	if config.UtteranceEndMS > 0 {
+		query.Set("utterance_end_ms", strconv.Itoa(config.UtteranceEndMS))
+	}
+	if config.MIPOptOut {
+		query.Set("mip_opt_out", "true")
+	}
+	for _, keyterm := range config.Keyterms {
+		keyterm = strings.TrimSpace(keyterm)
+		if keyterm != "" {
+			query.Add("keyterm", keyterm)
+		}
+	}
 	parsed.RawQuery = query.Encode()
 	return parsed.String(), nil
 }
@@ -234,6 +295,20 @@ func validateConfig(config Config) error {
 	}
 	if config.Delay < 0 || config.Delay > 10*time.Second {
 		return errors.New("deepgram delay is invalid")
+	}
+	if config.UtteranceEndMS < 0 || config.UtteranceEndMS > 10000 {
+		return errors.New("deepgram utterance_end_ms is invalid")
+	}
+	if config.LocalFinalize < 0 || config.LocalFinalize > 10*time.Second || config.SpeakerIdleClose < 0 || config.SpeakerIdleClose > 2*time.Minute || config.KeepAliveInterval < 0 || config.KeepAliveInterval > time.Minute {
+		return errors.New("deepgram session timing is invalid")
+	}
+	if len(config.Keyterms) > 20 {
+		return errors.New("deepgram keyterms are invalid")
+	}
+	for _, keyterm := range config.Keyterms {
+		if keyterm = strings.TrimSpace(keyterm); keyterm == "" || len(keyterm) > 128 {
+			return errors.New("deepgram keyterms are invalid")
+		}
 	}
 	return nil
 }
@@ -253,7 +328,8 @@ func (s *Session) Ingest(ctx context.Context, packet AudioPacket) error {
 	if len(packet.Opus) == 0 {
 		return ErrEmptyAudio
 	}
-	conn, err := s.connection(ctx, packet.SSRC, strings.TrimSpace(packet.UserID))
+	packet.UserID = strings.TrimSpace(packet.UserID)
+	conn, err := s.connection(ctx, packet)
 	if err != nil {
 		return err
 	}
@@ -261,33 +337,52 @@ func (s *Session) Ingest(ctx context.Context, packet AudioPacket) error {
 		s.discard(conn)
 		return ErrUnavailable
 	}
+	conn.markAudio(packet.ReceivedAt)
 	return nil
 }
 
-func (s *Session) connection(ctx context.Context, ssrc uint32, userID string) (*speakerConnection, error) {
+func connectionKeyFor(packet AudioPacket) connectionKey {
+	if packet.UserID != "" {
+		return connectionKey{UserID: packet.UserID, Generation: packet.ConnectionGeneration}
+	}
+	return connectionKey{Generation: packet.ConnectionGeneration, UnresolvedSSRC: packet.SSRC}
+}
+
+func (s *Session) connection(ctx context.Context, packet AudioPacket) (*speakerConnection, error) {
+	key := connectionKeyFor(packet)
 	for {
-		var stale *speakerConnection
+		var stale []*speakerConnection
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
 			return nil, ErrClosed
 		}
-		if conn := s.conns[ssrc]; conn != nil {
-			if conn.hasDifferentUser(userID) {
-				delete(s.conns, ssrc)
-				stale = conn
-			} else {
-				conn.setUserID(userID)
-				s.mu.Unlock()
-				return conn, nil
+		if conn := s.conns[key]; conn != nil {
+			s.mu.Unlock()
+			return conn, nil
+		}
+		if packet.UserID != "" || packet.ConnectionGeneration != 0 {
+			for candidateKey, conn := range s.conns {
+				if candidateKey == key {
+					continue
+				}
+				sameUser := packet.UserID != "" && candidateKey.UserID == packet.UserID
+				sameSSRC := packet.SSRC != 0 && conn.ssrc == packet.SSRC
+				if !sameUser && !sameSSRC {
+					continue
+				}
+				delete(s.conns, candidateKey)
+				stale = append(stale, conn)
 			}
 		}
-		if stale != nil {
+		if len(stale) > 0 {
 			s.mu.Unlock()
-			stale.abort()
+			for _, conn := range stale {
+				conn.abort()
+			}
 			continue
 		}
-		if call := s.dialing[ssrc]; call != nil {
+		if call := s.dialing[key]; call != nil {
 			done := call.done
 			s.mu.Unlock()
 			select {
@@ -309,24 +404,24 @@ func (s *Session) connection(ctx context.Context, ssrc uint32, userID string) (*
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, s.options.dialTimeout)
 		call := &dialCall{done: make(chan struct{}), cancel: cancel}
-		s.dialing[ssrc] = call
+		s.dialing[key] = call
 		s.dialWG.Add(1)
 		s.mu.Unlock()
 
-		conn, err := s.completeDial(dialCtx, call, ssrc, userID)
+		conn, err := s.completeDial(dialCtx, call, key, packet)
 		cancel()
 		s.dialWG.Done()
 		return conn, err
 	}
 }
 
-func (s *Session) completeDial(ctx context.Context, call *dialCall, ssrc uint32, userID string) (*speakerConnection, error) {
+func (s *Session) completeDial(ctx context.Context, call *dialCall, key connectionKey, packet AudioPacket) (*speakerConnection, error) {
 	sock, dialErr := s.dial(ctx)
 	var conn *speakerConnection
 	var closeSocket bool
 
 	s.mu.Lock()
-	delete(s.dialing, ssrc)
+	delete(s.dialing, key)
 	switch {
 	case dialErr != nil:
 		call.err = ErrUnavailable
@@ -335,8 +430,8 @@ func (s *Session) completeDial(ctx context.Context, call *dialCall, ssrc uint32,
 		call.err = ErrClosed
 		closeSocket = true
 	default:
-		conn = newSpeakerConnection(s, sock, ssrc, userID)
-		s.conns[ssrc] = conn
+		conn = newSpeakerConnection(s, sock, key, packet)
+		s.conns[key] = conn
 		s.loopWG.Add(3)
 		call.conn = conn
 	}
@@ -369,17 +464,18 @@ func (s *Session) dial(ctx context.Context) (socket, error) {
 	return conn, nil
 }
 
-func newSpeakerConnection(session *Session, sock socket, ssrc uint32, userID string) *speakerConnection {
+func newSpeakerConnection(session *Session, sock socket, key connectionKey, packet AudioPacket) *speakerConnection {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &speakerConnection{
 		session:  session,
 		socket:   sock,
-		ssrc:     ssrc,
+		ssrc:     packet.SSRC,
+		key:      key,
 		ctx:      ctx,
 		cancel:   cancel,
 		readDone: make(chan struct{}),
 		results:  make(chan queuedTranscript, 32),
-		userID:   userID,
+		userID:   packet.UserID,
 	}
 }
 
@@ -401,7 +497,7 @@ func (c *speakerConnection) readLoop() {
 		if messageType != websocket.MessageText {
 			continue
 		}
-		result, ok := parseResult(payload, c.session.config.InterimResults)
+		result, ok := parseMessage(payload, c.session.config.InterimResults)
 		if !ok {
 			continue
 		}
@@ -414,15 +510,44 @@ func (c *speakerConnection) readLoop() {
 }
 
 func parseResult(payload []byte, interimResults bool) (queuedTranscript, bool) {
+	result, ok := parseMessage(payload, interimResults)
+	if !ok || result.utteranceEnd {
+		return queuedTranscript{}, false
+	}
+	return result, true
+}
+
+func parseMessage(payload []byte, interimResults bool) (queuedTranscript, bool) {
 	var message resultMessage
-	if err := json.Unmarshal(payload, &message); err != nil || message.Type != "Results" || len(message.Channel.Alternatives) == 0 {
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return queuedTranscript{}, false
+	}
+	if envelope.Type == "UtteranceEnd" {
+		return queuedTranscript{utteranceEnd: true, receivedAt: time.Now().UTC()}, true
+	}
+	if envelope.Type != "Results" || json.Unmarshal(payload, &message) != nil || len(message.Channel.Alternatives) == 0 {
 		return queuedTranscript{}, false
 	}
 	transcript := strings.TrimSpace(message.Channel.Alternatives[0].Transcript)
 	if transcript == "" || (!message.IsFinal && !interimResults) {
 		return queuedTranscript{}, false
 	}
-	return queuedTranscript{text: transcript, final: message.IsFinal, receivedAt: time.Now().UTC()}, true
+	receivedAt := time.Now().UTC()
+	startedAt := receivedAt
+	if message.Duration > 0 {
+		startedAt = receivedAt.Add(-time.Duration(message.Duration * float64(time.Second)))
+	}
+	return queuedTranscript{
+		text:        transcript,
+		final:       message.IsFinal,
+		speechFinal: message.SpeechFinal,
+		receivedAt:  receivedAt,
+		startedAt:   startedAt,
+		confidence:  message.Channel.Alternatives[0].Confidence,
+	}, true
 }
 
 func (c *speakerConnection) keepAliveLoop() {
@@ -434,6 +559,9 @@ func (c *speakerConnection) keepAliveLoop() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
+			if c.hasRecentAudio() {
+				continue
+			}
 			if err := c.writeControl(c.ctx, []byte(`{"type":"KeepAlive"}`)); err != nil {
 				c.session.discard(c)
 				return
@@ -444,29 +572,172 @@ func (c *speakerConnection) keepAliveLoop() {
 
 func (c *speakerConnection) publishLoop() {
 	defer c.session.loopWG.Done()
+	var ticker *time.Ticker
+	var tick <-chan time.Time
+	if c.session.config.LocalFinalize > 0 || c.session.config.SpeakerIdleClose > 0 {
+		ticker = time.NewTicker(100 * time.Millisecond)
+		tick = ticker.C
+		defer ticker.Stop()
+	}
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case result := <-c.results:
-			due := result.receivedAt.Add(c.session.config.Delay)
-			if wait := time.Until(due); wait > 0 {
-				timer := time.NewTimer(wait)
-				select {
-				case <-c.ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
-				}
+			if transcript, ok := c.applyResult(result); ok {
+				c.publishTranscript(transcript)
 			}
-			_ = c.session.handler(c.ctx, Transcript{
-				Text:          result.text,
-				SpeakerUserID: c.currentUserID(),
-				Final:         result.final,
-				ReceivedAt:    result.receivedAt,
-			})
+		case now := <-tick:
+			if transcript, ok := c.localFinalizeDue(now.UTC()); ok {
+				c.publishTranscript(transcript)
+			}
+			if c.idleDue(now.UTC()) {
+				c.session.discard(c)
+				return
+			}
 		}
 	}
+}
+
+func (c *speakerConnection) applyResult(result queuedTranscript) (Transcript, bool) {
+	now := result.receivedAt
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.lastResultAt = now
+	if result.utteranceEnd {
+		if c.utteranceText == "" {
+			return Transcript{}, false
+		}
+		transcript := c.buildTranscriptLocked(now, true, "utterance_end", c.utteranceText, c.lastConfidence)
+		c.resetUtteranceLocked()
+		return transcript, true
+	}
+	if result.text == "" {
+		return Transcript{}, false
+	}
+	if c.utteranceID == "" {
+		c.utteranceSeq++
+		c.utteranceID = fmt.Sprintf("%s-%d-%d", c.currentUserID(), c.ssrc, c.utteranceSeq)
+		c.utteranceStarted = result.startedAt
+		if c.utteranceStarted.IsZero() {
+			c.utteranceStarted = now
+		}
+	}
+	if result.startedAt.Before(c.utteranceStarted) && !result.startedAt.IsZero() {
+		c.utteranceStarted = result.startedAt
+	}
+	c.lastConfidence = result.confidence
+	changed := result.text != c.utteranceText
+	c.utteranceText = result.text
+	if result.final || result.speechFinal {
+		reason := "is_final"
+		if result.speechFinal {
+			reason = "speech_final"
+		}
+		transcript := c.buildTranscriptLocked(now, true, reason, result.text, result.confidence)
+		c.resetUtteranceLocked()
+		return transcript, true
+	}
+	if !changed {
+		return Transcript{}, false
+	}
+	c.utteranceRevision++
+	return c.buildTranscriptLocked(now, false, "", result.text, result.confidence), true
+}
+
+func (c *speakerConnection) localFinalizeDue(now time.Time) (Transcript, bool) {
+	if c.session.config.LocalFinalize <= 0 {
+		return Transcript{}, false
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.utteranceText == "" || c.lastResultAt.IsZero() || now.Sub(c.lastResultAt) < c.session.config.LocalFinalize {
+		return Transcript{}, false
+	}
+	if !c.lastAudioAt.IsZero() && now.Sub(c.lastAudioAt) < c.session.config.LocalFinalize {
+		return Transcript{}, false
+	}
+	transcript := c.buildTranscriptLocked(now, true, "local_finalize", c.utteranceText, c.lastConfidence)
+	c.resetUtteranceLocked()
+	return transcript, true
+}
+
+func (c *speakerConnection) buildTranscriptLocked(now time.Time, final bool, reason, text string, confidence float64) Transcript {
+	if final {
+		c.utteranceRevision++
+	}
+	return Transcript{
+		Text:          text,
+		SpeakerUserID: c.currentUserID(),
+		UtteranceID:   c.utteranceID,
+		Revision:      c.utteranceRevision,
+		Final:         final,
+		StartedAt:     c.utteranceStarted,
+		UpdatedAt:     now,
+		EndedAt: func() time.Time {
+			if final {
+				return now
+			}
+			return time.Time{}
+		}(),
+		Confidence:         confidence,
+		FinalizationReason: reason,
+		Source:             "discord_voice",
+		AudioReceivedAt:    c.lastAudioAt,
+		ReceivedAt:         now,
+	}
+}
+
+func (c *speakerConnection) resetUtteranceLocked() {
+	c.utteranceID = ""
+	c.utteranceText = ""
+	c.utteranceRevision = 0
+	c.utteranceStarted = time.Time{}
+	c.lastConfidence = 0
+}
+
+func (c *speakerConnection) publishTranscript(transcript Transcript) {
+	due := transcript.ReceivedAt.Add(c.session.config.Delay)
+	if wait := time.Until(due); wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
+	_ = c.session.handler(c.ctx, transcript)
+}
+
+func (c *speakerConnection) markAudio(receivedAt time.Time) {
+	if receivedAt.IsZero() {
+		receivedAt = time.Now().UTC()
+	}
+	c.stateMu.Lock()
+	c.lastAudioAt = receivedAt.UTC()
+	c.stateMu.Unlock()
+}
+
+func (c *speakerConnection) hasRecentAudio() bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.lastAudioAt.IsZero() {
+		return false
+	}
+	return time.Since(c.lastAudioAt) < c.session.options.keepAliveInterval
+}
+
+func (c *speakerConnection) idleDue(now time.Time) bool {
+	if c.session.config.SpeakerIdleClose <= 0 {
+		return false
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return !c.lastAudioAt.IsZero() && now.Sub(c.lastAudioAt) >= c.session.config.SpeakerIdleClose
 }
 
 func (c *speakerConnection) writeAudio(ctx context.Context, payload []byte) error {
@@ -522,8 +793,8 @@ func (c *speakerConnection) currentUserID() string {
 
 func (s *Session) discard(conn *speakerConnection) {
 	s.mu.Lock()
-	if s.conns[conn.ssrc] == conn {
-		delete(s.conns, conn.ssrc)
+	if s.conns[conn.key] == conn {
+		delete(s.conns, conn.key)
 	}
 	s.mu.Unlock()
 	conn.abort()
@@ -539,6 +810,7 @@ func (c *speakerConnection) abort() {
 func (c *speakerConnection) gracefulClose() {
 	c.closeOnce.Do(func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), c.session.options.writeTimeout)
+		_ = c.writeControl(closeCtx, []byte(`{"type":"Finalize"}`))
 		err := c.writeControl(closeCtx, []byte(`{"type":"CloseStream"}`))
 		cancel()
 		if err == nil {
@@ -566,7 +838,7 @@ func (s *Session) close() {
 	for _, conn := range s.conns {
 		connections = append(connections, conn)
 	}
-	s.conns = map[uint32]*speakerConnection{}
+	s.conns = map[connectionKey]*speakerConnection{}
 	for _, call := range s.dialing {
 		call.cancel()
 	}

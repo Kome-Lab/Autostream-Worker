@@ -112,6 +112,36 @@ func TestSceneKeepsDefaultChatUntilItIsDisplacedOrTheStreamStops(t *testing.T) {
 	}
 }
 
+func TestSceneConvergesVoiceInterimAndFinalIntoUnifiedConversation(t *testing.T) {
+	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
+	s := newTestScene(t, 854, 480, now)
+	s.Reset(1, "stream-01", "Dev")
+	apply(t, s, events.CustomOverlayEvent("stream-01", "overlay.discord_chat", map[string]any{
+		"message_id": "chat-01", "author_id": "user-01", "display_name": "Alice", "content": "hello",
+	}, now))
+	apply(t, s, events.CaptionTranscriptEvent("stream-01", "hel", "user-01", "utt-01", "deepgram", 1, false, now, now, time.Time{}, 0, "", now))
+	apply(t, s, events.CaptionTranscriptEvent("stream-01", "hello world", "user-01", "utt-01", "deepgram", 2, false, now, now, time.Time{}, 0.8, "", now.Add(100*time.Millisecond)))
+	if got := s.Snapshot(now.Add(100 * time.Millisecond)); len(got.Conversation) != 2 || got.Conversation[1].Text != "hello world" || got.Conversation[1].Final {
+		t.Fatalf("interim conversation did not converge: %#v", got.Conversation)
+	}
+	apply(t, s, events.CaptionTranscriptEvent("stream-01", "hello world", "user-01", "utt-01", "deepgram", 3, true, now, now, now.Add(time.Second), 0.9, "speech_final", now.Add(time.Second)))
+	got := s.Snapshot(now.Add(time.Second))
+	if len(got.Conversation) != 2 || !got.Conversation[1].Final || got.Conversation[1].Kind != "voice" {
+		t.Fatalf("final conversation did not replace interim: %#v", got.Conversation)
+	}
+	if len(got.Captions) != 1 || !got.Captions[0].Final {
+		t.Fatalf("caption compatibility state was not retained: %#v", got.Captions)
+	}
+	// A delayed interim or duplicate final for the same utterance must not
+	// reopen the green/current caption or append a second archive candidate.
+	apply(t, s, events.CaptionTranscriptEvent("stream-01", "late interim", "user-01", "utt-01", "deepgram", 2, false, now, now, time.Time{}, 0.7, "", now.Add(2*time.Second)))
+	apply(t, s, events.CaptionTranscriptEvent("stream-01", "hello world", "user-01", "utt-01", "deepgram", 3, true, now, now, now.Add(time.Second), 0.9, "speech_final", now.Add(3*time.Second)))
+	got = s.Snapshot(now.Add(3 * time.Second))
+	if len(got.Conversation) != 2 || got.Conversation[1].Text != "hello world" || !got.Conversation[1].Final || len(got.Captions) != 1 {
+		t.Fatalf("stale caption delivery reopened or duplicated state: %#v captions=%#v", got.Conversation, got.Captions)
+	}
+}
+
 func TestSceneResetAndClearFenceStreamState(t *testing.T) {
 	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
 	s := newTestScene(t, 854, 480, now)

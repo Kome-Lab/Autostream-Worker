@@ -41,7 +41,7 @@ func (s *Scene) RenderSize(width, height int, at time.Time) (*image.RGBA, error)
 	}
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	draw.Draw(img, img.Bounds(), &image.Uniform{C: backgroundColor}, image.Point{}, draw.Src)
-	renderSnapshot(img, snapshot, fonts, s.avatars)
+	renderSnapshot(img, snapshot, fonts, s.avatars, s.showLegacyCaptionBar)
 	return img, nil
 }
 
@@ -59,7 +59,7 @@ func (s *Scene) fontsForHeight(height int) (*fontSet, error) {
 	return loaded, nil
 }
 
-func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars *avatarCache) {
+func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars *avatarCache, showLegacyCaptionBar bool) {
 	width, height := img.Bounds().Dx(), img.Bounds().Dy()
 	scale := float64(height) / defaultHeight
 	px := func(value int) int {
@@ -84,7 +84,7 @@ func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars 
 	gap := px(18)
 	panelTop := headerHeight + outer
 	captionHeight := 0
-	if len(snapshot.Captions) > 0 {
+	if showLegacyCaptionBar && len(snapshot.Captions) > 0 {
 		captionHeight = maxInt(px(170), fonts.captionHeight*3+px(32))
 	}
 	panelBottom := height - outer - captionHeight
@@ -99,7 +99,7 @@ func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars 
 	chatRect := image.Rect(outer, panelTop, participantRect.Min.X-gap, panelBottom)
 	drawPanel(img, chatRect)
 	drawPanel(img, participantRect)
-	drawChat(img, chatRect, snapshot.Chat, fonts, avatars, px)
+	drawChat(img, chatRect, snapshot.Chat, snapshot.Conversation, fonts, avatars, px)
 	drawParticipants(img, participantRect, snapshot.Participants, fonts, avatars, px)
 	if captionHeight > 0 {
 		captionRect := image.Rect(outer, height-outer-captionHeight+px(12), width-outer, height-outer)
@@ -114,7 +114,7 @@ func drawPanel(img *image.RGBA, rect image.Rectangle) {
 	draw.Draw(img, rect, &image.Uniform{C: panelColor}, image.Point{}, draw.Src)
 }
 
-func drawChat(img *image.RGBA, area image.Rectangle, messages []ChatMessage, fonts *fontSet, avatars *avatarCache, px func(int) int) {
+func drawChat(img *image.RGBA, area image.Rectangle, messages []ChatMessage, conversation []ConversationItem, fonts *fontSet, avatars *avatarCache, px func(int) int) {
 	if area.Empty() {
 		return
 	}
@@ -125,21 +125,25 @@ func drawChat(img *image.RGBA, area image.Rectangle, messages []ChatMessage, fon
 	availableWidth := area.Dx() - padding*2
 	avatarSize := maxInt(px(40), 22)
 	cardGap := px(10)
-	for i := len(messages) - 1; i >= 0; i-- {
-		message := messages[i]
+	items := conversationItems(messages, conversation)
+	for i := len(items) - 1; i >= 0; i-- {
+		item := items[i]
 		contentWidth := availableWidth - avatarSize - px(38)
-		lines := wrapText(message.Content, contentWidth, fonts.body, 3)
+		lines := wrapText(item.Text, contentWidth, fonts.body, 3)
 		cardHeight := maxInt(avatarSize+px(20), fonts.strongHeight+fonts.bodyHeight*len(lines)+px(28))
 		if y+cardHeight > area.Max.Y-padding {
 			break
 		}
 		card := image.Rect(area.Min.X+padding, y, area.Max.X-padding, y+cardHeight)
 		draw.Draw(img, card, &image.Uniform{C: cardColor}, image.Point{}, draw.Src)
-		avatar := avatars.Lookup(message.AvatarURL)
+		avatar := avatars.Lookup(item.AvatarURL)
 		drawAvatar(img, card.Min.X+px(10), card.Min.Y+px(10), avatarSize, avatar, false)
 		textX := card.Min.X + avatarSize + px(22)
-		name := message.DisplayName
-		if message.IsBot {
+		name := item.DisplayName
+		if item.Kind == "voice" {
+			name = "MIC  " + name
+		}
+		if item.IsBot {
 			name += "  BOT"
 		}
 		drawTextClipped(img, textX, card.Min.Y+px(10)+fonts.strongHeight, name, card.Max.X-textX-px(10), textColor, fonts.strong)
@@ -150,6 +154,17 @@ func drawChat(img *image.RGBA, area image.Rectangle, messages []ChatMessage, fon
 		}
 		y += cardHeight + cardGap
 	}
+}
+
+func conversationItems(messages []ChatMessage, conversation []ConversationItem) []ConversationItem {
+	if len(conversation) > 0 {
+		return conversation
+	}
+	items := make([]ConversationItem, 0, len(messages))
+	for _, message := range messages {
+		items = append(items, ConversationItem{ID: "chat:" + message.MessageID, Kind: "chat", AuthorID: message.AuthorID, DisplayName: message.DisplayName, AvatarURL: message.AvatarURL, IsBot: message.IsBot, Text: message.Content, CreatedAt: message.CreatedAt, ExpiresAt: message.ExpiresAt})
+	}
+	return items
 }
 
 func drawParticipants(img *image.RGBA, area image.Rectangle, participants []Participant, fonts *fontSet, avatars *avatarCache, px func(int) int) {

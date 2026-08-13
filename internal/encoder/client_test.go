@@ -2,8 +2,11 @@ package encoder
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -138,6 +141,62 @@ func TestPublishRetriesTransientFailures(t *testing.T) {
 	}
 }
 
+func TestPublishRetriesConflictAndRequestTimeout(t *testing.T) {
+	for _, status := range []int{http.StatusConflict, http.StatusRequestTimeout} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			attempts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				if attempts == 1 {
+					w.WriteHeader(status)
+					return
+				}
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer server.Close()
+
+			client := Client{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second, RetryMax: 1, RetryBaseDelay: time.Millisecond}}
+			if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"}); err != nil {
+				t.Fatal(err)
+			}
+			if attempts != 2 {
+				t.Fatalf("expected retry for status %d, got %d attempts", status, attempts)
+			}
+		})
+	}
+}
+
+func TestPublishRetriesTransportFailure(t *testing.T) {
+	attempts := 0
+	client := Client{
+		Config: Config{URL: "https://encoder.example.com", Token: "secret-token", Timeout: time.Second, RetryMax: 1, RetryBaseDelay: time.Millisecond},
+		HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("connection reset by peer")
+			}
+			return &http.Response{StatusCode: http.StatusAccepted, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: req}, nil
+		})},
+	}
+	if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"}); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected transport retry, got %d attempts", attempts)
+	}
+}
+
+func TestPublishErrorMetadataIsSafe(t *testing.T) {
+	err := NewRetryablePublishError(http.StatusConflict, "http_status")
+	class, status := PublishErrorMetadata(err)
+	if class != "http_status" || status != http.StatusConflict {
+		t.Fatalf("unexpected safe metadata: class=%q status=%d", class, status)
+	}
+	if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "Authorization") {
+		t.Fatalf("retry error exposed sensitive details: %v", err)
+	}
+}
+
 func TestPublishDoesNotRetryValidationFailures(t *testing.T) {
 	var attempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -147,12 +206,23 @@ func TestPublishDoesNotRetryValidationFailures(t *testing.T) {
 	defer server.Close()
 
 	client := Client{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second, RetryMax: 2, RetryBaseDelay: time.Millisecond}}
-	if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"}); err == nil {
+	err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"})
+	if err == nil {
 		t.Fatal("expected non-transient error")
 	}
 	if attempts != 1 {
 		t.Fatalf("non-transient failure should not be retried, got %d attempts", attempts)
 	}
+	class, status := PublishErrorMetadata(err)
+	if class != "http_status" || status != http.StatusBadRequest || IsRetryablePublishError(err) {
+		t.Fatalf("non-retryable HTTP metadata was not preserved: class=%q status=%d retryable=%v", class, status, IsRetryablePublishError(err))
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func TestValidateRejectsNonHTTPEncoderURL(t *testing.T) {

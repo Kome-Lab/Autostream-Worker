@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,14 +16,16 @@ import (
 )
 
 type Event struct {
-	ID        string         `json:"id"`
-	StreamID  string         `json:"stream_id"`
-	ServiceID string         `json:"service_id,omitempty"`
-	Type      string         `json:"type"`
-	Payload   map[string]any `json:"payload"`
-	Timestamp time.Time      `json:"timestamp"`
-	URL       string         `json:"-"`
-	Token     string         `json:"-"`
+	ID         string         `json:"id"`
+	StreamID   string         `json:"stream_id"`
+	ServiceID  string         `json:"service_id,omitempty"`
+	Generation uint64         `json:"job_generation,omitempty"`
+	Attempt    uint32         `json:"attempt,omitempty"`
+	Type       string         `json:"type"`
+	Payload    map[string]any `json:"payload"`
+	Timestamp  time.Time      `json:"timestamp"`
+	URL        string         `json:"-"`
+	Token      string         `json:"-"`
 }
 
 type Publisher interface {
@@ -49,11 +52,15 @@ func ConfigFromEnv() Config {
 		serviceID = "worker-01"
 	}
 	return Config{
-		URL:            os.Getenv("ENCODER_RECORDER_URL"),
-		Token:          os.Getenv("ENCODER_RECORDER_TOKEN"),
-		ServiceID:      serviceID,
-		Timeout:        envDuration("ENCODER_RECORDER_TIMEOUT_SEC", 5*time.Second),
-		RetryMax:       envInt("ENCODER_RECORDER_RETRY_MAX", 2),
+		URL:       os.Getenv("ENCODER_RECORDER_URL"),
+		Token:     os.Getenv("ENCODER_RECORDER_TOKEN"),
+		ServiceID: serviceID,
+		Timeout:   envDuration("ENCODER_RECORDER_TIMEOUT_SEC", 5*time.Second),
+		// Manager owns the durable bounded retry queue. Keep one HTTP attempt
+		// per logical delivery attempt by default so attempt metadata and
+		// duplicate pressure remain predictable; operators may opt into a
+		// separate bounded client retry through the environment.
+		RetryMax:       envInt("ENCODER_RECORDER_RETRY_MAX", 0),
 		RetryBaseDelay: envDuration("ENCODER_RECORDER_RETRY_BASE_DELAY_SEC", time.Second),
 	}
 }
@@ -165,15 +172,19 @@ func (c Client) publishOnce(ctx context.Context, targetURL string, body []byte, 
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return transientError{err: err}
+		class := "transport"
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			class = "timeout"
+		}
+		return transientError{err: err, class: class, retryable: true}
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		err := fmt.Errorf("encoder worker-event publish failed with status %d", res.StatusCode)
-		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
-			return transientError{err: err}
+		if res.StatusCode == http.StatusRequestTimeout || res.StatusCode == http.StatusConflict || res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
+			return transientError{err: err, status: res.StatusCode, class: "http_status", retryable: true}
 		}
-		return err
+		return transientError{err: err, status: res.StatusCode, class: "http_status"}
 	}
 	return nil
 }
@@ -198,7 +209,19 @@ func noRedirectClient() *http.Client {
 }
 
 type transientError struct {
-	err error
+	err       error
+	status    int
+	class     string
+	retryable bool
+}
+
+// NewRetryablePublishError is used by bounded-delivery adapters that need to
+// preserve the same safe retry classification as the HTTP client.
+func NewRetryablePublishError(status int, class string) error {
+	if strings.TrimSpace(class) == "" {
+		class = "http_status"
+	}
+	return transientError{err: fmt.Errorf("encoder worker-event publish failed with status %d", status), status: status, class: class, retryable: true}
 }
 
 func (e transientError) Error() string {
@@ -211,7 +234,30 @@ func (e transientError) Unwrap() error {
 
 func isTransientPublishError(err error) bool {
 	var transient transientError
-	return errors.As(err, &transient)
+	return errors.As(err, &transient) && transient.retryable
+}
+
+// IsRetryablePublishError exposes only the bounded-retry decision. Callers
+// must not log the underlying error because it may contain provider details.
+func IsRetryablePublishError(err error) bool {
+	return isTransientPublishError(err)
+}
+
+// PublishErrorMetadata returns safe, low-cardinality delivery metadata.
+func PublishErrorMetadata(err error) (class string, status int) {
+	var transient transientError
+	if errors.As(err, &transient) {
+		class = transient.class
+		status = transient.status
+		if class == "" {
+			class = "transport"
+		}
+		return class, status
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return "timeout", 0
+	}
+	return "non_retryable", 0
 }
 
 type NoopPublisher struct{}
