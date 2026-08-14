@@ -134,13 +134,14 @@ type Manager struct {
 	latestEventByKey map[string]string
 	publisherMu      sync.Mutex
 
-	startedAt                time.Time
-	stoppedOrder             []stoppedTargetReceipt
-	stoppedTargetReceiptPath string
-	events                   []events.OverlayEvent
-	eventCounts              map[string]int
-	sendFailures             int
-	maxEvents                int
+	startedAt                     time.Time
+	stoppedOrder                  []stoppedTargetReceipt
+	stoppedTargetReceiptPath      string
+	events                        []events.OverlayEvent
+	eventCounts                   map[string]int
+	sendFailures                  int
+	captionAudioStartedGeneration uint64
+	maxEvents                     int
 }
 
 type Reporter interface {
@@ -279,7 +280,13 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		apiKey := []byte(secret.Value)
 		secret.Value = ""
 		captionSession, err = factory.New(config, apiKey, func(resultCtx context.Context, transcript deepgram.Transcript) error {
+			m.report(resultCtx, stream.StreamID, "worker.caption.transcript_received", captionTranscriptStatus(transcript), captionTranscriptAttributes(transcript))
 			_, publishErr := m.CaptionTranscriptDetailedForGeneration(resultCtx, stream.StreamID, nextGeneration, transcript)
+			if publishErr != nil {
+				attributes := captionTranscriptAttributes(transcript)
+				attributes["error_class"] = classifyCaptionTranscriptError(publishErr)
+				m.report(resultCtx, stream.StreamID, "worker.caption.transcript_publish_failed", "failed", attributes)
+			}
 			return publishErr
 		})
 		zeroBytes(apiKey)
@@ -778,6 +785,38 @@ func (m *Manager) captionStartFailed(ctx context.Context, streamID, profileID, r
 	return target
 }
 
+func captionTranscriptStatus(transcript deepgram.Transcript) string {
+	if transcript.Final {
+		return "final"
+	}
+	return "interim"
+}
+
+func captionTranscriptAttributes(transcript deepgram.Transcript) map[string]any {
+	return map[string]any{
+		"final":               transcript.Final,
+		"text_length":         len([]rune(strings.TrimSpace(transcript.Text))),
+		"has_speaker_user_id": strings.TrimSpace(transcript.SpeakerUserID) != "",
+		"has_utterance_id":    strings.TrimSpace(transcript.UtteranceID) != "",
+		"revision":            transcript.Revision,
+	}
+}
+
+func classifyCaptionTranscriptError(err error) string {
+	switch {
+	case errors.Is(err, ErrJobGenerationMismatch):
+		return "job_generation_mismatch"
+	case errors.Is(err, ErrStreamStopping):
+		return "stream_stopping"
+	case errors.Is(err, ErrNoActiveStreamJob):
+		return "no_active_stream"
+	case errors.Is(err, ErrStreamIDDoesNotMatchJob):
+		return "stream_id_mismatch"
+	default:
+		return "event_publish_failed"
+	}
+}
+
 func closeCaptionSession(session CaptionSession) {
 	if session != nil {
 		_ = session.Close(context.Background())
@@ -971,11 +1010,13 @@ func (m *Manager) IngestCaptionAudioForGeneration(ctx context.Context, streamID 
 		return ErrJobGenerationMismatch
 	}
 	captionSession := m.captionSession
+	currentGeneration := m.jobGeneration
 	m.mu.Unlock()
 	if captionSession == nil {
 		return ErrCaptionNotConfigured
 	}
 	failed := false
+	accepted := 0
 	for _, packet := range packets {
 		if len(packet.Opus) == 0 {
 			return errors.New("opus packet is required")
@@ -983,6 +1024,19 @@ func (m *Manager) IngestCaptionAudioForGeneration(ctx context.Context, streamID 
 		if err := captionSession.Ingest(ctx, packet); err != nil {
 			m.report(ctx, streamID, "worker.caption.audio_failed", "failed", map[string]any{"ssrc": packet.SSRC})
 			failed = true
+			continue
+		}
+		accepted++
+	}
+	if accepted > 0 {
+		m.mu.Lock()
+		shouldReportAudioStarted := m.captionAudioStartedGeneration != currentGeneration
+		if shouldReportAudioStarted {
+			m.captionAudioStartedGeneration = currentGeneration
+		}
+		m.mu.Unlock()
+		if shouldReportAudioStarted {
+			m.report(ctx, streamID, "worker.caption.audio_started", "accepted", map[string]any{"packet_count": accepted})
 		}
 	}
 	if failed {

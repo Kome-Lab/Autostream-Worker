@@ -360,7 +360,8 @@ func TestManagerStartAppliesProfileDefaults(t *testing.T) {
 
 func TestManagerStartsSelectedCaptionProfileAndPublishesDeepgramResults(t *testing.T) {
 	pub := &fakePublisher{}
-	manager := NewManager(pub, observability.Client{})
+	reporter := &fakeReporter{}
+	manager := NewManager(pub, reporter)
 	resolveCalls := 0
 	var resolvedStreamID string
 	var resolvedName string
@@ -419,12 +420,70 @@ func TestManagerStartsSelectedCaptionProfileAndPublishesDeepgramResults(t *testi
 	if pub.events[0].Payload["speaker_user_id"] != "speaker-42" || pub.events[1].Payload["speaker_user_id"] != "speaker-42" {
 		t.Fatalf("speaker_user_id was not preserved: %#v", pub.events)
 	}
+	var sawAudioStarted, sawInterim, sawFinal bool
+	for i, name := range reporter.events {
+		if i >= len(reporter.attrs) {
+			continue
+		}
+		attrs := reporter.attrs[i]
+		switch name {
+		case "worker.caption.audio_started":
+			sawAudioStarted = attrs["packet_count"] == 1
+		case "worker.caption.transcript_received":
+			if attrs["final"] == false {
+				sawInterim = true
+			}
+			if attrs["final"] == true {
+				sawFinal = true
+			}
+		}
+	}
+	if !sawAudioStarted || !sawInterim || !sawFinal {
+		t.Fatalf("caption pipeline diagnostics were incomplete: events=%#v attrs=%#v", reporter.events, reporter.attrs)
+	}
 	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
 		t.Fatal(err)
 	}
 	if session.closed != 1 || resolveCalls != 1 {
 		t.Fatalf("unexpected caption lifecycle: closed=%d resolve_calls=%d", session.closed, resolveCalls)
 	}
+}
+
+func TestManagerReportsCaptionTranscriptPublishFailureWithoutTextLeak(t *testing.T) {
+	reporter := &fakeReporter{}
+	session := &fakeCaptionSession{}
+	manager := NewManager(&fakePublisher{err: errors.New("encoder unavailable")}, reporter)
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), CaptionSessionFactoryFunc(func(_ deepgram.Config, _ []byte, handler deepgram.Handler) (CaptionSession, error) {
+		session.handler = handler
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.handler(t.Context(), deepgram.Transcript{Text: "秘匿すべき本文", SpeakerUserID: "speaker-42", Final: true}); err == nil {
+		t.Fatal("expected encoder publish failure")
+	}
+
+	for i, name := range reporter.events {
+		if name != "worker.caption.transcript_publish_failed" || i >= len(reporter.attrs) {
+			continue
+		}
+		attrs := reporter.attrs[i]
+		if attrs["error_class"] != "event_publish_failed" || attrs["text_length"] != len([]rune("秘匿すべき本文")) {
+			t.Fatalf("unexpected caption failure diagnostic: %#v", attrs)
+		}
+		if _, leaked := attrs["text"]; leaked {
+			t.Fatal("caption text leaked into failure diagnostics")
+		}
+		if err := manager.Stop(t.Context(), "stream-01"); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	t.Fatalf("caption publish failure diagnostic was not reported: events=%#v attrs=%#v", reporter.events, reporter.attrs)
 }
 
 func TestManagerRejectsLateCaptionResultFromPreviousGeneration(t *testing.T) {
