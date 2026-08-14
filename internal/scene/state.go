@@ -257,6 +257,7 @@ func (s *Scene) Close() {
 		}
 		closeFontFace(fonts.body)
 		closeFontFace(fonts.strong)
+		closeFontFace(fonts.chatBody)
 		closeFontFace(fonts.caption)
 	}
 	s.fonts = map[int]*fontSet{}
@@ -434,12 +435,19 @@ func (s *Scene) applyParticipantsLocked(payload map[string]any) error {
 		}
 	}
 	s.participants, s.participantIDs, s.speakingIDs = participants, ids, speaking
+	s.refreshVoiceSpeakerIdentityLocked()
 	return nil
 }
 
 func (s *Scene) applyActiveSpeakerLocked(payload map[string]any) error {
 	userID := cleanText(stringValue(payload, "user_id"), 128)
-	speaking, _ := payload["speaking"].(bool)
+	// Older event producers omitted speaking on the start edge. Match the HTTP
+	// compatibility handler: a non-empty user_id without the field is a start,
+	// while an empty user_id remains the authoritative clear operation.
+	speaking := userID != ""
+	if raw, ok := payload["speaking"].(bool); ok {
+		speaking = raw
+	}
 	if !speaking && userID == "" {
 		s.speakingIDs = map[string]bool{}
 		for id, participant := range s.participants {
@@ -469,6 +477,7 @@ func (s *Scene) applyActiveSpeakerLocked(payload map[string]any) error {
 		participant.Speaking = speaking
 		s.participants[userID] = participant
 	}
+	s.refreshVoiceSpeakerIdentityLocked()
 	return nil
 }
 
@@ -525,11 +534,7 @@ func (s *Scene) applyCaptionLocked(payload map[string]any, now time.Time, final 
 	utteranceID := cleanText(stringValue(payload, "utterance_id"), 160)
 	revision := intValue(payload, "revision")
 	speakerName := cleanText(preferredString(payload, "speaker_display_name", "display_name"), 80)
-	if speakerName == "" {
-		if participant, ok := s.participants[speakerUserID]; ok {
-			speakerName = participant.DisplayName
-		}
-	}
+	speakerUserID, speakerName = s.resolveCaptionSpeakerLocked(speakerUserID, speakerName)
 	avatarURL := ""
 	isBot := false
 	if participant, ok := s.participants[speakerUserID]; ok {
@@ -538,7 +543,7 @@ func (s *Scene) applyCaptionLocked(payload map[string]any, now time.Time, final 
 		}
 		avatarURL, isBot = participant.AvatarURL, participant.IsBot
 	}
-	if speakerName == "" {
+	if speakerName == "" && speakerUserID != "" {
 		speakerName = speakerUserID
 	}
 	sameCaptionIndex := -1
@@ -697,6 +702,91 @@ func (s *Scene) upsertConversationVoiceLocked(utteranceID, speakerUserID, speake
 		utteranceID = speakerUserID + ":active"
 	}
 	s.insertConversationLocked(ConversationItem{ID: "voice:" + utteranceID, Kind: "voice", AuthorID: speakerUserID, DisplayName: speakerName, AvatarURL: avatarURL, IsBot: isBot, Text: text, Final: final, Revision: revision, CreatedAt: createdAt, ExpiresAt: expiresAt})
+}
+
+func (s *Scene) resolveCaptionSpeakerLocked(userID, speakerName string) (string, string) {
+	userID = strings.TrimSpace(userID)
+	speakerName = strings.TrimSpace(speakerName)
+	if userID == "" {
+		userID = s.uniqueVoiceSpeakerLocked()
+	}
+	if participant, ok := s.participants[userID]; ok {
+		if isUnknownSpeakerName(speakerName) || speakerName == userID {
+			speakerName = participant.DisplayName
+		}
+	}
+	return userID, speakerName
+}
+
+func (s *Scene) uniqueVoiceSpeakerLocked() string {
+	candidate := ""
+	for userID, speaking := range s.speakingIDs {
+		if !speaking {
+			continue
+		}
+		if _, ok := s.participants[userID]; !ok {
+			continue
+		}
+		if candidate != "" {
+			return ""
+		}
+		candidate = userID
+	}
+	if candidate != "" {
+		return candidate
+	}
+	if len(s.participantIDs) == 1 {
+		return s.participantIDs[0]
+	}
+	return ""
+}
+
+func isUnknownSpeakerName(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "" || strings.EqualFold(value, "MIC")
+}
+
+func (s *Scene) refreshVoiceSpeakerIdentityLocked() {
+	for index := range s.captions {
+		caption := s.captions[index]
+		userID, speakerName := s.resolveCaptionSpeakerLocked(caption.SpeakerUserID, caption.SpeakerName)
+		if userID == "" {
+			continue
+		}
+		participant, ok := s.participants[userID]
+		if !ok {
+			continue
+		}
+		caption.SpeakerUserID = userID
+		if isUnknownSpeakerName(speakerName) || speakerName == userID {
+			speakerName = participant.DisplayName
+		}
+		caption.SpeakerName = speakerName
+		s.captions[index] = caption
+	}
+	for index := range s.conversation {
+		item := s.conversation[index]
+		if item.Kind != "voice" {
+			continue
+		}
+		userID := strings.TrimSpace(item.AuthorID)
+		if userID == "" {
+			userID = s.uniqueVoiceSpeakerLocked()
+		}
+		participant, ok := s.participants[userID]
+		if !ok {
+			continue
+		}
+		item.AuthorID = userID
+		if isUnknownSpeakerName(item.DisplayName) || item.DisplayName == userID {
+			item.DisplayName = participant.DisplayName
+		}
+		if item.AvatarURL == "" {
+			item.AvatarURL = participant.AvatarURL
+		}
+		item.IsBot = participant.IsBot
+		s.conversation[index] = item
+	}
 }
 
 func (s *Scene) Render(at time.Time) (*image.RGBA, error) {

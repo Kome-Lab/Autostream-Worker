@@ -129,8 +129,8 @@ func drawChat(img *image.RGBA, area image.Rectangle, messages []ChatMessage, con
 	for i := len(items) - 1; i >= 0; i-- {
 		item := items[i]
 		contentWidth := availableWidth - avatarSize - px(38)
-		lines := wrapText(item.Text, contentWidth, fonts.body, 3)
-		cardHeight := maxInt(avatarSize+px(20), fonts.strongHeight+fonts.bodyHeight*len(lines)+px(28))
+		lines := wrapText(item.Text, contentWidth, fonts.chatBody, 3)
+		cardHeight := maxInt(avatarSize+px(20), fonts.strongHeight+fonts.chatBodyHeight*len(lines)+px(28))
 		if y+cardHeight > area.Max.Y-padding {
 			break
 		}
@@ -139,21 +139,39 @@ func drawChat(img *image.RGBA, area image.Rectangle, messages []ChatMessage, con
 		avatar := avatars.Lookup(item.AvatarURL)
 		drawAvatar(img, card.Min.X+px(10), card.Min.Y+px(10), avatarSize, avatar, false)
 		textX := card.Min.X + avatarSize + px(22)
-		name := item.DisplayName
-		if item.Kind == "voice" {
-			name = "MIC  " + name
+		name := strings.TrimSpace(item.DisplayName)
+		if name == "" {
+			name = "MIC"
 		}
 		if item.IsBot {
 			name += "  BOT"
 		}
-		drawTextClipped(img, textX, card.Min.Y+px(10)+fonts.strongHeight, name, card.Max.X-textX-px(10), textColor, fonts.strong)
-		lineY := card.Min.Y + px(18) + fonts.strongHeight + fonts.bodyHeight
+		timestamp := formatConversationTimestamp(item.CreatedAt)
+		nameWidth := card.Max.X - textX - px(10)
+		if timestamp != "" {
+			nameWidth -= measureText(fonts.body, timestamp) + px(8)
+		}
+		nameToDraw := truncateText(name, nameWidth, fonts.strong)
+		nameBaseline := card.Min.Y + px(10) + fonts.strongHeight
+		drawText(img, textX, nameBaseline, nameToDraw, textColor, fonts.strong)
+		if timestamp != "" {
+			timestampX := textX + measureText(fonts.strong, nameToDraw) + px(8)
+			drawText(img, timestampX, nameBaseline, timestamp, mutedColor, fonts.body)
+		}
+		lineY := card.Min.Y + px(18) + fonts.strongHeight + fonts.chatBodyHeight
 		for _, line := range lines {
-			drawText(img, textX, lineY, line, color.RGBA{229, 231, 235, 255}, fonts.body)
-			lineY += fonts.bodyHeight
+			drawText(img, textX, lineY, line, color.RGBA{229, 231, 235, 255}, fonts.chatBody)
+			lineY += fonts.chatBodyHeight
 		}
 		y += cardHeight + cardGap
 	}
+}
+
+func formatConversationTimestamp(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.In(jstLocation()).Format("15:04:05")
 }
 
 func conversationItems(messages []ChatMessage, conversation []ConversationItem) []ConversationItem {
@@ -225,9 +243,12 @@ func drawCaptions(img *image.RGBA, area image.Rectangle, captions []Caption, par
 	lines := make([]string, 0, 3)
 	for i := len(captions) - 1; i >= 0 && len(lines) < 3; i-- {
 		caption := captions[i]
-		prefix := ""
-		if caption.SpeakerUserID != "" {
+		prefix := strings.TrimSpace(caption.SpeakerName)
+		if isUnknownSpeakerName(prefix) || prefix == caption.SpeakerUserID {
 			prefix = participantName(caption.SpeakerUserID, participants)
+		}
+		if prefix == "" {
+			prefix = "MIC"
 		}
 		line := caption.Text
 		if prefix != "" {
@@ -270,7 +291,7 @@ func drawAvatar(dst *image.RGBA, x, y, size int, source image.Image, speaking bo
 		ring = speakingGreen
 	}
 	drawCircle(dst, x, y, size, ring)
-	inset := maxInt(size/12, 2)
+	inset := maxInt(size/8, 3)
 	inner := size - inset*2
 	drawCircle(dst, x+inset, y+inset, inner, color.RGBA{55, 65, 81, 255})
 	if source == nil || source.Bounds().Empty() || inner <= 0 {

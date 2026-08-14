@@ -14,12 +14,14 @@ import (
 const maxFontBytes = 64 << 20
 
 type fontSet struct {
-	body          font.Face
-	strong        font.Face
-	caption       font.Face
-	bodyHeight    int
-	strongHeight  int
-	captionHeight int
+	body           font.Face
+	strong         font.Face
+	chatBody       font.Face
+	caption        font.Face
+	bodyHeight     int
+	strongHeight   int
+	chatBodyHeight int
+	captionHeight  int
 }
 
 func loadFontSet(path string, scale float64) (*fontSet, error) {
@@ -61,15 +63,22 @@ func loadFontSet(path string, scale float64) (*fontSet, error) {
 		closeFontFace(body)
 		return nil, fmt.Errorf("create scene strong font: %w", err)
 	}
+	chatBody, err := newFontFace(parsed, maxFloat(16, 30*scale))
+	if err != nil {
+		closeFontFace(body)
+		closeFontFace(strong)
+		return nil, fmt.Errorf("create scene chat body font: %w", err)
+	}
 	caption, err := newFontFace(parsed, maxFloat(17, 34*scale))
 	if err != nil {
 		closeFontFace(body)
 		closeFontFace(strong)
+		closeFontFace(chatBody)
 		return nil, fmt.Errorf("create scene caption font: %w", err)
 	}
 	return &fontSet{
-		body: body, strong: strong, caption: caption,
-		bodyHeight: faceHeight(body), strongHeight: faceHeight(strong), captionHeight: faceHeight(caption),
+		body: body, strong: strong, chatBody: chatBody, caption: caption,
+		bodyHeight: faceHeight(body), strongHeight: faceHeight(strong), chatBodyHeight: faceHeight(chatBody), captionHeight: faceHeight(caption),
 	}, nil
 }
 

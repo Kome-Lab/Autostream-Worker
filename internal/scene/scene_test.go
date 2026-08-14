@@ -71,6 +71,42 @@ func TestSceneReducesCanonicalEventsAndRendersSupportedSizes(t *testing.T) {
 	}
 }
 
+func TestSceneDefaultsActiveSpeakerStartAndClearsIt(t *testing.T) {
+	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
+	s := newTestScene(t, 854, 480, now)
+	s.Reset(1, "stream-01", "Dev")
+	apply(t, s, events.CustomOverlayEvent("stream-01", "overlay.participants", map[string]any{
+		"participants": []any{map[string]any{"user_id": "user-01", "display_name": "Alice"}},
+	}, now))
+	apply(t, s, events.CustomOverlayEvent("stream-01", "overlay.active_speaker", map[string]any{
+		"user_id": "user-01",
+	}, now))
+	if got := s.Snapshot(now); len(got.Participants) != 1 || !got.Participants[0].Speaking {
+		t.Fatalf("omitted speaking field must default to an active speaker: %#v", got.Participants)
+	}
+	apply(t, s, events.CustomOverlayEvent("stream-01", "overlay.active_speaker", map[string]any{
+		"user_id": "user-01", "speaking": false,
+	}, now))
+	if got := s.Snapshot(now); len(got.Participants) != 1 || got.Participants[0].Speaking {
+		t.Fatalf("explicit stop must clear the active speaker: %#v", got.Participants)
+	}
+}
+
+func TestConversationTimestampUsesJSTAndChatBodyIsLargerThanUsername(t *testing.T) {
+	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
+	s := newTestScene(t, 854, 480, now)
+	fonts, err := s.fontsForHeight(480)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fonts.chatBodyHeight <= fonts.strongHeight {
+		t.Fatalf("chat body font must be larger than username font: body=%d strong=%d", fonts.chatBodyHeight, fonts.strongHeight)
+	}
+	if got := formatConversationTimestamp(now); got != "12:04:05" {
+		t.Fatalf("conversation timestamp = %q, want JST time", got)
+	}
+}
+
 func TestSceneBoundsDeduplicatesAndExpiresChatAndCaptions(t *testing.T) {
 	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
 	s := newTestSceneWithConfig(t, Config{
@@ -139,6 +175,60 @@ func TestSceneConvergesVoiceInterimAndFinalIntoUnifiedConversation(t *testing.T)
 	got = s.Snapshot(now.Add(3 * time.Second))
 	if len(got.Conversation) != 2 || got.Conversation[1].Text != "hello world" || !got.Conversation[1].Final || len(got.Captions) != 1 {
 		t.Fatalf("stale caption delivery reopened or duplicated state: %#v captions=%#v", got.Conversation, got.Captions)
+	}
+}
+
+func TestSceneResolvesVoiceSpeakerIdentityFromParticipants(t *testing.T) {
+	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
+	s := newTestScene(t, 854, 480, now)
+	s.Reset(1, "stream-01", "Dev")
+	apply(t, s, events.CustomOverlayEvent("stream-01", "overlay.participants", map[string]any{
+		"participants": []any{map[string]any{"user_id": "user-01", "display_name": "Alice", "avatar_url": "https://cdn.discordapp.com/avatars/user-01/a.png"}},
+	}, now))
+	apply(t, s, events.CaptionTranscriptEvent("stream-01", "hello", "user-01", "utt-01", "deepgram", 1, false, now, now, time.Time{}, 0.9, "", now))
+
+	got := s.Snapshot(now)
+	if len(got.Captions) != 1 || got.Captions[0].SpeakerName != "Alice" {
+		t.Fatalf("caption speaker identity = %#v, want Alice", got.Captions)
+	}
+	if len(got.Conversation) != 1 || got.Conversation[0].DisplayName != "Alice" || got.Conversation[0].AvatarURL == "" {
+		t.Fatalf("conversation speaker identity = %#v, want Alice with avatar", got.Conversation)
+	}
+}
+
+func TestSceneResolvesUnidentifiedVoiceToUniqueParticipant(t *testing.T) {
+	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
+	s := newTestScene(t, 854, 480, now)
+	s.Reset(1, "stream-01", "Dev")
+	apply(t, s, events.CustomOverlayEvent("stream-01", "overlay.participants", map[string]any{
+		"participants": []any{map[string]any{"user_id": "user-01", "display_name": "Alice"}},
+	}, now))
+	apply(t, s, events.CaptionTranscriptEvent("stream-01", "hello", "", "utt-01", "deepgram", 1, false, now, now, time.Time{}, 0.9, "", now))
+
+	got := s.Snapshot(now)
+	if len(got.Captions) != 1 || got.Captions[0].SpeakerUserID != "user-01" || got.Captions[0].SpeakerName != "Alice" {
+		t.Fatalf("unidentified caption did not resolve: %#v", got.Captions)
+	}
+	if len(got.Conversation) != 1 || got.Conversation[0].DisplayName != "Alice" {
+		t.Fatalf("unidentified conversation did not resolve: %#v", got.Conversation)
+	}
+}
+
+func TestSceneRefreshesVoiceSpeakerAfterParticipantsArrive(t *testing.T) {
+	now := time.Date(2026, 8, 12, 3, 4, 5, 0, time.UTC)
+	s := newTestScene(t, 854, 480, now)
+	s.Reset(1, "stream-01", "Dev")
+	apply(t, s, events.CaptionTranscriptEvent("stream-01", "hello", "user-01", "utt-01", "deepgram", 1, false, now, now, time.Time{}, 0.9, "", now))
+	apply(t, s, events.CustomOverlayEvent("stream-01", "overlay.participants", map[string]any{
+		"participants": []any{map[string]any{"user_id": "user-01", "display_name": "Alice"}},
+	}, now))
+
+	got := s.Snapshot(now)
+	if len(got.Captions) != 1 || got.Captions[0].SpeakerName != "Alice" {
+		t.Fatalf("caption was not refreshed: %#v", got.Captions)
+	}
+	if len(got.Conversation) != 1 || got.Conversation[0].DisplayName != "Alice" {
+		t.Fatalf("conversation was not refreshed: %#v", got.Conversation)
 	}
 }
 
