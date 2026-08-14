@@ -42,6 +42,51 @@ func TestManagerSendsJPEGSceneFramesDirectlyWithoutVideoEncoding(t *testing.T) {
 	}
 }
 
+func TestManagerStopWaitsForInFlightJPEGWriteBeforeClosingSRT(t *testing.T) {
+	conn := newBlockingSRTConn()
+	manager := NewManager(staticFrameSource{frame: image.NewRGBA(image.Rect(0, 0, 4, 2))}, Options{
+		Dialer: staticDialer{conn: conn}, StartupTimeout: time.Second, FrameInterval: time.Millisecond,
+	})
+	if err := manager.Start(t.Context(), validTestConfig()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-conn.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for an in-flight JPEG write")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- manager.Stop(t.Context())
+	}()
+	select {
+	case <-conn.closedSignal:
+		t.Fatal("SRT connection closed before the in-flight JPEG write completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(conn.releaseWrite)
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for graceful SRT stop")
+	}
+
+	frames := conn.Frames()
+	if len(frames) < 2 {
+		t.Fatalf("expected at least two complete JPEG frames, got %d", len(frames))
+	}
+	for index, frame := range frames {
+		if _, err := jpeg.Decode(bytes.NewReader(frame)); err != nil {
+			t.Fatalf("SRT frame %d is truncated: %v", index+1, err)
+		}
+	}
+}
+
 func TestManagerStartFailsIfFrameShapeDoesNotMatchContract(t *testing.T) {
 	conn := &recordingSRTConn{}
 	manager := NewManager(staticFrameSource{frame: image.NewRGBA(image.Rect(0, 0, 3, 2))}, Options{
@@ -142,6 +187,73 @@ type recordingSRTConn struct {
 	closed          bool
 	writes          int
 	failAfterWrites int
+}
+
+type blockingSRTConn struct {
+	mu             sync.Mutex
+	data           bytes.Buffer
+	writes         int
+	closed         bool
+	frames         [][]byte
+	writeStarted   chan struct{}
+	releaseWrite   chan struct{}
+	closedSignal   chan struct{}
+	writeStartOnce sync.Once
+	closeOnce      sync.Once
+}
+
+func newBlockingSRTConn() *blockingSRTConn {
+	return &blockingSRTConn{
+		writeStarted: make(chan struct{}),
+		releaseWrite: make(chan struct{}),
+		closedSignal: make(chan struct{}),
+	}
+}
+
+func (c *blockingSRTConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.writes++
+	writeNumber := c.writes
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return 0, io.ErrClosedPipe
+	}
+	if writeNumber == 2 {
+		c.writeStartOnce.Do(func() { close(c.writeStarted) })
+		<-c.releaseWrite
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return 0, io.ErrClosedPipe
+	}
+	c.frames = append(c.frames, append([]byte(nil), p...))
+	return c.data.Write(p)
+}
+
+func (c *blockingSRTConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	c.closeOnce.Do(func() { close(c.closedSignal) })
+	return nil
+}
+
+func (c *blockingSRTConn) Data() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.data.Bytes()...)
+}
+
+func (c *blockingSRTConn) Frames() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	frames := make([][]byte, len(c.frames))
+	for index, frame := range c.frames {
+		frames[index] = append([]byte(nil), frame...)
+	}
+	return frames
 }
 
 func (c *recordingSRTConn) Write(p []byte) (int, error) {

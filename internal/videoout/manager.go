@@ -95,6 +95,8 @@ type session struct {
 	first      chan struct{}
 	done       chan struct{}
 	bytes      atomic.Uint64
+	stopping   atomic.Bool
+	writeMu    sync.Mutex
 	firstOnce  sync.Once
 	stopOnce   sync.Once
 }
@@ -308,6 +310,11 @@ func (m *Manager) renderFrame(s *session, config Config) error {
 	if encoded.Len() <= 0 || encoded.Len() > maxEncodedFrameBytes {
 		return ErrJPEGSize
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.stopping.Load() {
+		return ErrTransportStopped
+	}
 	if err := writeFull(s.conn, encoded.Bytes()); err != nil {
 		return ErrSRTWrite
 	}
@@ -348,9 +355,25 @@ func (s *session) signalError(err error) {
 func (s *session) shutdown(ctx context.Context) error {
 	var shutdownErr error
 	s.stopOnce.Do(func() {
+		s.stopping.Store(true)
 		s.cancel()
+		writerIdle := make(chan struct{})
+		go func() {
+			s.writeMu.Lock()
+			s.writeMu.Unlock()
+			close(writerIdle)
+		}()
+		writerCompleted := true
+		select {
+		case <-writerIdle:
+		case <-ctx.Done():
+			writerCompleted = false
+		}
 		if err := s.conn.Close(); err != nil {
 			shutdownErr = err
+		}
+		if !writerCompleted && shutdownErr == nil {
+			shutdownErr = ctx.Err()
 		}
 		select {
 		case <-s.done:
