@@ -542,7 +542,8 @@ func TestManagerDoesNotEnableCaptionWithoutExplicitProfileID(t *testing.T) {
 }
 
 func TestManagerProcessesNextCaptionPacketAfterSendFailure(t *testing.T) {
-	manager := NewManager(&fakePublisher{}, observability.Client{})
+	reporter := &fakeReporter{}
+	manager := NewManager(&fakePublisher{}, reporter)
 	session := &fakeCaptionSession{ingestErrors: []error{errors.New("first send failed")}}
 	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
 		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
@@ -563,6 +564,42 @@ func TestManagerProcessesNextCaptionPacketAfterSendFailure(t *testing.T) {
 	}
 	if session.ingestCalls != 2 || len(session.packets) != 1 || session.packets[0].Sequence != 2 {
 		t.Fatalf("next packet was not processed after send failure: calls=%d packets=%#v", session.ingestCalls, session.packets)
+	}
+	for i, name := range reporter.events {
+		if name != "worker.caption.audio_failed" || i >= len(reporter.attrs) {
+			continue
+		}
+		attrs := reporter.attrs[i]
+		if attrs["error_class"] != "caption_audio_ingest_failed" {
+			t.Fatalf("unexpected caption audio error class: %#v", attrs)
+		}
+		if _, leaked := attrs["error"]; leaked {
+			t.Fatalf("raw caption audio error leaked: %#v", attrs)
+		}
+		return
+	}
+	t.Fatalf("caption audio failure diagnostic was not reported: events=%#v attrs=%#v", reporter.events, reporter.attrs)
+}
+
+func TestClassifyCaptionAudioErrorUsesSafeStableClasses(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "canceled", err: context.Canceled, want: "context_canceled"},
+		{name: "deadline", err: context.DeadlineExceeded, want: "context_deadline"},
+		{name: "empty audio", err: deepgram.ErrEmptyAudio, want: "invalid_audio"},
+		{name: "closed", err: deepgram.ErrClosed, want: "deepgram_session_closed"},
+		{name: "unavailable", err: deepgram.ErrUnavailable, want: "deepgram_unavailable"},
+		{name: "unknown", err: errors.New("secret endpoint must not be logged"), want: "caption_audio_ingest_failed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyCaptionAudioError(tt.err); got != tt.want {
+				t.Fatalf("classifyCaptionAudioError() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

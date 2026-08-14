@@ -817,6 +817,26 @@ func classifyCaptionTranscriptError(err error) string {
 	}
 }
 
+// classifyCaptionAudioError intentionally returns only a stable, safe class.
+// Deepgram's transport errors can contain endpoint details, while the packet
+// itself may carry user-associated identifiers; neither belongs in telemetry.
+func classifyCaptionAudioError(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline"
+	case errors.Is(err, deepgram.ErrEmptyAudio):
+		return "invalid_audio"
+	case errors.Is(err, deepgram.ErrClosed):
+		return "deepgram_session_closed"
+	case errors.Is(err, deepgram.ErrUnavailable):
+		return "deepgram_unavailable"
+	default:
+		return "caption_audio_ingest_failed"
+	}
+}
+
 func closeCaptionSession(session CaptionSession) {
 	if session != nil {
 		_ = session.Close(context.Background())
@@ -1022,7 +1042,10 @@ func (m *Manager) IngestCaptionAudioForGeneration(ctx context.Context, streamID 
 			return errors.New("opus packet is required")
 		}
 		if err := captionSession.Ingest(ctx, packet); err != nil {
-			m.report(ctx, streamID, "worker.caption.audio_failed", "failed", map[string]any{"ssrc": packet.SSRC})
+			m.report(ctx, streamID, "worker.caption.audio_failed", "failed", map[string]any{
+				"ssrc":        packet.SSRC,
+				"error_class": classifyCaptionAudioError(err),
+			})
 			failed = true
 			continue
 		}
