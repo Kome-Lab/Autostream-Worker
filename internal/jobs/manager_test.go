@@ -191,6 +191,77 @@ func TestManagerVideoOutputFailureClearsOnlyMatchingActiveJob(t *testing.T) {
 	}
 }
 
+func TestManagerVideoOutputFailureFencesRearmUntilCaptionShutdown(t *testing.T) {
+	oldSession := &closeBlockingCaptionSession{
+		closeStarted: make(chan struct{}),
+		releaseClose: make(chan struct{}),
+	}
+	newSession := &fakeCaptionSession{}
+	sessions := []CaptionSession{oldSession, newSession}
+	factoryCalls := 0
+	output := &fakeVideoOutput{}
+	manager := NewManager(&fakePublisher{}, observability.Client{})
+	manager.SetSceneRenderer(&fakeSceneRenderer{})
+	manager.SetVideoOutput(output)
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error) {
+		session := sessions[factoryCalls]
+		factoryCalls++
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	oldStream := StreamContext{
+		StreamID: "stream-01", CaptionProfileID: "caption-01", EncoderProfileID: "encoder-profile-01",
+		VideoIngestURL: "srt://encoder.example:10080", VideoIngestPassphrase: "0123456789abcdef0123456789abcdef", VideoIngestPBKeylen: 32,
+	}
+	if err := manager.Start(t.Context(), oldStream); err != nil {
+		t.Fatal(err)
+	}
+
+	failureDone := make(chan struct{})
+	go func() {
+		manager.HandleVideoOutputFailure(oldStream.StreamID, output.scenes[0].Generation, "srt_write")
+		close(failureDone)
+	}()
+	select {
+	case <-oldSession.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("video failure did not begin old caption shutdown")
+	}
+
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- manager.Start(t.Context(), StreamContext{StreamID: oldStream.StreamID, CaptionProfileID: "caption-01"})
+	}()
+	select {
+	case err := <-startDone:
+		close(oldSession.releaseClose)
+		t.Fatalf("rearm crossed the old caption shutdown fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(oldSession.releaseClose)
+	select {
+	case <-failureDone:
+	case <-time.After(time.Second):
+		t.Fatal("video failure did not finish after caption shutdown")
+	}
+	select {
+	case err := <-startDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rearm did not proceed after caption shutdown")
+	}
+	if got := manager.CurrentStreamID(); got != oldStream.StreamID {
+		t.Fatalf("unexpected active stream after fenced rearm: %q", got)
+	}
+	if err := manager.Stop(t.Context(), oldStream.StreamID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManagerVideoOutputFailureFailsClosedWhenStoppedReceiptCannotPersist(t *testing.T) {
 	scene := &fakeSceneRenderer{}
 	output := &fakeVideoOutput{}
@@ -260,6 +331,113 @@ type fakeCaptionSession struct {
 	err          error
 	ingestCalls  int
 	ingestErrors []error
+}
+
+type controlledCaptionSession struct {
+	mu      sync.Mutex
+	packets []deepgram.AudioPacket
+	started chan struct{}
+	block   bool
+	once    sync.Once
+	closed  int
+}
+
+type retryCaptionSession struct {
+	mu                sync.Mutex
+	failuresRemaining int
+	calls             int
+	packets           []deepgram.AudioPacket
+	called            chan struct{}
+}
+
+type closeBlockingCaptionSession struct {
+	closeStarted chan struct{}
+	releaseClose chan struct{}
+	closeOnce    sync.Once
+}
+
+func (*closeBlockingCaptionSession) Ingest(context.Context, deepgram.AudioPacket) error {
+	return nil
+}
+
+func (s *closeBlockingCaptionSession) Close(ctx context.Context) error {
+	s.closeOnce.Do(func() { close(s.closeStarted) })
+	select {
+	case <-s.releaseClose:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *retryCaptionSession) Ingest(_ context.Context, packet deepgram.AudioPacket) error {
+	s.mu.Lock()
+	s.calls++
+	failed := s.failuresRemaining > 0
+	if failed {
+		s.failuresRemaining--
+	} else {
+		s.packets = append(s.packets, packet)
+	}
+	s.mu.Unlock()
+	select {
+	case s.called <- struct{}{}:
+	default:
+	}
+	if failed {
+		return deepgram.ErrUnavailable
+	}
+	return nil
+}
+
+func (*retryCaptionSession) Close(context.Context) error { return nil }
+
+func (s *retryCaptionSession) snapshot() (int, []deepgram.AudioPacket) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, append([]deepgram.AudioPacket(nil), s.packets...)
+}
+
+func waitForCaptionSessionCalls(t *testing.T, session *retryCaptionSession, want int) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		calls, _ := session.snapshot()
+		if calls >= want {
+			return
+		}
+		select {
+		case <-session.called:
+		case <-deadline.C:
+			t.Fatalf("caption session calls = %d, want at least %d", calls, want)
+		}
+	}
+}
+
+func (s *controlledCaptionSession) Ingest(ctx context.Context, packet deepgram.AudioPacket) error {
+	s.mu.Lock()
+	s.packets = append(s.packets, packet)
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.started) })
+	if !s.block {
+		return nil
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (s *controlledCaptionSession) Close(context.Context) error {
+	s.mu.Lock()
+	s.closed++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *controlledCaptionSession) snapshot() ([]deepgram.AudioPacket, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]deepgram.AudioPacket(nil), s.packets...), s.closed
 }
 
 func (s *fakeCaptionSession) Ingest(_ context.Context, packet deepgram.AudioPacket) error {
@@ -581,6 +759,248 @@ func TestManagerProcessesNextCaptionPacketAfterSendFailure(t *testing.T) {
 	t.Fatalf("caption audio failure diagnostic was not reported: events=%#v attrs=%#v", reporter.events, reporter.attrs)
 }
 
+func TestManagerCaptionIngressQueueIsBounded(t *testing.T) {
+	session := &controlledCaptionSession{started: make(chan struct{}), block: true}
+	manager := NewManager(&fakePublisher{}, observability.Client{})
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error) {
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	generation := manager.Status().JobGeneration
+	packet := func(sequence uint16) []deepgram.AudioPacket {
+		return []deepgram.AudioPacket{{SSRC: 42, UserID: "speaker-42", JobGeneration: generation, ConnectionGeneration: 1, Sequence: sequence, Opus: []byte{1}}}
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packet(1)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-session.started:
+	case <-time.After(time.Second):
+		t.Fatal("caption provider ingest did not block")
+	}
+	for i := 0; i < captionAudioQueueBatches; i++ {
+		if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packet(uint16(i+2))); err != nil {
+			t.Fatalf("queue rejected batch %d before the configured bound: %v", i+1, err)
+		}
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packet(500)); !errors.Is(err, ErrCaptionAudioQueueFull) {
+		t.Fatalf("queue did not reject overflow: %v", err)
+	}
+	status := manager.Status()
+	if status.CaptionAudioQueueBatches != captionAudioQueueBatches || status.CaptionAudioQueuePackets != captionAudioQueueBatches || status.CaptionAudioQueueDrops != 1 {
+		t.Fatalf("unexpected bounded caption queue status: %#v", status)
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := manager.Stop(stopCtx, "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerCaptionIngressRequiresGenerationAndRetriesOnlyFailedPackets(t *testing.T) {
+	session := &retryCaptionSession{failuresRemaining: 1, called: make(chan struct{}, 8)}
+	manager := NewManager(&fakePublisher{}, observability.Client{})
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error) {
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	packet := []deepgram.AudioPacket{{SSRC: 42, UserID: "speaker-42", ConnectionGeneration: 1, Sequence: 1, Opus: []byte{1}}}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", 0, packet); !errors.Is(err, ErrCaptionAudioGenerationRequired) {
+		t.Fatalf("zero generation was not rejected: %v", err)
+	}
+	generation := manager.Status().JobGeneration
+	packet[0].JobGeneration = generation
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packet); err != nil {
+		t.Fatal(err)
+	}
+	waitForCaptionSessionCalls(t, session, 2)
+	calls, packets := session.snapshot()
+	if calls != 2 || len(packets) != 1 || packets[0].Sequence != 1 || packets[0].JobGeneration != generation {
+		t.Fatalf("failed packet retry did not converge exactly once: calls=%d packets=%#v", calls, packets)
+	}
+	status := manager.Status()
+	if status.CaptionAudioRetries != 1 || status.CaptionAudioProviderDrops != 0 {
+		t.Fatalf("unexpected caption retry status: %#v", status)
+	}
+	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerCaptionIngressCountsFinalProviderDrop(t *testing.T) {
+	session := &retryCaptionSession{failuresRemaining: 10, called: make(chan struct{}, 8)}
+	manager := NewManager(&fakePublisher{}, observability.Client{})
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error) {
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	generation := manager.Status().JobGeneration
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, []deepgram.AudioPacket{{SSRC: 42, UserID: "speaker-42", JobGeneration: generation, ConnectionGeneration: 1, Sequence: 1, Opus: []byte{1}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForCaptionSessionCalls(t, session, captionAudioRetryMax)
+	deadline := time.Now().Add(time.Second)
+	for manager.Status().CaptionAudioProviderDrops == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	status := manager.Status()
+	if status.CaptionAudioRetries != captionAudioRetryMax-1 || status.CaptionAudioProviderDrops != 1 {
+		t.Fatalf("unexpected final caption drop status: %#v", status)
+	}
+	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerCancelsQueuedCaptionAudioAcrossStopAndRearm(t *testing.T) {
+	oldSession := &controlledCaptionSession{started: make(chan struct{}), block: true}
+	newSession := &controlledCaptionSession{started: make(chan struct{})}
+	sessions := []*controlledCaptionSession{oldSession, newSession}
+	factoryCalls := 0
+	manager := NewManager(&fakePublisher{}, observability.Client{})
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error) {
+		session := sessions[factoryCalls]
+		factoryCalls++
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	oldGeneration := manager.Status().JobGeneration
+	oldFirst := []deepgram.AudioPacket{{SSRC: 42, UserID: "speaker-42", JobGeneration: oldGeneration, ConnectionGeneration: 1, Sequence: 1, Opus: []byte{1}}}
+	oldQueued := []deepgram.AudioPacket{{SSRC: 42, UserID: "speaker-42", JobGeneration: oldGeneration, ConnectionGeneration: 1, Sequence: 2, Opus: []byte{2}}}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", oldGeneration, oldFirst); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-oldSession.started:
+	case <-time.After(time.Second):
+		t.Fatal("old generation did not enter provider ingest")
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", oldGeneration, oldQueued); err != nil {
+		t.Fatal(err)
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+	if err := manager.Stop(stopCtx, "stream-01"); err != nil {
+		stopCancel()
+		t.Fatal(err)
+	}
+	stopCancel()
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	newGeneration := manager.Status().JobGeneration
+	if newGeneration == oldGeneration {
+		t.Fatalf("rearm did not advance generation: old=%d new=%d", oldGeneration, newGeneration)
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", oldGeneration, oldQueued); !errors.Is(err, ErrJobGenerationMismatch) {
+		t.Fatalf("old generation was not rejected after rearm: %v", err)
+	}
+	newPacket := []deepgram.AudioPacket{{SSRC: 84, UserID: "speaker-84", JobGeneration: newGeneration, ConnectionGeneration: 1, Sequence: 3, Opus: []byte{3}}}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", newGeneration, newPacket); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-newSession.started:
+	case <-time.After(time.Second):
+		t.Fatal("new generation caption audio was not processed")
+	}
+	oldPackets, oldClosed := oldSession.snapshot()
+	newPackets, _ := newSession.snapshot()
+	if len(oldPackets) != 1 || oldPackets[0].Sequence != 1 || oldClosed != 1 {
+		t.Fatalf("queued old generation crossed the stop boundary: packets=%#v closed=%d", oldPackets, oldClosed)
+	}
+	if len(newPackets) != 1 || newPackets[0].Sequence != 3 {
+		t.Fatalf("new generation received unexpected packets: %#v", newPackets)
+	}
+	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerSupersedesOlderConnectionGenerationQueue(t *testing.T) {
+	session := &controlledCaptionSession{started: make(chan struct{}), block: true}
+	manager := NewManager(&fakePublisher{}, observability.Client{})
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error) {
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	generation := manager.Status().JobGeneration
+	packet := func(connectionGeneration uint64, sequence uint16) []deepgram.AudioPacket {
+		return []deepgram.AudioPacket{{
+			SSRC:                 42,
+			UserID:               "speaker-42",
+			JobGeneration:        generation,
+			ConnectionGeneration: connectionGeneration,
+			Sequence:             sequence,
+			Opus:                 []byte{1},
+		}}
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packet(1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-session.started:
+	case <-time.After(time.Second):
+		t.Fatal("old connection generation did not enter provider ingest")
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packet(1, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packet(2, 3)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		packets, _ := session.snapshot()
+		if len(packets) >= 2 {
+			if packets[0].Sequence != 1 || packets[1].Sequence != 3 {
+				t.Fatalf("superseded queue reached provider: %#v", packets)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("new connection generation did not reach provider: %#v", packets)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packet(1, 4)); !errors.Is(err, ErrCaptionAudioConnectionGenerationStale) {
+		t.Fatalf("older connection generation was not rejected: %v", err)
+	}
+	status := manager.Status()
+	if status.CaptionAudioConnectionGeneration != 2 || status.CaptionAudioSupersededDrops != 1 {
+		t.Fatalf("unexpected connection generation status: %#v", status)
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := manager.Stop(stopCtx, "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClassifyCaptionAudioErrorUsesSafeStableClasses(t *testing.T) {
 	tests := []struct {
 		name string
@@ -591,6 +1011,7 @@ func TestClassifyCaptionAudioErrorUsesSafeStableClasses(t *testing.T) {
 		{name: "deadline", err: context.DeadlineExceeded, want: "context_deadline"},
 		{name: "empty audio", err: deepgram.ErrEmptyAudio, want: "invalid_audio"},
 		{name: "closed", err: deepgram.ErrClosed, want: "deepgram_session_closed"},
+		{name: "stale connection generation", err: deepgram.ErrStaleConnectionGeneration, want: "connection_generation_stale"},
 		{name: "unavailable", err: deepgram.ErrUnavailable, want: "deepgram_unavailable"},
 		{name: "unknown", err: errors.New("secret endpoint must not be logged"), want: "caption_audio_ingest_failed"},
 	}

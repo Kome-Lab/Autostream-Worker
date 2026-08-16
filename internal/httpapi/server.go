@@ -367,16 +367,31 @@ func (s Server) captionAudio(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	jobGeneration := packets[0].JobGeneration
+	connectionGeneration := packets[0].ConnectionGeneration
 	for _, packet := range packets[1:] {
 		if packet.JobGeneration != jobGeneration {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "mixed_job_generation"})
 			return
 		}
+		if packet.ConnectionGeneration != connectionGeneration {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "mixed_connection_generation"})
+			return
+		}
 	}
-	if err := s.manager.IngestCaptionAudioForGeneration(r.Context(), streamID, jobGeneration, packets); err != nil {
+	if err := s.manager.EnqueueCaptionAudioForGeneration(r.Context(), streamID, jobGeneration, packets); err != nil {
 		switch {
+		case errors.Is(err, jobs.ErrCaptionAudioGenerationRequired):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "job_generation_required"})
+		case errors.Is(err, jobs.ErrCaptionAudioConnectionGenerationRequired):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "connection_generation_required"})
+		case errors.Is(err, jobs.ErrCaptionAudioConnectionGenerationStale):
+			writeJSON(w, http.StatusConflict, map[string]string{"code": "connection_generation_stale"})
+		case errors.Is(err, jobs.ErrCaptionAudioPayloadInvalid):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_audio_payload"})
 		case errors.Is(err, jobs.ErrCaptionNotConfigured):
 			writeJSON(w, http.StatusConflict, map[string]string{"code": "caption_audio_disabled"})
+		case errors.Is(err, jobs.ErrCaptionAudioQueueFull):
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"code": "caption_audio_queue_full"})
 		case errors.Is(err, jobs.ErrCaptionAudioUnavailable):
 			writeJSON(w, http.StatusBadGateway, map[string]string{"code": "caption_provider_unavailable"})
 		case errors.Is(err, jobs.ErrJobGenerationMismatch):
@@ -545,6 +560,12 @@ func writeRequestError(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, jobs.ErrCaptionAudioUnavailable):
 		writeJSON(w, http.StatusBadGateway, map[string]string{"code": "caption_provider_unavailable"})
+		return
+	case errors.Is(err, jobs.ErrCaptionAudioGenerationRequired):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "job_generation_required"})
+		return
+	case errors.Is(err, jobs.ErrCaptionAudioPayloadInvalid):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_audio_payload"})
 		return
 	case errors.Is(err, jobs.ErrJobGenerationMismatch):
 		writeJSON(w, http.StatusConflict, map[string]string{"code": "job_generation_mismatch"})

@@ -27,9 +27,10 @@ const (
 )
 
 var (
-	ErrUnavailable = errors.New("deepgram transcription unavailable")
-	ErrClosed      = errors.New("deepgram transcription session is closed")
-	ErrEmptyAudio  = errors.New("opus packet is empty")
+	ErrUnavailable               = errors.New("deepgram transcription unavailable")
+	ErrClosed                    = errors.New("deepgram transcription session is closed")
+	ErrEmptyAudio                = errors.New("opus packet is empty")
+	ErrStaleConnectionGeneration = errors.New("deepgram connection generation is stale")
 )
 
 type Config struct {
@@ -84,13 +85,14 @@ type Session struct {
 	handler  Handler
 	apiKey   []byte
 
-	mu        sync.Mutex
-	closed    bool
-	conns     map[connectionKey]*speakerConnection
-	dialing   map[connectionKey]*dialCall
-	dialWG    sync.WaitGroup
-	loopWG    sync.WaitGroup
-	closeOnce sync.Once
+	mu                         sync.Mutex
+	closed                     bool
+	latestConnectionGeneration uint64
+	conns                      map[connectionKey]*speakerConnection
+	dialing                    map[connectionKey]*dialCall
+	dialWG                     sync.WaitGroup
+	loopWG                     sync.WaitGroup
+	closeOnce                  sync.Once
 }
 
 // A user and connection generation identify a speaker. SSRC is only retained
@@ -352,10 +354,40 @@ func (s *Session) connection(ctx context.Context, packet AudioPacket) (*speakerC
 	key := connectionKeyFor(packet)
 	for {
 		var stale []*speakerConnection
+		var staleDials []*dialCall
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
 			return nil, ErrClosed
+		}
+		if s.latestConnectionGeneration > 0 && packet.ConnectionGeneration < s.latestConnectionGeneration {
+			s.mu.Unlock()
+			return nil, ErrStaleConnectionGeneration
+		}
+		if packet.ConnectionGeneration > s.latestConnectionGeneration {
+			s.latestConnectionGeneration = packet.ConnectionGeneration
+			for candidateKey, call := range s.dialing {
+				if candidateKey.Generation < packet.ConnectionGeneration {
+					delete(s.dialing, candidateKey)
+					staleDials = append(staleDials, call)
+				}
+			}
+			for candidateKey, conn := range s.conns {
+				if candidateKey.Generation < packet.ConnectionGeneration {
+					delete(s.conns, candidateKey)
+					stale = append(stale, conn)
+				}
+			}
+		}
+		if len(stale) > 0 || len(staleDials) > 0 {
+			s.mu.Unlock()
+			for _, call := range staleDials {
+				call.cancel()
+			}
+			for _, conn := range stale {
+				conn.abort()
+			}
+			continue
 		}
 		if conn := s.conns[key]; conn != nil {
 			s.mu.Unlock()
@@ -428,6 +460,9 @@ func (s *Session) completeDial(ctx context.Context, call *dialCall, key connecti
 		closeSocket = sock != nil
 	case s.closed:
 		call.err = ErrClosed
+		closeSocket = true
+	case s.latestConnectionGeneration > 0 && key.Generation < s.latestConnectionGeneration:
+		call.err = ErrStaleConnectionGeneration
 		closeSocket = true
 	default:
 		conn = newSpeakerConnection(s, sock, key, packet)

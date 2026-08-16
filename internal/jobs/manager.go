@@ -18,20 +18,36 @@ import (
 )
 
 var (
-	ErrCaptionNotConfigured            = errors.New("caption transcription is not configured")
-	ErrCaptionProfileInvalid           = errors.New("caption profile is invalid")
-	ErrCaptionRuntimeUnavailable       = errors.New("caption transcription runtime is unavailable")
-	ErrCaptionAudioUnavailable         = errors.New("caption audio transcription is unavailable")
-	ErrStreamAlreadyStopped            = errors.New("stream job is already stopped")
-	ErrNoActiveStreamJob               = errors.New("no active stream job")
-	ErrStreamIDDoesNotMatchJob         = errors.New("stream_id does not match current job")
-	ErrJobGenerationMismatch           = errors.New("job generation does not match current job")
-	ErrStreamStopping                  = errors.New("stream job is stopping")
-	ErrStoppedTargetReceiptUnavailable = errors.New("stopped target receipt is unavailable")
-	ErrVideoOutputUnavailable          = errors.New("worker video output is unavailable")
+	ErrCaptionNotConfigured                     = errors.New("caption transcription is not configured")
+	ErrCaptionProfileInvalid                    = errors.New("caption profile is invalid")
+	ErrCaptionRuntimeUnavailable                = errors.New("caption transcription runtime is unavailable")
+	ErrCaptionAudioUnavailable                  = errors.New("caption audio transcription is unavailable")
+	ErrCaptionAudioQueueFull                    = errors.New("caption audio queue is full")
+	ErrCaptionAudioGenerationRequired           = errors.New("caption audio job generation is required")
+	ErrCaptionAudioConnectionGenerationRequired = errors.New("caption audio connection generation is required")
+	ErrCaptionAudioConnectionGenerationStale    = errors.New("caption audio connection generation is stale")
+	ErrCaptionAudioPayloadInvalid               = errors.New("caption audio payload is invalid")
+	ErrStreamAlreadyStopped                     = errors.New("stream job is already stopped")
+	ErrNoActiveStreamJob                        = errors.New("no active stream job")
+	ErrStreamIDDoesNotMatchJob                  = errors.New("stream_id does not match current job")
+	ErrJobGenerationMismatch                    = errors.New("job generation does not match current job")
+	ErrStreamStopping                           = errors.New("stream job is stopping")
+	ErrStoppedTargetReceiptUnavailable          = errors.New("stopped target receipt is unavailable")
+	ErrVideoOutputUnavailable                   = errors.New("worker video output is unavailable")
 )
 
-const maxStoppedStreamTargets = 64
+const (
+	maxStoppedStreamTargets           = 64
+	captionAudioQueueBatches          = 128
+	captionAudioQueuePackets          = 1024
+	captionAudioQueueBytes            = 8 << 20
+	captionAudioBatchTimeout          = 15 * time.Second
+	captionAudioRetryMax              = 3
+	captionAudioRetryBase             = 250 * time.Millisecond
+	captionDiagnosticTimeout          = 2 * time.Second
+	captionAudioMaxUserIDBytes        = 128
+	captionAudioPacketAccountingBytes = 128
+)
 
 type StreamContext struct {
 	StreamID              string `json:"stream_id"`
@@ -97,14 +113,22 @@ type AssignmentPolicy struct {
 }
 
 type Status struct {
-	CurrentStreamID string         `json:"current_stream_id,omitempty"`
-	StreamName      string         `json:"stream_name,omitempty"`
-	JobGeneration   uint64         `json:"job_generation,omitempty"`
-	StartedAt       time.Time      `json:"started_at,omitempty"`
-	EventCount      int            `json:"event_count"`
-	EventCounts     map[string]int `json:"event_counts,omitempty"`
-	SendFailures    int            `json:"event_send_failures_total"`
-	LastEventAt     time.Time      `json:"last_event_at,omitempty"`
+	CurrentStreamID                  string         `json:"current_stream_id,omitempty"`
+	StreamName                       string         `json:"stream_name,omitempty"`
+	JobGeneration                    uint64         `json:"job_generation,omitempty"`
+	StartedAt                        time.Time      `json:"started_at,omitempty"`
+	EventCount                       int            `json:"event_count"`
+	EventCounts                      map[string]int `json:"event_counts,omitempty"`
+	SendFailures                     int            `json:"event_send_failures_total"`
+	CaptionAudioQueueBatches         int            `json:"caption_audio_queue_batches"`
+	CaptionAudioQueuePackets         int            `json:"caption_audio_queue_packets"`
+	CaptionAudioQueueBytes           int            `json:"caption_audio_queue_bytes"`
+	CaptionAudioQueueDrops           int            `json:"caption_audio_queue_drops_total"`
+	CaptionAudioRetries              int            `json:"caption_audio_retries_total"`
+	CaptionAudioProviderDrops        int            `json:"caption_audio_provider_drops_total"`
+	CaptionAudioConnectionGeneration uint64         `json:"caption_audio_connection_generation"`
+	CaptionAudioSupersededDrops      int            `json:"caption_audio_superseded_drops_total"`
+	LastEventAt                      time.Time      `json:"last_event_at,omitempty"`
 }
 
 type Manager struct {
@@ -121,6 +145,7 @@ type Manager struct {
 	secretResolver   RuntimeSecretResolver
 	captionFactory   CaptionSessionFactory
 	captionSession   CaptionSession
+	captionIngress   *captionAudioIngress
 	sceneRenderer    SceneRenderer
 	sceneVideo       VideoSceneConfig
 	videoOutput      VideoOutput
@@ -134,14 +159,19 @@ type Manager struct {
 	latestEventByKey map[string]string
 	publisherMu      sync.Mutex
 
-	startedAt                     time.Time
-	stoppedOrder                  []stoppedTargetReceipt
-	stoppedTargetReceiptPath      string
-	events                        []events.OverlayEvent
-	eventCounts                   map[string]int
-	sendFailures                  int
-	captionAudioStartedGeneration uint64
-	maxEvents                     int
+	startedAt                        time.Time
+	stoppedOrder                     []stoppedTargetReceipt
+	stoppedTargetReceiptPath         string
+	events                           []events.OverlayEvent
+	eventCounts                      map[string]int
+	sendFailures                     int
+	captionAudioStartedGeneration    uint64
+	captionAudioConnectionGeneration uint64
+	captionAudioQueueDrops           int
+	captionAudioRetries              int
+	captionAudioProviderDrops        int
+	captionAudioSupersededDrops      int
+	maxEvents                        int
 }
 
 type Reporter interface {
@@ -178,6 +208,73 @@ func (f CaptionSessionFactoryFunc) New(config deepgram.Config, apiKey []byte, ha
 		return nil, ErrCaptionRuntimeUnavailable
 	}
 	return f(config, apiKey, handler)
+}
+
+type captionAudioBatch struct {
+	streamID             string
+	generation           uint64
+	connectionGeneration uint64
+	packets              []deepgram.AudioPacket
+	bytes                int
+}
+
+type captionAudioIngress struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
+	batches chan captionAudioBatch
+
+	mu            sync.Mutex
+	queuedPackets int
+	queuedBytes   int
+}
+
+func newCaptionAudioIngress() *captionAudioIngress {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &captionAudioIngress{
+		ctx:     ctx,
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		batches: make(chan captionAudioBatch, captionAudioQueueBatches),
+	}
+}
+
+func (q *captionAudioIngress) enqueue(batch captionAudioBatch) bool {
+	if len(batch.packets) == 0 || len(batch.packets) > captionAudioQueuePackets || batch.bytes < 0 || batch.bytes > captionAudioQueueBytes {
+		return false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.ctx.Err() != nil || q.queuedPackets+len(batch.packets) > captionAudioQueuePackets || q.queuedBytes+batch.bytes > captionAudioQueueBytes {
+		return false
+	}
+	select {
+	case q.batches <- batch:
+		q.queuedPackets += len(batch.packets)
+		q.queuedBytes += batch.bytes
+		return true
+	default:
+		return false
+	}
+}
+
+func (q *captionAudioIngress) markDequeued(batch captionAudioBatch) {
+	q.mu.Lock()
+	q.queuedPackets -= len(batch.packets)
+	q.queuedBytes -= batch.bytes
+	if q.queuedPackets < 0 {
+		q.queuedPackets = 0
+	}
+	if q.queuedBytes < 0 {
+		q.queuedBytes = 0
+	}
+	q.mu.Unlock()
+}
+
+func (q *captionAudioIngress) snapshot() (batches, packets, bytes int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.batches), q.queuedPackets, q.queuedBytes
 }
 
 type deepgramSessionFactory struct{}
@@ -330,6 +427,11 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		closeCaptionSession(captionSession)
 		return ErrVideoOutputUnavailable
 	}
+	var captionIngress *captionAudioIngress
+	if captionSession != nil {
+		captionIngress = newCaptionAudioIngress()
+		m.captionIngress = captionIngress
+	}
 	if configurer, ok := sceneRenderer.(sceneDisplayConfigurer); ok {
 		configurer.ConfigureDisplay(displayConfig.maxItems, displayConfig.reorderWindow, displayConfig.interimTTL, displayConfig.finalTTL, displayConfig.showVoiceTranscripts, displayConfig.showLegacyCaptionBar)
 	}
@@ -340,18 +442,29 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	m.events = nil
 	m.eventCounts = map[string]int{}
 	m.sendFailures = 0
+	m.captionAudioStartedGeneration = 0
+	m.captionAudioConnectionGeneration = 0
+	m.captionAudioQueueDrops = 0
+	m.captionAudioRetries = 0
+	m.captionAudioProviderDrops = 0
+	m.captionAudioSupersededDrops = 0
 	m.mu.Unlock()
+	if captionIngress != nil {
+		go m.runCaptionAudioIngress(captionIngress)
+	}
 	if videoRequested {
 		videoStartConfig := videoConfig
 		videoStartConfig.Generation = generation
 		if err := videoOutput.Start(ctx, stream, videoStartConfig); err != nil {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cleanupCancel()
 			_ = videoOutput.Stop(cleanupCtx, stream.StreamID)
-			cleanupCancel()
 			m.mu.Lock()
 			if m.current.StreamID == stream.StreamID {
 				m.current = StreamContext{}
 				m.captionSession = nil
+				m.captionIngress = nil
+				m.captionAudioConnectionGeneration = 0
 				m.sceneVideo = VideoSceneConfig{}
 				m.startedAt = time.Time{}
 				m.events = nil
@@ -360,8 +473,11 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 			}
 			m.mu.Unlock()
 			m.stopEventDelivery()
+			stopCaptionAudioIngress(cleanupCtx, captionIngress)
 			sceneRenderer.Clear(stream.StreamID)
-			closeCaptionSession(captionSession)
+			if captionSession != nil {
+				_ = captionSession.Close(cleanupCtx)
+			}
 			m.report(ctx, stream.StreamID, "worker.video.start_failed", "failed", nil)
 			return ErrVideoOutputUnavailable
 		}
@@ -436,9 +552,12 @@ func (m *Manager) HandleVideoOutputFailure(streamID string, generation uint64, e
 		m.rememberStoppedTargetInMemoryLocked(streamID, time.Now().UTC())
 	}
 	captionSession := m.captionSession
+	captionIngress := m.captionIngress
 	sceneRenderer := m.sceneRenderer
 	m.current = StreamContext{}
 	m.captionSession = nil
+	m.captionIngress = nil
+	m.captionAudioConnectionGeneration = 0
 	m.sceneVideo = VideoSceneConfig{}
 	m.startedAt = time.Time{}
 	m.jobGeneration++
@@ -448,21 +567,22 @@ func (m *Manager) HandleVideoOutputFailure(streamID string, generation uint64, e
 	if sceneRenderer != nil {
 		sceneRenderer.Clear(streamID)
 	}
-	m.lifecycleMu.Unlock()
-
 	failureCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	stopCaptionAudioIngress(failureCtx, captionIngress)
+	if captionSession != nil {
+		if err := captionSession.Close(failureCtx); err != nil {
+			m.report(failureCtx, streamID, "worker.caption.stop_failed", "failed", nil)
+		}
+	}
+	m.lifecycleMu.Unlock()
+
 	errorClass = normalizeVideoOutputErrorClass(errorClass)
 	attributes := map[string]any{"reason": "transport_stopped", "error_class": errorClass}
 	if receiptErr != nil {
 		attributes["stopped_target_receipt"] = "unavailable"
 	}
 	m.report(failureCtx, streamID, "worker.video.output_failed", "failed", attributes)
-	if captionSession != nil {
-		if err := captionSession.Close(failureCtx); err != nil {
-			m.report(failureCtx, streamID, "worker.caption.stop_failed", "failed", nil)
-		}
-	}
 }
 
 func normalizeVideoOutputErrorClass(value string) string {
@@ -830,6 +950,8 @@ func classifyCaptionAudioError(err error) string {
 		return "invalid_audio"
 	case errors.Is(err, deepgram.ErrClosed):
 		return "deepgram_session_closed"
+	case errors.Is(err, deepgram.ErrStaleConnectionGeneration):
+		return "connection_generation_stale"
 	case errors.Is(err, deepgram.ErrUnavailable):
 		return "deepgram_unavailable"
 	default:
@@ -896,9 +1018,12 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	}
 	stoppedStreamID := m.current.StreamID
 	captionSession := m.captionSession
+	captionIngress := m.captionIngress
 	videoOutput := m.videoOutput
 	videoRequested := videoOutputRequested(m.current)
 	m.captionSession = nil
+	m.captionIngress = nil
+	m.captionAudioConnectionGeneration = 0
 	// Mark the stop boundary before waiting for downstream stop operations. The
 	// current stream is retained until its durable stop receipt is written so a
 	// persistence failure preserves the existing retryable Stop semantics, but
@@ -907,6 +1032,7 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	m.jobGeneration++
 	m.mu.Unlock()
 	m.stopEventDelivery()
+	stopCaptionAudioIngress(ctx, captionIngress)
 
 	if videoRequested && videoOutput != nil {
 		if err := videoOutput.Stop(ctx, stoppedStreamID); err != nil {
@@ -1012,48 +1138,367 @@ func (m *Manager) Close(ctx context.Context) error {
 	return nil
 }
 
-func (m *Manager) IngestCaptionAudio(ctx context.Context, streamID string, packets []deepgram.AudioPacket) error {
-	return m.IngestCaptionAudioForGeneration(ctx, streamID, 0, packets)
+func (m *Manager) runCaptionAudioIngress(ingress *captionAudioIngress) {
+	defer close(ingress.done)
+	for {
+		select {
+		case <-ingress.ctx.Done():
+			return
+		case batch := <-ingress.batches:
+			ingress.markDequeued(batch)
+			if ingress.ctx.Err() != nil {
+				return
+			}
+			batchCtx, cancel := context.WithTimeout(ingress.ctx, captionAudioBatchTimeout)
+			m.processCaptionAudioBatch(batchCtx, ingress, batch)
+			cancel()
+		}
+	}
 }
 
-func (m *Manager) IngestCaptionAudioForGeneration(ctx context.Context, streamID string, generation uint64, packets []deepgram.AudioPacket) error {
-	if len(packets) == 0 {
-		return errors.New("at least one opus packet is required")
+type captionAudioFailure struct {
+	packet     deepgram.AudioPacket
+	errorClass string
+}
+
+func (m *Manager) processCaptionAudioBatch(ctx context.Context, ingress *captionAudioIngress, batch captionAudioBatch) {
+	remaining := batch.packets
+	retryCount := 0
+	var failures []captionAudioFailure
+	for attempt := 1; attempt <= captionAudioRetryMax; attempt++ {
+		if !m.captionAudioGenerationCurrent(batch.streamID, batch.generation, batch.connectionGeneration, ingress) {
+			return
+		}
+		var err error
+		failures, _, err = m.ingestCaptionAudioAttempt(ctx, batch.streamID, batch.generation, batch.connectionGeneration, remaining)
+		if err != nil || len(failures) == 0 || ingress.ctx.Err() != nil {
+			return
+		}
+		if attempt == captionAudioRetryMax || ctx.Err() != nil {
+			break
+		}
+		timer := time.NewTimer(captionAudioRetryDelay(retryCount + 1))
+		select {
+		case <-ingress.ctx.Done():
+			timer.Stop()
+			return
+		case <-ctx.Done():
+			timer.Stop()
+			m.recordCaptionAudioProviderDrop(batch.streamID, batch.generation, batch.connectionGeneration, failures, retryCount)
+			return
+		case <-timer.C:
+		}
+		retryCount++
+		if !m.recordCaptionAudioRetry(batch.streamID, batch.generation, batch.connectionGeneration, ingress) {
+			return
+		}
+		remaining = captionAudioFailurePackets(failures)
 	}
+	if ingress.ctx.Err() == nil {
+		m.recordCaptionAudioProviderDrop(batch.streamID, batch.generation, batch.connectionGeneration, failures, retryCount)
+	}
+}
+
+func (m *Manager) captionAudioGenerationCurrent(streamID string, generation, connectionGeneration uint64, ingress *captionAudioIngress) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.current.StreamID == streamID &&
+		m.jobGeneration == generation &&
+		m.captionAudioConnectionGeneration == connectionGeneration &&
+		m.captionIngress == ingress &&
+		!m.stopping
+}
+
+func captionAudioRetryDelay(retryCount int) time.Duration {
+	delay := captionAudioRetryBase
+	for i := 1; i < retryCount; i++ {
+		delay *= 2
+	}
+	return delay
+}
+
+func captionAudioFailurePackets(failures []captionAudioFailure) []deepgram.AudioPacket {
+	packets := make([]deepgram.AudioPacket, len(failures))
+	for i, failure := range failures {
+		packets[i] = failure.packet
+	}
+	return packets
+}
+
+func captionAudioFailureClass(failures []captionAudioFailure) string {
+	if len(failures) == 0 {
+		return "unknown"
+	}
+	class := failures[0].errorClass
+	for _, failure := range failures[1:] {
+		if failure.errorClass != class {
+			return "mixed"
+		}
+	}
+	return class
+}
+
+func (m *Manager) recordCaptionAudioRetry(streamID string, generation, connectionGeneration uint64, ingress *captionAudioIngress) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.current.StreamID != streamID || m.jobGeneration != generation || m.captionAudioConnectionGeneration != connectionGeneration || m.captionIngress != ingress || m.stopping {
+		return false
+	}
+	m.captionAudioRetries++
+	return true
+}
+
+func (m *Manager) recordCaptionAudioProviderDrop(streamID string, generation, connectionGeneration uint64, failures []captionAudioFailure, retryCount int) {
+	if len(failures) == 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.current.StreamID != streamID || m.jobGeneration != generation || m.captionAudioConnectionGeneration != connectionGeneration || m.stopping {
+		m.mu.Unlock()
+		return
+	}
+	m.captionAudioProviderDrops += len(failures)
+	m.mu.Unlock()
+	diagnosticCtx, cancel := context.WithTimeout(context.Background(), captionDiagnosticTimeout)
+	defer cancel()
+	m.report(diagnosticCtx, streamID, "worker.caption.audio_dropped", "failed", map[string]any{
+		"job_generation":        generation,
+		"connection_generation": connectionGeneration,
+		"packet_count":          len(failures),
+		"retry_count":           retryCount,
+		"error_class":           captionAudioFailureClass(failures),
+	})
+}
+
+func stopCaptionAudioIngress(ctx context.Context, ingress *captionAudioIngress) {
+	if ingress == nil {
+		return
+	}
+	ingress.cancel()
+	select {
+	case <-ingress.done:
+	case <-ctx.Done():
+	}
+}
+
+func validateCaptionAudioPackets(packets []deepgram.AudioPacket, generation, connectionGeneration uint64) (int, error) {
+	if len(packets) == 0 {
+		return 0, errors.New("at least one opus packet is required")
+	}
+	retainedBytes := 0
+	for _, packet := range packets {
+		if len(packet.Opus) == 0 || len(packet.UserID) > captionAudioMaxUserIDBytes {
+			return 0, ErrCaptionAudioPayloadInvalid
+		}
+		if packet.JobGeneration == 0 {
+			return 0, ErrCaptionAudioGenerationRequired
+		}
+		if packet.JobGeneration != generation {
+			return 0, ErrJobGenerationMismatch
+		}
+		if packet.ConnectionGeneration == 0 {
+			return 0, ErrCaptionAudioConnectionGenerationRequired
+		}
+		if packet.ConnectionGeneration != connectionGeneration {
+			return 0, ErrCaptionAudioPayloadInvalid
+		}
+		retainedBytes += len(packet.Opus) + len(packet.UserID) + captionAudioPacketAccountingBytes
+		if retainedBytes > captionAudioQueueBytes {
+			return 0, ErrCaptionAudioQueueFull
+		}
+	}
+	return retainedBytes, nil
+}
+
+func cloneCaptionAudioPackets(packets []deepgram.AudioPacket, generation, connectionGeneration uint64) []deepgram.AudioPacket {
+	cloned := make([]deepgram.AudioPacket, len(packets))
+	for i, packet := range packets {
+		cloned[i] = packet
+		cloned[i].JobGeneration = generation
+		cloned[i].ConnectionGeneration = connectionGeneration
+		cloned[i].Opus = append([]byte(nil), packet.Opus...)
+	}
+	return cloned
+}
+
+func (m *Manager) EnqueueCaptionAudioForGeneration(ctx context.Context, streamID string, generation uint64, packets []deepgram.AudioPacket) error {
+	if generation == 0 {
+		return ErrCaptionAudioGenerationRequired
+	}
+	if len(packets) == 0 {
+		return ErrCaptionAudioPayloadInvalid
+	}
+	connectionGeneration := packets[0].ConnectionGeneration
+	if connectionGeneration == 0 {
+		return ErrCaptionAudioConnectionGenerationRequired
+	}
+	retainedBytes, err := validateCaptionAudioPackets(packets, generation, connectionGeneration)
+	if err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	if err := m.ensureStreamLocked(streamID); err != nil {
 		m.mu.Unlock()
 		return err
 	}
-	if generation != 0 && generation != m.jobGeneration {
+	if generation != m.jobGeneration {
 		m.mu.Unlock()
 		return ErrJobGenerationMismatch
+	}
+	if m.captionSession == nil {
+		m.mu.Unlock()
+		return ErrCaptionNotConfigured
+	}
+	ingress := m.captionIngress
+	if ingress == nil {
+		m.mu.Unlock()
+		return ErrCaptionAudioUnavailable
+	}
+	currentConnectionGeneration := m.captionAudioConnectionGeneration
+	if currentConnectionGeneration > connectionGeneration {
+		m.mu.Unlock()
+		return ErrCaptionAudioConnectionGenerationStale
+	}
+	var supersededIngress *captionAudioIngress
+	var supersededPackets int
+	if currentConnectionGeneration == 0 {
+		m.captionAudioConnectionGeneration = connectionGeneration
+	} else if connectionGeneration > currentConnectionGeneration {
+		supersededIngress = ingress
+		_, supersededPackets, _ = supersededIngress.snapshot()
+		supersededIngress.cancel()
+		ingress = newCaptionAudioIngress()
+		m.captionIngress = ingress
+		m.captionAudioConnectionGeneration = connectionGeneration
+		m.captionAudioSupersededDrops += supersededPackets
+	}
+	currentGeneration := m.jobGeneration
+	m.mu.Unlock()
+	if supersededIngress != nil {
+		go m.runCaptionAudioIngress(ingress)
+		go m.reportCaptionAudioSuperseded(streamID, currentGeneration, currentConnectionGeneration, connectionGeneration, supersededPackets)
+	}
+
+	cloned := cloneCaptionAudioPackets(packets, generation, connectionGeneration)
+	m.mu.Lock()
+	if err := m.ensureStreamLocked(streamID); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	if generation != m.jobGeneration {
+		m.mu.Unlock()
+		return ErrJobGenerationMismatch
+	}
+	if m.captionSession == nil {
+		m.mu.Unlock()
+		return ErrCaptionNotConfigured
+	}
+	if m.captionAudioConnectionGeneration > connectionGeneration {
+		m.mu.Unlock()
+		return ErrCaptionAudioConnectionGenerationStale
+	}
+	if m.captionAudioConnectionGeneration != connectionGeneration || m.captionIngress != ingress {
+		m.mu.Unlock()
+		return ErrCaptionAudioUnavailable
+	}
+	accepted := ingress.enqueue(captionAudioBatch{
+		streamID:             streamID,
+		generation:           currentGeneration,
+		connectionGeneration: connectionGeneration,
+		packets:              cloned,
+		bytes:                retainedBytes,
+	})
+	if accepted {
+		m.mu.Unlock()
+		return nil
+	}
+	m.captionAudioQueueDrops++
+	queuedBatches, queuedPackets, queuedBytes := ingress.snapshot()
+	m.mu.Unlock()
+	m.report(ctx, streamID, "worker.caption.audio_queue_full", "failed", map[string]any{
+		"job_generation":        currentGeneration,
+		"connection_generation": connectionGeneration,
+		"packet_count":          len(packets),
+		"queued_batches":        queuedBatches,
+		"queued_packets":        queuedPackets,
+		"queued_bytes":          queuedBytes,
+	})
+	return ErrCaptionAudioQueueFull
+}
+
+func (m *Manager) reportCaptionAudioSuperseded(streamID string, generation, previousConnectionGeneration, connectionGeneration uint64, packetCount int) {
+	ctx, cancel := context.WithTimeout(context.Background(), captionDiagnosticTimeout)
+	defer cancel()
+	m.report(ctx, streamID, "worker.caption.audio_generation_superseded", "superseded", map[string]any{
+		"job_generation":                 generation,
+		"previous_connection_generation": previousConnectionGeneration,
+		"connection_generation":          connectionGeneration,
+		"packet_count":                   packetCount,
+	})
+}
+
+func (m *Manager) IngestCaptionAudio(ctx context.Context, streamID string, packets []deepgram.AudioPacket) error {
+	return m.IngestCaptionAudioForGeneration(ctx, streamID, 0, packets)
+}
+
+func (m *Manager) IngestCaptionAudioForGeneration(ctx context.Context, streamID string, generation uint64, packets []deepgram.AudioPacket) error {
+	failures, _, err := m.ingestCaptionAudioAttempt(ctx, streamID, generation, 0, packets)
+	if err != nil {
+		return err
+	}
+	for _, failure := range failures {
+		m.report(ctx, streamID, "worker.caption.audio_failed", "failed", map[string]any{
+			"error_class": failure.errorClass,
+		})
+	}
+	if len(failures) > 0 {
+		return ErrCaptionAudioUnavailable
+	}
+	return nil
+}
+
+func (m *Manager) ingestCaptionAudioAttempt(ctx context.Context, streamID string, generation, connectionGeneration uint64, packets []deepgram.AudioPacket) ([]captionAudioFailure, int, error) {
+	if len(packets) == 0 {
+		return nil, 0, errors.New("at least one opus packet is required")
+	}
+	m.mu.Lock()
+	if err := m.ensureStreamLocked(streamID); err != nil {
+		m.mu.Unlock()
+		return nil, 0, err
+	}
+	if generation != 0 && generation != m.jobGeneration {
+		m.mu.Unlock()
+		return nil, 0, ErrJobGenerationMismatch
+	}
+	if connectionGeneration != 0 && connectionGeneration != m.captionAudioConnectionGeneration {
+		m.mu.Unlock()
+		return nil, 0, ErrCaptionAudioConnectionGenerationStale
 	}
 	captionSession := m.captionSession
 	currentGeneration := m.jobGeneration
 	m.mu.Unlock()
 	if captionSession == nil {
-		return ErrCaptionNotConfigured
+		return nil, 0, ErrCaptionNotConfigured
 	}
-	failed := false
+	failures := make([]captionAudioFailure, 0)
 	accepted := 0
 	for _, packet := range packets {
+		if err := ctx.Err(); err != nil {
+			return failures, accepted, err
+		}
 		if len(packet.Opus) == 0 {
-			return errors.New("opus packet is required")
+			return nil, accepted, ErrCaptionAudioPayloadInvalid
 		}
 		if err := captionSession.Ingest(ctx, packet); err != nil {
-			m.report(ctx, streamID, "worker.caption.audio_failed", "failed", map[string]any{
-				"ssrc":        packet.SSRC,
-				"error_class": classifyCaptionAudioError(err),
-			})
-			failed = true
+			failures = append(failures, captionAudioFailure{packet: packet, errorClass: classifyCaptionAudioError(err)})
 			continue
 		}
 		accepted++
 	}
 	if accepted > 0 {
 		m.mu.Lock()
-		shouldReportAudioStarted := m.captionAudioStartedGeneration != currentGeneration
+		shouldReportAudioStarted := m.current.StreamID == streamID && m.jobGeneration == currentGeneration && !m.stopping && m.captionAudioStartedGeneration != currentGeneration
 		if shouldReportAudioStarted {
 			m.captionAudioStartedGeneration = currentGeneration
 		}
@@ -1062,10 +1507,7 @@ func (m *Manager) IngestCaptionAudioForGeneration(ctx context.Context, streamID 
 			m.report(ctx, streamID, "worker.caption.audio_started", "accepted", map[string]any{"packet_count": accepted})
 		}
 	}
-	if failed {
-		return ErrCaptionAudioUnavailable
-	}
-	return nil
+	return failures, accepted, nil
 }
 
 func (m *Manager) CurrentStreamID() string {
@@ -1115,7 +1557,18 @@ func (m *Manager) RefreshAvatars() {
 func (m *Manager) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	status := Status{EventCount: len(m.events), SendFailures: m.sendFailures}
+	status := Status{
+		EventCount:                       len(m.events),
+		SendFailures:                     m.sendFailures,
+		CaptionAudioQueueDrops:           m.captionAudioQueueDrops,
+		CaptionAudioRetries:              m.captionAudioRetries,
+		CaptionAudioProviderDrops:        m.captionAudioProviderDrops,
+		CaptionAudioConnectionGeneration: m.captionAudioConnectionGeneration,
+		CaptionAudioSupersededDrops:      m.captionAudioSupersededDrops,
+	}
+	if m.captionIngress != nil {
+		status.CaptionAudioQueueBatches, status.CaptionAudioQueuePackets, status.CaptionAudioQueueBytes = m.captionIngress.snapshot()
+	}
 	if len(m.eventCounts) > 0 {
 		status.EventCounts = make(map[string]int, len(m.eventCounts))
 		for name, count := range m.eventCounts {
@@ -1137,10 +1590,18 @@ func (m *Manager) Status() Status {
 func (m *Manager) Metrics() map[string]float64 {
 	status := m.Status()
 	metrics := map[string]float64{
-		"worker.event_send_failures_total": float64(status.SendFailures),
-		"worker.scene_updates_total":       0,
-		"worker.overlay_events_total":      0,
-		"worker.caption_events_total":      0,
+		"worker.event_send_failures_total":            float64(status.SendFailures),
+		"worker.scene_updates_total":                  0,
+		"worker.overlay_events_total":                 0,
+		"worker.caption_events_total":                 0,
+		"worker.caption_audio_queue_batches":          float64(status.CaptionAudioQueueBatches),
+		"worker.caption_audio_queue_packets":          float64(status.CaptionAudioQueuePackets),
+		"worker.caption_audio_queue_bytes":            float64(status.CaptionAudioQueueBytes),
+		"worker.caption_audio_queue_drops_total":      float64(status.CaptionAudioQueueDrops),
+		"worker.caption_audio_retries_total":          float64(status.CaptionAudioRetries),
+		"worker.caption_audio_provider_drops_total":   float64(status.CaptionAudioProviderDrops),
+		"worker.caption_audio_connection_generation":  float64(status.CaptionAudioConnectionGeneration),
+		"worker.caption_audio_superseded_drops_total": float64(status.CaptionAudioSupersededDrops),
 	}
 	for name, count := range status.EventCounts {
 		metrics[name] = float64(count)

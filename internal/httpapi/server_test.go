@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,23 +37,57 @@ func (p *capturePublisher) Publish(ctx context.Context, event encoder.Event) err
 }
 
 type captureCaptionSession struct {
-	packets []deepgram.AudioPacket
-	closed  int
-	err     error
+	mu       sync.Mutex
+	packets  []deepgram.AudioPacket
+	closed   int
+	err      error
+	ingested chan struct{}
 }
 
 func (s *captureCaptionSession) Ingest(_ context.Context, packet deepgram.AudioPacket) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.err != nil {
 		return s.err
 	}
 	s.packets = append(s.packets, packet)
+	select {
+	case s.ingested <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
 func (s *captureCaptionSession) Close(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.closed++
 	return nil
 }
+
+func (s *captureCaptionSession) snapshotPackets() []deepgram.AudioPacket {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]deepgram.AudioPacket(nil), s.packets...)
+}
+
+type blockingCaptionSession struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingCaptionSession) Ingest(ctx context.Context, _ deepgram.AudioPacket) error {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+		return nil
+	}
+}
+
+func (*blockingCaptionSession) Close(context.Context) error { return nil }
 
 func TestUpdaterVersionEndpointIsUnauthenticatedAndReturnsIdentityBoundProbe(t *testing.T) {
 	previousVersion := version.Version
@@ -579,7 +614,7 @@ func TestCaptionAudioEndpointAcceptsContractPayloadWithSignedToken(t *testing.T)
 		t.Fatal(err)
 	}
 	opus := []byte{0xf8, 0xff, 0xfe}
-	body := `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"` + base64.StdEncoding.EncodeToString(opus) + `"}]}`
+	body := `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","job_generation":` + strconv.FormatUint(manager.Status().JobGeneration, 10) + `,"connection_generation":1,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"` + base64.StdEncoding.EncodeToString(opus) + `"}]}`
 	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", "Bearer "+token, body)
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusAccepted {
@@ -587,12 +622,150 @@ func TestCaptionAudioEndpointAcceptsContractPayloadWithSignedToken(t *testing.T)
 		_, _ = response.ReadFrom(res.Body)
 		t.Fatalf("expected caption audio 202, got %d body=%s", res.StatusCode, response.String())
 	}
-	if len(captionSession.packets) != 1 {
-		t.Fatalf("packet was not forwarded: %#v", captionSession.packets)
+	select {
+	case <-captionSession.ingested:
+	case <-time.After(time.Second):
+		t.Fatal("caption packet was not forwarded")
 	}
-	packet := captionSession.packets[0]
+	packets := captionSession.snapshotPackets()
+	if len(packets) != 1 {
+		t.Fatalf("packet was not forwarded exactly once: %#v", packets)
+	}
+	packet := packets[0]
 	if packet.SSRC != 42 || packet.UserID != "user-42" || packet.Sequence != 7 || packet.Timestamp != 960 || !packet.ReceivedAt.Equal(time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)) || !bytes.Equal(packet.Opus, opus) {
 		t.Fatalf("unexpected forwarded packet: %#v", packet)
+	}
+}
+
+func TestCaptionAudioEndpointRequiresNonzeroJobGeneration(t *testing.T) {
+	const signingKey = "caption-generation-signing-key"
+	manager, _ := captionReadyManager(t)
+	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	defer server.Close()
+	body := `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ=="}]}`
+	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", signedCaptionAudioAuthorization(t, signingKey, "stream-01"), body)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing generation status = %d, want 400", res.StatusCode)
+	}
+	var response map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["code"] != "job_generation_required" {
+		t.Fatalf("unexpected missing generation response: %#v", response)
+	}
+}
+
+func TestCaptionAudioEndpointRequiresNonzeroConnectionGeneration(t *testing.T) {
+	const signingKey = "caption-connection-generation-signing-key"
+	manager, _ := captionReadyManager(t)
+	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	defer server.Close()
+	body := `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","job_generation":1,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ=="}]}`
+	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", signedCaptionAudioAuthorization(t, signingKey, "stream-01"), body)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing connection generation status = %d, want 400", res.StatusCode)
+	}
+	var response map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["code"] != "connection_generation_required" {
+		t.Fatalf("unexpected missing connection generation response: %#v", response)
+	}
+}
+
+func TestCaptionAudioEndpointRejectsOlderConnectionGeneration(t *testing.T) {
+	const signingKey = "caption-stale-connection-generation-signing-key"
+	manager, _ := captionReadyManager(t)
+	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	defer server.Close()
+	authorization := signedCaptionAudioAuthorization(t, signingKey, "stream-01")
+	newerBody := strings.Replace(validCaptionAudioBody(), `"connection_generation":1`, `"connection_generation":2`, 1)
+	accepted := postJSON(t, server.URL+"/streams/stream-01/audio/opus", authorization, newerBody)
+	accepted.Body.Close()
+	if accepted.StatusCode != http.StatusAccepted {
+		t.Fatalf("newer connection generation status = %d, want 202", accepted.StatusCode)
+	}
+	stale := postJSON(t, server.URL+"/streams/stream-01/audio/opus", authorization, validCaptionAudioBody())
+	defer stale.Body.Close()
+	if stale.StatusCode != http.StatusConflict {
+		t.Fatalf("stale connection generation status = %d, want 409", stale.StatusCode)
+	}
+	var response map[string]string
+	if err := json.NewDecoder(stale.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["code"] != "connection_generation_stale" {
+		t.Fatalf("unexpected stale connection generation response: %#v", response)
+	}
+}
+
+func TestCaptionAudioEndpointAcceptsBeforeProviderIngestCompletes(t *testing.T) {
+	const signingKey = "caption-async-signing-key"
+	session := &blockingCaptionSession{started: make(chan struct{}), release: make(chan struct{})}
+	manager := jobs.NewManager(encoder.NoopPublisher{}, observability.Client{})
+	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), jobs.CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (jobs.CaptionSession, error) {
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfigForHTTP())
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-session.release:
+		default:
+			close(session.release)
+		}
+		_ = manager.Close(context.Background())
+	})
+
+	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	defer func() {
+		select {
+		case <-session.release:
+		default:
+			close(session.release)
+		}
+		server.Close()
+	}()
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/streams/stream-01/audio/opus", strings.NewReader(validCaptionAudioBody()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", signedCaptionAudioAuthorization(t, signingKey, "stream-01"))
+	req.Header.Set("Content-Type", "application/json")
+	type responseResult struct {
+		response *http.Response
+		err      error
+	}
+	result := make(chan responseResult, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(req)
+		result <- responseResult{response: response, err: requestErr}
+	}()
+
+	select {
+	case <-session.started:
+	case <-time.After(time.Second):
+		t.Fatal("caption provider ingest did not start")
+	}
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		defer got.response.Body.Close()
+		if got.response.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected asynchronous caption acceptance 202, got %d", got.response.StatusCode)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("caption HTTP response waited for the provider ingest")
 	}
 }
 
@@ -884,7 +1057,7 @@ func TestErrorDoesNotEchoBearerToken(t *testing.T) {
 func captionReadyManager(t *testing.T) (*jobs.Manager, *captureCaptionSession) {
 	t.Helper()
 	manager := jobs.NewManager(encoder.NoopPublisher{}, observability.Client{})
-	session := &captureCaptionSession{}
+	session := &captureCaptionSession{ingested: make(chan struct{}, 1)}
 	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
 		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
 	}), jobs.CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (jobs.CaptionSession, error) {
@@ -928,7 +1101,7 @@ func captionRuntimeConfigForHTTP() control.RuntimeConfig {
 }
 
 func validCaptionAudioBody() string {
-	return `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"` + base64.StdEncoding.EncodeToString([]byte{1}) + `"}]}`
+	return `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","job_generation":1,"connection_generation":1,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"` + base64.StdEncoding.EncodeToString([]byte{1}) + `"}]}`
 }
 
 func signedCaptionAudioAuthorization(t *testing.T, signingKey, streamID string) string {

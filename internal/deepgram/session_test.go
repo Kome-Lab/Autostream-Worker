@@ -29,6 +29,29 @@ type fakeDialer struct {
 	records []fakeDialRecord
 }
 
+type delayedFirstDialer struct {
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release chan struct{}
+	first   *fakeSocket
+	second  *fakeSocket
+	once    sync.Once
+}
+
+func (d *delayedFirstDialer) Dial(_ context.Context, _ string, _ http.Header) (socket, error) {
+	d.mu.Lock()
+	d.calls++
+	call := d.calls
+	d.mu.Unlock()
+	if call == 1 {
+		d.once.Do(func() { close(d.started) })
+		<-d.release
+		return d.first, nil
+	}
+	return d.second, nil
+}
+
 func (d *fakeDialer) Dial(_ context.Context, endpoint string, header http.Header) (socket, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -355,6 +378,81 @@ func TestSessionSeparatesUnresolvedSSRCAcrossConnectionGenerations(t *testing.T)
 	case <-first.closed:
 	default:
 		t.Fatal("old unresolved generation connection was not discarded")
+	}
+}
+
+func TestSessionRejectsOlderConnectionGenerationAfterReconnect(t *testing.T) {
+	current := newFakeSocket()
+	current.closeAfterCloseStream = true
+	dialer := &fakeDialer{results: []fakeDialResult{{socket: current}}}
+	session, err := newSession(testConfig(0), []byte("dg-runtime-key"), func(context.Context, Transcript) error { return nil }, testOptions(dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close(t.Context())
+
+	if err := session.Ingest(t.Context(), AudioPacket{SSRC: 42, UserID: "user-42", ConnectionGeneration: 2, Opus: []byte{2}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Ingest(t.Context(), AudioPacket{SSRC: 42, UserID: "user-42", ConnectionGeneration: 1, Opus: []byte{1}}); !errors.Is(err, ErrStaleConnectionGeneration) {
+		t.Fatalf("older generation error = %v, want %v", err, ErrStaleConnectionGeneration)
+	}
+	if len(dialer.snapshot()) != 1 {
+		t.Fatalf("older generation opened a replacement Deepgram connection: dials=%d", len(dialer.snapshot()))
+	}
+	select {
+	case <-current.closed:
+		t.Fatal("older generation evicted the current Deepgram connection")
+	default:
+	}
+}
+
+func TestSessionDoesNotInstallDelayedOlderGenerationDial(t *testing.T) {
+	older := newFakeSocket()
+	newer := newFakeSocket()
+	newer.closeAfterCloseStream = true
+	dialer := &delayedFirstDialer{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		first:   older,
+		second:  newer,
+	}
+	session, err := newSession(testConfig(0), []byte("dg-runtime-key"), func(context.Context, Transcript) error { return nil }, testOptions(dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close(t.Context())
+
+	olderResult := make(chan error, 1)
+	go func() {
+		olderResult <- session.Ingest(t.Context(), AudioPacket{SSRC: 42, UserID: "user-42", ConnectionGeneration: 1, Opus: []byte{1}})
+	}()
+	select {
+	case <-dialer.started:
+	case <-time.After(time.Second):
+		t.Fatal("older generation dial did not start")
+	}
+	if err := session.Ingest(t.Context(), AudioPacket{SSRC: 42, UserID: "user-42", ConnectionGeneration: 2, Opus: []byte{2}}); err != nil {
+		t.Fatalf("newer generation did not supersede the delayed dial: %v", err)
+	}
+	close(dialer.release)
+	select {
+	case err := <-olderResult:
+		if !errors.Is(err, ErrStaleConnectionGeneration) {
+			t.Fatalf("delayed older generation error = %v, want %v", err, ErrStaleConnectionGeneration)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delayed older generation dial did not finish")
+	}
+	select {
+	case <-older.closed:
+	case <-time.After(time.Second):
+		t.Fatal("socket from delayed older generation was not closed")
+	}
+	select {
+	case <-newer.closed:
+		t.Fatal("delayed older generation evicted the current connection")
+	default:
 	}
 }
 
