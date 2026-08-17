@@ -93,6 +93,21 @@ type Session struct {
 	dialWG                     sync.WaitGroup
 	loopWG                     sync.WaitGroup
 	closeOnce                  sync.Once
+	audioPacketsSent           uint64
+	transcriptMessages         uint64
+	providerErrors             uint64
+	lastErrorClass             string
+}
+
+// Status exposes only bounded counters and stable error classes. Provider
+// payloads, close reasons, endpoints, and credentials are intentionally never
+// retained here.
+type Status struct {
+	ActiveConnections  int    `json:"active_connections"`
+	AudioPacketsSent   uint64 `json:"audio_packets_sent"`
+	TranscriptMessages uint64 `json:"transcript_messages"`
+	ProviderErrors     uint64 `json:"provider_errors"`
+	LastErrorClass     string `json:"last_error_class,omitempty"`
 }
 
 // A user and connection generation identify a speaker. SSRC is only retained
@@ -336,11 +351,50 @@ func (s *Session) Ingest(ctx context.Context, packet AudioPacket) error {
 		return err
 	}
 	if err := conn.writeAudio(ctx, packet.Opus); err != nil {
+		s.recordProviderError("provider_write_failed")
 		s.discard(conn)
 		return ErrUnavailable
 	}
 	conn.markAudio(packet.ReceivedAt)
+	s.recordAudioPacketSent()
 	return nil
+}
+
+func (s *Session) Status() Status {
+	if s == nil {
+		return Status{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return Status{
+		ActiveConnections:  len(s.conns),
+		AudioPacketsSent:   s.audioPacketsSent,
+		TranscriptMessages: s.transcriptMessages,
+		ProviderErrors:     s.providerErrors,
+		LastErrorClass:     s.lastErrorClass,
+	}
+}
+
+func (s *Session) recordAudioPacketSent() {
+	s.mu.Lock()
+	s.audioPacketsSent++
+	s.mu.Unlock()
+}
+
+func (s *Session) recordTranscriptMessage() {
+	s.mu.Lock()
+	s.transcriptMessages++
+	s.mu.Unlock()
+}
+
+func (s *Session) recordProviderError(errorClass string) {
+	if s == nil || strings.TrimSpace(errorClass) == "" {
+		return
+	}
+	s.mu.Lock()
+	s.providerErrors++
+	s.lastErrorClass = errorClass
+	s.mu.Unlock()
 }
 
 func connectionKeyFor(packet AudioPacket) connectionKey {
@@ -449,6 +503,9 @@ func (s *Session) connection(ctx context.Context, packet AudioPacket) (*speakerC
 
 func (s *Session) completeDial(ctx context.Context, call *dialCall, key connectionKey, packet AudioPacket) (*speakerConnection, error) {
 	sock, dialErr := s.dial(ctx)
+	if dialErr != nil && ctx.Err() == nil {
+		s.recordProviderError("provider_dial_failed")
+	}
 	var conn *speakerConnection
 	var closeSocket bool
 
@@ -527,14 +584,24 @@ func (c *speakerConnection) readLoop() {
 	for {
 		messageType, payload, err := c.socket.Read(c.ctx)
 		if err != nil {
+			if c.ctx.Err() == nil {
+				c.session.recordProviderError(classifyProviderReadError(err))
+			}
 			return
 		}
 		if messageType != websocket.MessageText {
 			continue
 		}
+		if isProviderErrorMessage(payload) {
+			c.session.recordProviderError("provider_response_error")
+			return
+		}
 		result, ok := parseMessage(payload, c.session.config.InterimResults)
 		if !ok {
 			continue
+		}
+		if !result.utteranceEnd {
+			c.session.recordTranscriptMessage()
 		}
 		select {
 		case c.results <- result:
@@ -542,6 +609,24 @@ func (c *speakerConnection) readLoop() {
 			return
 		}
 	}
+}
+
+func classifyProviderReadError(err error) string {
+	switch websocket.CloseStatus(err) {
+	case websocket.StatusPolicyViolation:
+		return "provider_audio_rejected"
+	case websocket.StatusInternalError:
+		return "provider_unavailable"
+	default:
+		return "provider_read_closed"
+	}
+}
+
+func isProviderErrorMessage(payload []byte) bool {
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(payload, &envelope) == nil && strings.EqualFold(strings.TrimSpace(envelope.Type), "error")
 }
 
 func parseResult(payload []byte, interimResults bool) (queuedTranscript, bool) {

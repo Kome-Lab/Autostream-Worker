@@ -331,6 +331,7 @@ type fakeCaptionSession struct {
 	err          error
 	ingestCalls  int
 	ingestErrors []error
+	status       deepgram.Status
 }
 
 type controlledCaptionSession struct {
@@ -457,6 +458,8 @@ func (s *fakeCaptionSession) Close(context.Context) error {
 	s.closed++
 	return nil
 }
+
+func (s *fakeCaptionSession) Status() deepgram.Status { return s.status }
 
 func TestManagerStartsAndPublishesEvent(t *testing.T) {
 	pub := &fakePublisher{}
@@ -585,6 +588,11 @@ func TestManagerStartsSelectedCaptionProfileAndPublishesDeepgramResults(t *testi
 	}
 	if len(session.packets) != 1 || session.packets[0].SSRC != 42 || session.packets[0].UserID != "speaker-42" {
 		t.Fatalf("caption audio was not forwarded: %#v", session.packets)
+	}
+	session.status = deepgram.Status{ActiveConnections: 1, AudioPacketsSent: 1, TranscriptMessages: 2, ProviderErrors: 1, LastErrorClass: "provider_read_closed"}
+	captionStatus := manager.Status()
+	if !captionStatus.CaptionSessionActive || captionStatus.CaptionProviderConnections != 1 || captionStatus.CaptionProviderAudioPackets != 1 || captionStatus.CaptionProviderTranscriptMessages != 2 || captionStatus.CaptionProviderErrors != 1 || captionStatus.CaptionProviderLastErrorClass != "provider_read_closed" {
+		t.Fatalf("caption provider diagnostics were not exposed safely: %#v", captionStatus)
 	}
 	if err := session.handler(t.Context(), deepgram.Transcript{Text: "interim", SpeakerUserID: "speaker-42"}); err != nil {
 		t.Fatal(err)

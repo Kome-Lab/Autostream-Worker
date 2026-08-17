@@ -513,6 +513,32 @@ func TestParseResultIgnoresInterimWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestSessionSurfacesSafeProviderAudioRejectionStatus(t *testing.T) {
+	sock := newFakeSocket()
+	dialer := &fakeDialer{results: []fakeDialResult{{socket: sock}}}
+	session, err := newSession(testConfig(0), []byte("dg-runtime-key"), func(context.Context, Transcript) error { return nil }, testOptions(dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.Close(t.Context()) })
+	if err := session.Ingest(t.Context(), AudioPacket{UserID: "speaker-01", ConnectionGeneration: 1, Opus: []byte{1, 2, 3}}); err != nil {
+		t.Fatal(err)
+	}
+
+	sock.reads <- fakeRead{err: websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "DATA-0000 secret provider detail"}}
+	deadline := time.Now().Add(time.Second)
+	for session.Status().ProviderErrors == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	status := session.Status()
+	if status.AudioPacketsSent != 1 || status.ProviderErrors != 1 || status.LastErrorClass != "provider_audio_rejected" {
+		t.Fatalf("unexpected safe Deepgram status: %#v", status)
+	}
+	if strings.Contains(status.LastErrorClass, "secret") || strings.Contains(status.LastErrorClass, "DATA-0000") {
+		t.Fatalf("provider close details leaked into status: %#v", status)
+	}
+}
+
 func testConfig(delay time.Duration) Config {
 	return Config{
 		Model:          "nova-3",

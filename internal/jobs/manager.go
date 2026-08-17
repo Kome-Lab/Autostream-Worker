@@ -113,22 +113,28 @@ type AssignmentPolicy struct {
 }
 
 type Status struct {
-	CurrentStreamID                  string         `json:"current_stream_id,omitempty"`
-	StreamName                       string         `json:"stream_name,omitempty"`
-	JobGeneration                    uint64         `json:"job_generation,omitempty"`
-	StartedAt                        time.Time      `json:"started_at,omitempty"`
-	EventCount                       int            `json:"event_count"`
-	EventCounts                      map[string]int `json:"event_counts,omitempty"`
-	SendFailures                     int            `json:"event_send_failures_total"`
-	CaptionAudioQueueBatches         int            `json:"caption_audio_queue_batches"`
-	CaptionAudioQueuePackets         int            `json:"caption_audio_queue_packets"`
-	CaptionAudioQueueBytes           int            `json:"caption_audio_queue_bytes"`
-	CaptionAudioQueueDrops           int            `json:"caption_audio_queue_drops_total"`
-	CaptionAudioRetries              int            `json:"caption_audio_retries_total"`
-	CaptionAudioProviderDrops        int            `json:"caption_audio_provider_drops_total"`
-	CaptionAudioConnectionGeneration uint64         `json:"caption_audio_connection_generation"`
-	CaptionAudioSupersededDrops      int            `json:"caption_audio_superseded_drops_total"`
-	LastEventAt                      time.Time      `json:"last_event_at,omitempty"`
+	CurrentStreamID                   string         `json:"current_stream_id,omitempty"`
+	StreamName                        string         `json:"stream_name,omitempty"`
+	JobGeneration                     uint64         `json:"job_generation,omitempty"`
+	StartedAt                         time.Time      `json:"started_at,omitempty"`
+	EventCount                        int            `json:"event_count"`
+	EventCounts                       map[string]int `json:"event_counts,omitempty"`
+	SendFailures                      int            `json:"event_send_failures_total"`
+	CaptionAudioQueueBatches          int            `json:"caption_audio_queue_batches"`
+	CaptionAudioQueuePackets          int            `json:"caption_audio_queue_packets"`
+	CaptionAudioQueueBytes            int            `json:"caption_audio_queue_bytes"`
+	CaptionAudioQueueDrops            int            `json:"caption_audio_queue_drops_total"`
+	CaptionAudioRetries               int            `json:"caption_audio_retries_total"`
+	CaptionAudioProviderDrops         int            `json:"caption_audio_provider_drops_total"`
+	CaptionAudioConnectionGeneration  uint64         `json:"caption_audio_connection_generation"`
+	CaptionAudioSupersededDrops       int            `json:"caption_audio_superseded_drops_total"`
+	CaptionSessionActive              bool           `json:"caption_session_active"`
+	CaptionProviderConnections        int            `json:"caption_provider_connections"`
+	CaptionProviderAudioPackets       uint64         `json:"caption_provider_audio_packets_total"`
+	CaptionProviderTranscriptMessages uint64         `json:"caption_provider_transcript_messages_total"`
+	CaptionProviderErrors             uint64         `json:"caption_provider_errors_total"`
+	CaptionProviderLastErrorClass     string         `json:"caption_provider_last_error_class,omitempty"`
+	LastEventAt                       time.Time      `json:"last_event_at,omitempty"`
 }
 
 type Manager struct {
@@ -195,6 +201,10 @@ func (f RuntimeSecretResolverFunc) ResolveRuntimeSecret(ctx context.Context, str
 type CaptionSession interface {
 	Ingest(context.Context, deepgram.AudioPacket) error
 	Close(context.Context) error
+}
+
+type captionSessionStatusProvider interface {
+	Status() deepgram.Status
 }
 
 type CaptionSessionFactory interface {
@@ -1565,6 +1575,15 @@ func (m *Manager) Status() Status {
 		CaptionAudioProviderDrops:        m.captionAudioProviderDrops,
 		CaptionAudioConnectionGeneration: m.captionAudioConnectionGeneration,
 		CaptionAudioSupersededDrops:      m.captionAudioSupersededDrops,
+		CaptionSessionActive:             m.captionSession != nil,
+	}
+	if provider, ok := m.captionSession.(captionSessionStatusProvider); ok {
+		providerStatus := provider.Status()
+		status.CaptionProviderConnections = providerStatus.ActiveConnections
+		status.CaptionProviderAudioPackets = providerStatus.AudioPacketsSent
+		status.CaptionProviderTranscriptMessages = providerStatus.TranscriptMessages
+		status.CaptionProviderErrors = providerStatus.ProviderErrors
+		status.CaptionProviderLastErrorClass = providerStatus.LastErrorClass
 	}
 	if m.captionIngress != nil {
 		status.CaptionAudioQueueBatches, status.CaptionAudioQueuePackets, status.CaptionAudioQueueBytes = m.captionIngress.snapshot()
@@ -1602,11 +1621,23 @@ func (m *Manager) Metrics() map[string]float64 {
 		"worker.caption_audio_provider_drops_total":   float64(status.CaptionAudioProviderDrops),
 		"worker.caption_audio_connection_generation":  float64(status.CaptionAudioConnectionGeneration),
 		"worker.caption_audio_superseded_drops_total": float64(status.CaptionAudioSupersededDrops),
+		"worker.caption_session_active":               boolMetric(status.CaptionSessionActive),
+		"worker.caption_provider_connections":         float64(status.CaptionProviderConnections),
+		"worker.caption_provider_audio_packets_total": float64(status.CaptionProviderAudioPackets),
+		"worker.caption_provider_transcripts_total":   float64(status.CaptionProviderTranscriptMessages),
+		"worker.caption_provider_errors_total":        float64(status.CaptionProviderErrors),
 	}
 	for name, count := range status.EventCounts {
 		metrics[name] = float64(count)
 	}
 	return metrics
+}
+
+func boolMetric(value bool) float64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (m *Manager) RecentEvents(streamID string) ([]events.OverlayEvent, error) {
