@@ -26,6 +26,11 @@ type fakeSceneRenderer struct {
 	events []events.OverlayEvent
 }
 
+type captionDisplaySceneRenderer struct {
+	fakeSceneRenderer
+	displays []captionDisplayConfig
+}
+
 type fakeVideoOutput struct {
 	starts   []StreamContext
 	scenes   []VideoSceneConfig
@@ -72,6 +77,17 @@ func (f *fakeSceneRenderer) RenderSize(width, height int, _ time.Time) (*image.R
 }
 func (*fakeSceneRenderer) AvatarRefreshInterval() time.Duration { return time.Minute }
 func (*fakeSceneRenderer) RefreshAvatars()                      {}
+
+func (f *captionDisplaySceneRenderer) ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts, showLegacyCaptionBar bool) {
+	f.displays = append(f.displays, captionDisplayConfig{
+		maxItems:             maxItems,
+		reorderWindow:        reorderWindow,
+		interimTTL:           interimTTL,
+		finalTTL:             finalTTL,
+		showVoiceTranscripts: showVoiceTranscripts,
+		showLegacyCaptionBar: showLegacyCaptionBar,
+	})
+}
 
 func TestManagerSceneLifecycleAppliesEventsBeforeLegacyForwardFailure(t *testing.T) {
 	scene := &fakeSceneRenderer{}
@@ -740,6 +756,113 @@ func TestManagerRejectsLateCaptionResultFromPreviousGeneration(t *testing.T) {
 
 	if err := oldHandler(t.Context(), deepgram.Transcript{Text: "late old result", Final: true}); !errors.Is(err, ErrJobGenerationMismatch) {
 		t.Fatalf("late result from old generation was not fenced: %v", err)
+	}
+}
+
+func TestManagerUpdatesRunningCaptionProfileWithoutChangingJobGeneration(t *testing.T) {
+	pub := &fakePublisher{}
+	manager := NewManager(pub, observability.Client{})
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), nil)
+	var sessions []*fakeCaptionSession
+	var configs []deepgram.Config
+	manager.SetCaptionRuntime(manager.secretResolver, CaptionSessionFactoryFunc(func(config deepgram.Config, _ []byte, handler deepgram.Handler) (CaptionSession, error) {
+		session := &fakeCaptionSession{handler: handler}
+		sessions = append(sessions, session)
+		configs = append(configs, config)
+		return session, nil
+	}))
+	scene := &captionDisplaySceneRenderer{}
+	manager.SetSceneRenderer(scene)
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	jobGeneration := manager.Status().JobGeneration
+
+	updatedConfig := captionProfileConfig("en")
+	updatedConfig["conversation_max_items"] = 24
+	updatedConfig["voice_final_ttl_seconds"] = 30
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: updatedConfig}))
+	if err := manager.UpdateCaptionRuntimeSettings(t.Context(), "stream-01", "caption-01"); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(sessions) != 2 || len(configs) != 2 {
+		t.Fatalf("caption session refresh count = sessions:%d configs:%d, want 2", len(sessions), len(configs))
+	}
+	if configs[0].Language != "ja" || configs[1].Language != "en" {
+		t.Fatalf("caption session languages = %#v", configs)
+	}
+	if sessions[0].closed != 1 || sessions[1].closed != 0 {
+		t.Fatalf("caption session close state = old:%d new:%d", sessions[0].closed, sessions[1].closed)
+	}
+	if manager.Status().JobGeneration != jobGeneration {
+		t.Fatalf("job generation changed during caption-only update: before=%d after=%d", jobGeneration, manager.Status().JobGeneration)
+	}
+	if manager.current.CaptionProfileID != "caption-01" {
+		t.Fatalf("active caption profile = %q", manager.current.CaptionProfileID)
+	}
+	if len(scene.displays) < 2 || scene.displays[len(scene.displays)-1].maxItems != 24 || scene.displays[len(scene.displays)-1].finalTTL != 30*time.Second {
+		t.Fatalf("updated caption display settings were not applied: %#v", scene.displays)
+	}
+	if err := sessions[0].handler(t.Context(), deepgram.Transcript{Text: "late old result", Final: true}); !errors.Is(err, ErrCaptionSessionGenerationMismatch) {
+		t.Fatalf("late result from replaced caption session was not fenced: %v", err)
+	}
+	if err := sessions[1].handler(t.Context(), deepgram.Transcript{Text: "new session result", Final: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(pub.events) != 1 || pub.events[0].Payload["text"] != "new session result" {
+		t.Fatalf("unexpected caption events after session replacement: %#v", pub.events)
+	}
+	packet := deepgram.AudioPacket{SSRC: 42, UserID: "speaker-42", Opus: []byte{1, 2, 3}}
+	if err := manager.IngestCaptionAudio(t.Context(), "stream-01", []deepgram.AudioPacket{packet}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions[0].packets) != 0 || len(sessions[1].packets) != 1 {
+		t.Fatalf("caption audio did not converge on the new session: old=%d new=%d", len(sessions[0].packets), len(sessions[1].packets))
+	}
+}
+
+func TestManagerKeepsRunningCaptionSessionWhenRuntimeUpdateFails(t *testing.T) {
+	manager := NewManager(&fakePublisher{}, observability.Client{})
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), nil)
+	oldSession := &fakeCaptionSession{}
+	factoryCalls := 0
+	manager.SetCaptionRuntime(manager.secretResolver, CaptionSessionFactoryFunc(func(_ deepgram.Config, _ []byte, handler deepgram.Handler) (CaptionSession, error) {
+		factoryCalls++
+		if factoryCalls == 1 {
+			oldSession.handler = handler
+			return oldSession, nil
+		}
+		return nil, errors.New("provider details must remain private")
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	jobGeneration := manager.Status().JobGeneration
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("en")}))
+
+	err := manager.UpdateCaptionRuntimeSettings(t.Context(), "stream-01", "caption-01")
+	if !errors.Is(err, ErrCaptionRuntimeUnavailable) {
+		t.Fatalf("runtime update error = %v", err)
+	}
+	if oldSession.closed != 0 || manager.captionSession != oldSession {
+		t.Fatalf("old caption session was not preserved: closed=%d current=%T", oldSession.closed, manager.captionSession)
+	}
+	if manager.Status().JobGeneration != jobGeneration {
+		t.Fatalf("job generation changed after failed caption update: before=%d after=%d", jobGeneration, manager.Status().JobGeneration)
+	}
+	packet := deepgram.AudioPacket{SSRC: 42, UserID: "speaker-42", Opus: []byte{1}}
+	if err := manager.IngestCaptionAudio(t.Context(), "stream-01", []deepgram.AudioPacket{packet}); err != nil {
+		t.Fatal(err)
+	}
+	if len(oldSession.packets) != 1 {
+		t.Fatalf("old caption session stopped receiving audio after failed update: %#v", oldSession.packets)
 	}
 }
 

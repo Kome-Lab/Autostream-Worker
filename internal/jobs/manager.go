@@ -31,6 +31,7 @@ var (
 	ErrNoActiveStreamJob                        = errors.New("no active stream job")
 	ErrStreamIDDoesNotMatchJob                  = errors.New("stream_id does not match current job")
 	ErrJobGenerationMismatch                    = errors.New("job generation does not match current job")
+	ErrCaptionSessionGenerationMismatch         = errors.New("caption session generation does not match current session")
 	ErrStreamStopping                           = errors.New("stream job is stopping")
 	ErrStoppedTargetReceiptUnavailable          = errors.New("stopped target receipt is unavailable")
 	ErrVideoOutputUnavailable                   = errors.New("worker video output is unavailable")
@@ -129,6 +130,7 @@ type Status struct {
 	CaptionAudioConnectionGeneration  uint64         `json:"caption_audio_connection_generation"`
 	CaptionAudioSupersededDrops       int            `json:"caption_audio_superseded_drops_total"`
 	CaptionSessionActive              bool           `json:"caption_session_active"`
+	CaptionSessionGeneration          uint64         `json:"caption_session_generation,omitempty"`
 	CaptionProviderConnections        int            `json:"caption_provider_connections"`
 	CaptionProviderAudioPackets       uint64         `json:"caption_provider_audio_packets_total"`
 	CaptionProviderTranscriptMessages uint64         `json:"caption_provider_transcript_messages_total"`
@@ -148,23 +150,24 @@ type Manager struct {
 	defaults    ProfileDefaults
 	assignments AssignmentPolicy
 
-	captionProfiles  map[string]control.RuntimeProfile
-	secretResolver   RuntimeSecretResolver
-	captionFactory   CaptionSessionFactory
-	captionSession   CaptionSession
-	captionIngress   *captionAudioIngress
-	sceneRenderer    SceneRenderer
-	sceneVideo       VideoSceneConfig
-	videoOutput      VideoOutput
-	jobGeneration    uint64
-	stopping         bool
-	deliveryCtx      context.Context
-	deliveryCancel   context.CancelFunc
-	deliveryWake     chan struct{}
-	deliveryWG       sync.WaitGroup
-	pendingEvents    map[string]pendingWorkerEvent
-	latestEventByKey map[string]string
-	publisherMu      sync.Mutex
+	captionProfiles          map[string]control.RuntimeProfile
+	secretResolver           RuntimeSecretResolver
+	captionFactory           CaptionSessionFactory
+	captionSession           CaptionSession
+	captionIngress           *captionAudioIngress
+	captionSessionGeneration uint64
+	sceneRenderer            SceneRenderer
+	sceneVideo               VideoSceneConfig
+	videoOutput              VideoOutput
+	jobGeneration            uint64
+	stopping                 bool
+	deliveryCtx              context.Context
+	deliveryCancel           context.CancelFunc
+	deliveryWake             chan struct{}
+	deliveryWG               sync.WaitGroup
+	pendingEvents            map[string]pendingWorkerEvent
+	latestEventByKey         map[string]string
+	publisherMu              sync.Mutex
 
 	startedAt                        time.Time
 	stoppedOrder                     []stoppedTargetReceipt
@@ -357,6 +360,7 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	resolver := m.secretResolver
 	factory := m.captionFactory
 	nextGeneration := m.jobGeneration + 1
+	nextCaptionSessionGeneration := m.captionSessionGeneration + 1
 	m.mu.Unlock()
 
 	var captionSession CaptionSession
@@ -387,16 +391,7 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		}
 		apiKey := []byte(secret.Value)
 		secret.Value = ""
-		captionSession, err = factory.New(config, apiKey, func(resultCtx context.Context, transcript deepgram.Transcript) error {
-			m.report(resultCtx, stream.StreamID, "worker.caption.transcript_received", captionTranscriptStatus(transcript), captionTranscriptAttributes(transcript))
-			_, publishErr := m.CaptionTranscriptDetailedForGeneration(resultCtx, stream.StreamID, nextGeneration, transcript)
-			if publishErr != nil {
-				attributes := captionTranscriptAttributes(transcript)
-				attributes["error_class"] = classifyCaptionTranscriptError(publishErr)
-				m.report(resultCtx, stream.StreamID, "worker.caption.transcript_publish_failed", "failed", attributes)
-			}
-			return publishErr
-		})
+		captionSession, err = factory.New(config, apiKey, m.captionTranscriptHandler(stream.StreamID, nextGeneration, nextCaptionSessionGeneration))
 		zeroBytes(apiKey)
 		if err != nil || captionSession == nil {
 			closeCaptionSession(captionSession)
@@ -423,6 +418,7 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	m.current = stream
 	m.jobGeneration++
 	generation := m.jobGeneration
+	m.captionSessionGeneration = nextCaptionSessionGeneration
 	m.startEventDeliveryLocked()
 	m.captionSession = captionSession
 	m.sceneVideo = videoConfig
@@ -568,6 +564,7 @@ func (m *Manager) HandleVideoOutputFailure(streamID string, generation uint64, e
 	m.current = StreamContext{}
 	m.captionSession = nil
 	m.captionIngress = nil
+	m.captionSessionGeneration++
 	m.captionAudioConnectionGeneration = 0
 	m.sceneVideo = VideoSceneConfig{}
 	m.startedAt = time.Time{}
@@ -611,6 +608,134 @@ func (m *Manager) ApplyRuntimeConfig(cfg control.RuntimeConfig) {
 	m.mu.Lock()
 	m.captionProfiles = captionProfilesFromRuntimeConfig(cfg)
 	m.mu.Unlock()
+}
+
+// UpdateCaptionRuntimeSettings replaces only the active Deepgram session and
+// caption display policy. The stream job generation remains stable so the
+// existing Discord audio route and video output continue without a restart.
+// A replacement session is prepared before the active pointers are swapped;
+// any preparation failure therefore leaves the old session untouched.
+func (m *Manager) UpdateCaptionRuntimeSettings(ctx context.Context, streamID, profileID string) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	streamID = strings.TrimSpace(streamID)
+	profileID = strings.TrimSpace(profileID)
+	if streamID == "" || profileID == "" {
+		return ErrCaptionProfileInvalid
+	}
+
+	m.mu.Lock()
+	switch {
+	case m.current.StreamID == "":
+		m.mu.Unlock()
+		return ErrNoActiveStreamJob
+	case m.stopping:
+		m.mu.Unlock()
+		return ErrStreamStopping
+	case m.current.StreamID != streamID:
+		m.mu.Unlock()
+		return ErrStreamIDDoesNotMatchJob
+	}
+	profile, profileSelected := m.captionProfiles[profileID]
+	resolver := m.secretResolver
+	factory := m.captionFactory
+	jobGeneration := m.jobGeneration
+	nextCaptionSessionGeneration := m.captionSessionGeneration + 1
+	m.mu.Unlock()
+
+	if !profileSelected {
+		return m.captionRuntimeUpdateFailed(ctx, streamID, profileID, jobGeneration, "profile_not_found", ErrCaptionProfileInvalid)
+	}
+	config, secretName, err := captionConfig(profile)
+	if err != nil {
+		return m.captionRuntimeUpdateFailed(ctx, streamID, profileID, jobGeneration, "profile_invalid", ErrCaptionProfileInvalid)
+	}
+	displayConfig, displayOK := captionDisplayConfigFromProfile(profile.Config)
+	if !displayOK {
+		return m.captionRuntimeUpdateFailed(ctx, streamID, profileID, jobGeneration, "profile_invalid", ErrCaptionProfileInvalid)
+	}
+	if resolver == nil || factory == nil {
+		return m.captionRuntimeUpdateFailed(ctx, streamID, profileID, jobGeneration, "runtime_unavailable", ErrCaptionRuntimeUnavailable)
+	}
+	secret, err := resolver.ResolveRuntimeSecret(ctx, streamID, secretName)
+	if err != nil {
+		return m.captionRuntimeUpdateFailed(ctx, streamID, profileID, jobGeneration, "secret_resolve_failed", ErrCaptionRuntimeUnavailable)
+	}
+	if secret.SecretName != secretName || strings.TrimSpace(secret.Value) == "" || secret.ExpiresInSec <= 0 {
+		secret.Value = ""
+		return m.captionRuntimeUpdateFailed(ctx, streamID, profileID, jobGeneration, "secret_invalid", ErrCaptionRuntimeUnavailable)
+	}
+	apiKey := []byte(secret.Value)
+	secret.Value = ""
+	newSession, err := factory.New(config, apiKey, m.captionTranscriptHandler(streamID, jobGeneration, nextCaptionSessionGeneration))
+	zeroBytes(apiKey)
+	if err != nil || newSession == nil {
+		closeCaptionSession(newSession)
+		return m.captionRuntimeUpdateFailed(ctx, streamID, profileID, jobGeneration, "session_create_failed", ErrCaptionRuntimeUnavailable)
+	}
+	if err := ctx.Err(); err != nil {
+		closeCaptionSession(newSession)
+		return err
+	}
+
+	newIngress := newCaptionAudioIngress()
+	m.mu.Lock()
+	switch {
+	case m.current.StreamID == "":
+		m.mu.Unlock()
+		closeCaptionSession(newSession)
+		return ErrNoActiveStreamJob
+	case m.stopping:
+		m.mu.Unlock()
+		closeCaptionSession(newSession)
+		return ErrStreamStopping
+	case m.current.StreamID != streamID:
+		m.mu.Unlock()
+		closeCaptionSession(newSession)
+		return ErrStreamIDDoesNotMatchJob
+	case m.jobGeneration != jobGeneration:
+		m.mu.Unlock()
+		closeCaptionSession(newSession)
+		return ErrJobGenerationMismatch
+	case !m.streamAssignedLocked(streamID):
+		m.mu.Unlock()
+		closeCaptionSession(newSession)
+		return errors.New("stream is not assigned to this worker service as primary")
+	}
+	oldSession := m.captionSession
+	oldIngress := m.captionIngress
+	sceneRenderer := m.sceneRenderer
+	m.current.CaptionProfileID = profileID
+	m.captionSession = newSession
+	m.captionIngress = newIngress
+	m.captionSessionGeneration = nextCaptionSessionGeneration
+	m.captionAudioStartedGeneration = 0
+	m.mu.Unlock()
+
+	go m.runCaptionAudioIngress(newIngress)
+	if configurer, ok := sceneRenderer.(sceneDisplayConfigurer); ok {
+		configurer.ConfigureDisplay(displayConfig.maxItems, displayConfig.reorderWindow, displayConfig.interimTTL, displayConfig.finalTTL, displayConfig.showVoiceTranscripts, displayConfig.showLegacyCaptionBar)
+	}
+
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cleanupCancel()
+	stopCaptionAudioIngress(cleanupCtx, oldIngress)
+	if oldSession != nil {
+		if err := oldSession.Close(cleanupCtx); err != nil {
+			m.report(cleanupCtx, streamID, "worker.caption.runtime_update_old_session_close_failed", "failed", map[string]any{
+				"caption_profile_id":         profileID,
+				"job_generation":             jobGeneration,
+				"caption_session_generation": nextCaptionSessionGeneration,
+			})
+		}
+	}
+	m.report(ctx, streamID, "worker.caption.runtime_updated", "applied", map[string]any{
+		"caption_profile_id":         profileID,
+		"job_generation":             jobGeneration,
+		"caption_session_generation": nextCaptionSessionGeneration,
+	})
+	return nil
 }
 
 func ProfileDefaultsFromRuntimeConfig(cfg control.RuntimeConfig) ProfileDefaults {
@@ -916,6 +1041,28 @@ func (m *Manager) captionStartFailed(ctx context.Context, streamID, profileID, r
 	return target
 }
 
+func (m *Manager) captionRuntimeUpdateFailed(ctx context.Context, streamID, profileID string, jobGeneration uint64, reason string, target error) error {
+	m.report(ctx, streamID, "worker.caption.runtime_update_failed", "failed", map[string]any{
+		"caption_profile_id": profileID,
+		"job_generation":     jobGeneration,
+		"reason":             reason,
+	})
+	return target
+}
+
+func (m *Manager) captionTranscriptHandler(streamID string, jobGeneration, captionSessionGeneration uint64) deepgram.Handler {
+	return func(resultCtx context.Context, transcript deepgram.Transcript) error {
+		m.report(resultCtx, streamID, "worker.caption.transcript_received", captionTranscriptStatus(transcript), captionTranscriptAttributes(transcript))
+		_, publishErr := m.CaptionTranscriptDetailedForSessionGeneration(resultCtx, streamID, jobGeneration, captionSessionGeneration, transcript)
+		if publishErr != nil {
+			attributes := captionTranscriptAttributes(transcript)
+			attributes["error_class"] = classifyCaptionTranscriptError(publishErr)
+			m.report(resultCtx, streamID, "worker.caption.transcript_publish_failed", "failed", attributes)
+		}
+		return publishErr
+	}
+}
+
 func captionTranscriptStatus(transcript deepgram.Transcript) string {
 	if transcript.Final {
 		return "final"
@@ -935,6 +1082,8 @@ func captionTranscriptAttributes(transcript deepgram.Transcript) map[string]any 
 
 func classifyCaptionTranscriptError(err error) string {
 	switch {
+	case errors.Is(err, ErrCaptionSessionGenerationMismatch):
+		return "caption_session_generation_mismatch"
 	case errors.Is(err, ErrJobGenerationMismatch):
 		return "job_generation_mismatch"
 	case errors.Is(err, ErrStreamStopping):
@@ -1037,6 +1186,7 @@ func (m *Manager) Stop(ctx context.Context, streamID string) error {
 	videoRequested := videoOutputRequested(m.current)
 	m.captionSession = nil
 	m.captionIngress = nil
+	m.captionSessionGeneration++
 	m.captionAudioConnectionGeneration = 0
 	// Mark the stop boundary before waiting for downstream stop operations. The
 	// current stream is retained until its durable stop receipt is written so a
@@ -1641,6 +1791,7 @@ func (m *Manager) Status() Status {
 		CaptionAudioConnectionGeneration: m.captionAudioConnectionGeneration,
 		CaptionAudioSupersededDrops:      m.captionAudioSupersededDrops,
 		CaptionSessionActive:             m.captionSession != nil,
+		CaptionSessionGeneration:         m.captionSessionGeneration,
 	}
 	if provider, ok := m.captionSession.(captionSessionStatusProvider); ok {
 		providerStatus := provider.Status()
@@ -1754,6 +1905,16 @@ func (m *Manager) CaptionTranscriptDetailed(ctx context.Context, streamID string
 // Deepgram session out of a later rearm that happens to reuse the same stream
 // ID.
 func (m *Manager) CaptionTranscriptDetailedForGeneration(ctx context.Context, streamID string, generation uint64, transcript deepgram.Transcript) (events.OverlayEvent, error) {
+	return m.captionTranscriptDetailedForGenerations(ctx, streamID, generation, 0, transcript)
+}
+
+// CaptionTranscriptDetailedForSessionGeneration additionally fences delayed
+// results from a replaced Deepgram session within the same stream job.
+func (m *Manager) CaptionTranscriptDetailedForSessionGeneration(ctx context.Context, streamID string, jobGeneration, captionSessionGeneration uint64, transcript deepgram.Transcript) (events.OverlayEvent, error) {
+	return m.captionTranscriptDetailedForGenerations(ctx, streamID, jobGeneration, captionSessionGeneration, transcript)
+}
+
+func (m *Manager) captionTranscriptDetailedForGenerations(ctx context.Context, streamID string, jobGeneration, captionSessionGeneration uint64, transcript deepgram.Transcript) (events.OverlayEvent, error) {
 	if strings.TrimSpace(transcript.Text) == "" {
 		return events.OverlayEvent{}, errors.New("caption text is required")
 	}
@@ -1764,7 +1925,7 @@ func (m *Manager) CaptionTranscriptDetailedForGeneration(ctx context.Context, st
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	return m.publishWithGeneration(ctx, events.CaptionTranscriptEvent(
+	return m.publishWithGenerations(ctx, events.CaptionTranscriptEvent(
 		streamID,
 		transcript.Text,
 		transcript.SpeakerUserID,
@@ -1778,7 +1939,7 @@ func (m *Manager) CaptionTranscriptDetailedForGeneration(ctx context.Context, st
 		transcript.Confidence,
 		transcript.FinalizationReason,
 		now,
-	), generation)
+	), jobGeneration, captionSessionGeneration)
 }
 
 func (m *Manager) Participants(ctx context.Context, streamID string, participants []events.Participant, now time.Time) (events.OverlayEvent, error) {
@@ -1820,6 +1981,10 @@ func (m *Manager) publish(ctx context.Context, event events.OverlayEvent) (event
 }
 
 func (m *Manager) publishWithGeneration(ctx context.Context, event events.OverlayEvent, expectedGeneration uint64) (events.OverlayEvent, error) {
+	return m.publishWithGenerations(ctx, event, expectedGeneration, 0)
+}
+
+func (m *Manager) publishWithGenerations(ctx context.Context, event events.OverlayEvent, expectedGeneration, expectedCaptionSessionGeneration uint64) (events.OverlayEvent, error) {
 	m.mu.Lock()
 	if err := m.ensureStreamLocked(event.StreamID); err != nil {
 		m.mu.Unlock()
@@ -1828,6 +1993,10 @@ func (m *Manager) publishWithGeneration(ctx context.Context, event events.Overla
 	if expectedGeneration != 0 && expectedGeneration != m.jobGeneration {
 		m.mu.Unlock()
 		return events.OverlayEvent{}, ErrJobGenerationMismatch
+	}
+	if expectedCaptionSessionGeneration != 0 && expectedCaptionSessionGeneration != m.captionSessionGeneration {
+		m.mu.Unlock()
+		return events.OverlayEvent{}, ErrCaptionSessionGenerationMismatch
 	}
 	encoderRecorderURL := m.current.EncoderRecorderURL
 	streamIngestToken := m.current.StreamIngestToken

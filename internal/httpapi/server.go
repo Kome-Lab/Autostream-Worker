@@ -205,6 +205,7 @@ func NewServerWithRuntimeConfigAndUpdaterIdentity(serviceType string, manager *j
 	mux.HandleFunc("POST /heartbeat", server.heartbeat)
 	mux.HandleFunc("POST /jobs/start", server.startJob)
 	mux.HandleFunc("POST /jobs/{id}/stop", server.stopJob)
+	mux.HandleFunc("PUT /jobs/{id}/caption-runtime-settings", server.updateCaptionRuntimeSettings)
 	mux.HandleFunc("POST /streams/{id}/audio/opus", server.captionAudio)
 	mux.HandleFunc("GET /streams/{id}/events", server.recentEvents)
 	mux.HandleFunc("POST /streams/{id}/events/current-time", server.currentTimeEvent)
@@ -318,6 +319,41 @@ func (s Server) stopJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stopped"})
+}
+
+func (s Server) updateCaptionRuntimeSettings(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "missing_or_invalid_service_token"})
+		return
+	}
+	var req struct {
+		CaptionProfileID string `json:"caption_profile_id"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
+		return
+	}
+	streamID := strings.TrimSpace(r.PathValue("id"))
+	req.CaptionProfileID = strings.TrimSpace(req.CaptionProfileID)
+	if streamID == "" || req.CaptionProfileID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "caption_profile_id_required"})
+		return
+	}
+	if s.runtimeConfig == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "runtime_config_unavailable", "message": "control panel runtime config fetch is not configured"})
+		return
+	}
+	cfg, err := s.runtimeConfig(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "runtime_config_unavailable", "message": "control panel runtime config fetch failed"})
+		return
+	}
+	s.manager.ApplyRuntimeConfig(cfg)
+	if err := s.manager.UpdateCaptionRuntimeSettings(r.Context(), streamID, req.CaptionProfileID); err != nil {
+		writeRequestError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.manager.Status())
 }
 
 func (s Server) captionAudio(w http.ResponseWriter, r *http.Request) {
@@ -569,6 +605,15 @@ func writeRequestError(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, jobs.ErrJobGenerationMismatch):
 		writeJSON(w, http.StatusConflict, map[string]string{"code": "job_generation_mismatch"})
+		return
+	case errors.Is(err, jobs.ErrCaptionSessionGenerationMismatch):
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "caption_session_generation_mismatch"})
+		return
+	case errors.Is(err, jobs.ErrNoActiveStreamJob):
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "no_active_stream_job"})
+		return
+	case errors.Is(err, jobs.ErrStreamIDDoesNotMatchJob):
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "stream_id_mismatch"})
 		return
 	case errors.Is(err, jobs.ErrStreamStopping):
 		writeJSON(w, http.StatusConflict, map[string]string{"code": "stream_stopping"})

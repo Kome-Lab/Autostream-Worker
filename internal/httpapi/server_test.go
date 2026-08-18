@@ -71,6 +71,12 @@ func (s *captureCaptionSession) snapshotPackets() []deepgram.AudioPacket {
 	return append([]deepgram.AudioPacket(nil), s.packets...)
 }
 
+func (s *captureCaptionSession) snapshotClosed() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
 type blockingCaptionSession struct {
 	started chan struct{}
 	release chan struct{}
@@ -865,6 +871,87 @@ func TestJobStartFailsClosedWhenCaptionSecretResolutionFails(t *testing.T) {
 	}
 	if manager.CurrentStreamID() != "" || resolveCalls != 1 {
 		t.Fatalf("job was partially started: status=%#v resolve_calls=%d", manager.Status(), resolveCalls)
+	}
+}
+
+func TestCaptionRuntimeSettingsRefreshesConfigAndReplacesRunningSession(t *testing.T) {
+	manager := jobs.NewManager(encoder.NoopPublisher{}, observability.Client{})
+	resolver := jobs.RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "runtime-key", ExpiresInSec: 300}, nil
+	})
+	var sessions []*captureCaptionSession
+	var languages []string
+	manager.SetCaptionRuntime(resolver, jobs.CaptionSessionFactoryFunc(func(config deepgram.Config, _ []byte, _ deepgram.Handler) (jobs.CaptionSession, error) {
+		session := &captureCaptionSession{ingested: make(chan struct{}, 1)}
+		sessions = append(sessions, session)
+		languages = append(languages, config.Language)
+		return session, nil
+	}))
+	initialConfig := captionRuntimeConfigForHTTP()
+	manager.ApplyRuntimeConfig(initialConfig)
+	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	updatedConfig := captionRuntimeConfigForHTTP()
+	updatedConfig.Profiles["caption"][0].Config["language"] = "en"
+	providerCalls := 0
+	server := httptest.NewServer(NewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "service-token"}, func(context.Context) (control.RuntimeConfig, error) {
+		providerCalls++
+		return updatedConfig, nil
+	}))
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPut, server.URL+"/jobs/stream-01/caption-runtime-settings", strings.NewReader(`{"caption_profile_id":"caption-01"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer service-token")
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("caption runtime update status = %d", res.StatusCode)
+	}
+	if providerCalls != 1 || len(sessions) != 2 || len(languages) != 2 || languages[0] != "ja" || languages[1] != "en" {
+		t.Fatalf("runtime refresh did not replace the configured session: provider=%d sessions=%d languages=%#v", providerCalls, len(sessions), languages)
+	}
+	if sessions[0].snapshotClosed() != 1 || sessions[1].snapshotClosed() != 0 {
+		t.Fatalf("caption session close state = old:%d new:%d", sessions[0].snapshotClosed(), sessions[1].snapshotClosed())
+	}
+}
+
+func TestCaptionRuntimeSettingsKeepsSessionWhenRuntimeConfigRefreshFails(t *testing.T) {
+	manager, session := captionReadyManager(t)
+	server := httptest.NewServer(NewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "service-token"}, func(context.Context) (control.RuntimeConfig, error) {
+		return control.RuntimeConfig{}, errors.New("upstream detail with secret-token")
+	}))
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPut, server.URL+"/jobs/stream-01/caption-runtime-settings", strings.NewReader(`{"caption_profile_id":"caption-01"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer service-token")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("caption runtime update status = %d", res.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(body["message"], "secret-token") || strings.Contains(body["code"], "secret-token") {
+		t.Fatal("runtime config failure leaked upstream details")
+	}
+	if session.snapshotClosed() != 0 || !manager.Status().CaptionSessionActive {
+		t.Fatalf("running caption session was not preserved: closed=%d status=%#v", session.snapshotClosed(), manager.Status())
 	}
 }
 

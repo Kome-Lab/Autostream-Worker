@@ -191,16 +191,17 @@ func isLocalDevHost(host string) bool {
 
 func serviceCapabilities() map[string]any {
 	return map[string]any{
-		"overlay_events":         true,
-		"caption_events":         true,
-		"caption_audio_ingest":   true,
-		"deepgram_transcription": true,
-		"participant_state":      true,
-		"active_speaker":         true,
-		"current_time_events":    true,
-		"scene_frames_mjpeg_srt": true,
-		"health_endpoint":        true,
-		"job_endpoint":           true,
+		"overlay_events":                true,
+		"caption_events":                true,
+		"caption_audio_ingest":          true,
+		"deepgram_transcription":        true,
+		"live_caption_runtime_settings": true,
+		"participant_state":             true,
+		"active_speaker":                true,
+		"current_time_events":           true,
+		"scene_frames_mjpeg_srt":        true,
+		"health_endpoint":               true,
+		"job_endpoint":                  true,
 	}
 }
 
