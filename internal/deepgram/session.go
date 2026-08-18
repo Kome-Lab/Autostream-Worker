@@ -97,6 +97,8 @@ type Session struct {
 	transcriptMessages         uint64
 	providerErrors             uint64
 	lastErrorClass             string
+	lastHTTPStatus             int
+	terminalProviderErr        error
 }
 
 // Status exposes only bounded counters and stable error classes. Provider
@@ -108,6 +110,7 @@ type Status struct {
 	TranscriptMessages uint64 `json:"transcript_messages"`
 	ProviderErrors     uint64 `json:"provider_errors"`
 	LastErrorClass     string `json:"last_error_class,omitempty"`
+	LastHTTPStatus     int    `json:"last_http_status,omitempty"`
 }
 
 // A user and connection generation identify a speaker. SSRC is only retained
@@ -129,7 +132,121 @@ type sessionOptions struct {
 }
 
 type socketDialer interface {
-	Dial(context.Context, string, http.Header) (socket, error)
+	Dial(context.Context, string, http.Header) (socket, int, error)
+}
+
+type providerFailure interface {
+	error
+	SafeErrorClass() string
+	SafeHTTPStatus() int
+	Retryable() bool
+}
+
+type providerError struct {
+	errorClass string
+	httpStatus int
+	retryable  bool
+}
+
+func (e *providerError) Error() string {
+	return ErrUnavailable.Error()
+}
+
+func (e *providerError) Unwrap() error {
+	return ErrUnavailable
+}
+
+func (e *providerError) SafeErrorClass() string {
+	return e.errorClass
+}
+
+func (e *providerError) SafeHTTPStatus() int {
+	return e.httpStatus
+}
+
+func (e *providerError) Retryable() bool {
+	return e.retryable
+}
+
+func newProviderError(errorClass string, httpStatus int, retryable bool) error {
+	return &providerError{
+		errorClass: errorClass,
+		httpStatus: safeHTTPStatus(httpStatus),
+		retryable:  retryable,
+	}
+}
+
+// SafeErrorClass returns only a bounded provider failure class. Raw transport
+// errors, provider payloads, endpoints, and credentials are never returned.
+func SafeErrorClass(err error) (string, bool) {
+	var failure providerFailure
+	if !errors.As(err, &failure) || !isSafeProviderErrorClass(failure.SafeErrorClass()) {
+		return "", false
+	}
+	return failure.SafeErrorClass(), true
+}
+
+// SafeHTTPStatus returns a valid provider handshake status when one was
+// available. Response bodies are never retained or exposed.
+func SafeHTTPStatus(err error) (int, bool) {
+	var failure providerFailure
+	if !errors.As(err, &failure) {
+		return 0, false
+	}
+	status := safeHTTPStatus(failure.SafeHTTPStatus())
+	return status, status != 0
+}
+
+// IsRetryable reports whether retrying the same immutable session may
+// converge. Authentication and request rejections require a new job/session.
+func IsRetryable(err error) bool {
+	var failure providerFailure
+	if errors.As(err, &failure) {
+		return failure.Retryable()
+	}
+	return errors.Is(err, ErrUnavailable) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func safeHTTPStatus(status int) int {
+	if status < 100 || status > 599 {
+		return 0
+	}
+	return status
+}
+
+func isSafeProviderErrorClass(errorClass string) bool {
+	switch errorClass {
+	case "provider_auth_rejected",
+		"provider_request_rejected",
+		"provider_rate_limited",
+		"provider_dial_timeout",
+		"provider_unavailable",
+		"provider_dial_failed",
+		"provider_write_failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func classifyDialFailure(status int, err error) error {
+	status = safeHTTPStatus(status)
+	switch {
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case errors.Is(err, context.DeadlineExceeded), status == http.StatusRequestTimeout:
+		return newProviderError("provider_dial_timeout", status, true)
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return newProviderError("provider_auth_rejected", status, false)
+	case status == http.StatusTooManyRequests:
+		return newProviderError("provider_rate_limited", status, true)
+	case status == http.StatusConflict || status == http.StatusTooEarly || status >= http.StatusInternalServerError:
+		return newProviderError("provider_unavailable", status, true)
+	case status != 0 && status != http.StatusSwitchingProtocols:
+		return newProviderError("provider_request_rejected", status, false)
+	default:
+		return newProviderError("provider_dial_failed", status, true)
+	}
 }
 
 type socket interface {
@@ -284,7 +401,7 @@ func buildListenURL(endpoint string, config Config) (string, error) {
 	query.Set("interim_results", strconv.FormatBool(config.InterimResults))
 	query.Set("smart_format", strconv.FormatBool(config.SmartFormat))
 	query.Set("endpointing", strconv.Itoa(config.EndpointingMS))
-	if config.UtteranceEndMS > 0 {
+	if config.UtteranceEndMS > 0 && config.InterimResults {
 		query.Set("utterance_end_ms", strconv.Itoa(config.UtteranceEndMS))
 	}
 	if config.MIPOptOut {
@@ -330,15 +447,19 @@ func validateConfig(config Config) error {
 	return nil
 }
 
-func (d coderDialer) Dial(ctx context.Context, endpoint string, header http.Header) (socket, error) {
-	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
+func (d coderDialer) Dial(ctx context.Context, endpoint string, header http.Header) (socket, int, error) {
+	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
 		HTTPClient: d.client,
 		HTTPHeader: header,
 	})
-	if err != nil {
-		return nil, err
+	status := 0
+	if response != nil {
+		status = response.StatusCode
 	}
-	return conn, nil
+	if err != nil {
+		return nil, status, err
+	}
+	return conn, status, nil
 }
 
 func (s *Session) Ingest(ctx context.Context, packet AudioPacket) error {
@@ -351,9 +472,10 @@ func (s *Session) Ingest(ctx context.Context, packet AudioPacket) error {
 		return err
 	}
 	if err := conn.writeAudio(ctx, packet.Opus); err != nil {
-		s.recordProviderError("provider_write_failed")
+		providerErr := newProviderError("provider_write_failed", 0, true)
+		s.recordProviderErrorWithStatus("provider_write_failed", 0)
 		s.discard(conn)
-		return ErrUnavailable
+		return providerErr
 	}
 	conn.markAudio(packet.ReceivedAt)
 	s.recordAudioPacketSent()
@@ -372,6 +494,7 @@ func (s *Session) Status() Status {
 		TranscriptMessages: s.transcriptMessages,
 		ProviderErrors:     s.providerErrors,
 		LastErrorClass:     s.lastErrorClass,
+		LastHTTPStatus:     s.lastHTTPStatus,
 	}
 }
 
@@ -388,12 +511,17 @@ func (s *Session) recordTranscriptMessage() {
 }
 
 func (s *Session) recordProviderError(errorClass string) {
+	s.recordProviderErrorWithStatus(errorClass, 0)
+}
+
+func (s *Session) recordProviderErrorWithStatus(errorClass string, httpStatus int) {
 	if s == nil || strings.TrimSpace(errorClass) == "" {
 		return
 	}
 	s.mu.Lock()
 	s.providerErrors++
 	s.lastErrorClass = errorClass
+	s.lastHTTPStatus = safeHTTPStatus(httpStatus)
 	s.mu.Unlock()
 }
 
@@ -442,6 +570,11 @@ func (s *Session) connection(ctx context.Context, packet AudioPacket) (*speakerC
 				conn.abort()
 			}
 			continue
+		}
+		if s.terminalProviderErr != nil {
+			err := s.terminalProviderErr
+			s.mu.Unlock()
+			return nil, err
 		}
 		if conn := s.conns[key]; conn != nil {
 			s.mu.Unlock()
@@ -503,8 +636,13 @@ func (s *Session) connection(ctx context.Context, packet AudioPacket) (*speakerC
 
 func (s *Session) completeDial(ctx context.Context, call *dialCall, key connectionKey, packet AudioPacket) (*speakerConnection, error) {
 	sock, dialErr := s.dial(ctx)
-	if dialErr != nil && ctx.Err() == nil {
-		s.recordProviderError("provider_dial_failed")
+	if dialErr != nil && !errors.Is(dialErr, context.Canceled) {
+		errorClass := "provider_dial_failed"
+		if classified, ok := SafeErrorClass(dialErr); ok {
+			errorClass = classified
+		}
+		httpStatus, _ := SafeHTTPStatus(dialErr)
+		s.recordProviderErrorWithStatus(errorClass, httpStatus)
 	}
 	var conn *speakerConnection
 	var closeSocket bool
@@ -513,7 +651,10 @@ func (s *Session) completeDial(ctx context.Context, call *dialCall, key connecti
 	delete(s.dialing, key)
 	switch {
 	case dialErr != nil:
-		call.err = ErrUnavailable
+		call.err = dialErr
+		if errors.Is(dialErr, ErrUnavailable) && !IsRetryable(dialErr) {
+			s.terminalProviderErr = dialErr
+		}
 		closeSocket = sock != nil
 	case s.closed:
 		call.err = ErrClosed
@@ -546,11 +687,11 @@ func (s *Session) dial(ctx context.Context) (socket, error) {
 	copy(authorization[len("Token "):], s.apiKey)
 	header := make(http.Header)
 	header.Set("Authorization", string(authorization))
-	conn, err := s.options.dialer.Dial(ctx, s.endpoint, header)
+	conn, status, err := s.options.dialer.Dial(ctx, s.endpoint, header)
 	header.Del("Authorization")
 	zeroBytes(authorization)
 	if err != nil || conn == nil {
-		return nil, ErrUnavailable
+		return nil, classifyDialFailure(status, err)
 	}
 	conn.SetReadLimit(maxResultMessageBytes)
 	return conn, nil

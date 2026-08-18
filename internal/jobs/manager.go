@@ -134,6 +134,7 @@ type Status struct {
 	CaptionProviderTranscriptMessages uint64         `json:"caption_provider_transcript_messages_total"`
 	CaptionProviderErrors             uint64         `json:"caption_provider_errors_total"`
 	CaptionProviderLastErrorClass     string         `json:"caption_provider_last_error_class,omitempty"`
+	CaptionProviderLastHTTPStatus     int            `json:"caption_provider_last_http_status,omitempty"`
 	LastEventAt                       time.Time      `json:"last_event_at,omitempty"`
 }
 
@@ -962,11 +963,14 @@ func classifyCaptionAudioError(err error) string {
 		return "deepgram_session_closed"
 	case errors.Is(err, deepgram.ErrStaleConnectionGeneration):
 		return "connection_generation_stale"
-	case errors.Is(err, deepgram.ErrUnavailable):
-		return "deepgram_unavailable"
-	default:
-		return "caption_audio_ingest_failed"
 	}
+	if errorClass, ok := deepgram.SafeErrorClass(err); ok {
+		return errorClass
+	}
+	if errors.Is(err, deepgram.ErrUnavailable) {
+		return "deepgram_unavailable"
+	}
+	return "caption_audio_ingest_failed"
 }
 
 func closeCaptionSession(session CaptionSession) {
@@ -1169,6 +1173,20 @@ func (m *Manager) runCaptionAudioIngress(ingress *captionAudioIngress) {
 type captionAudioFailure struct {
 	packet     deepgram.AudioPacket
 	errorClass string
+	httpStatus int
+	retryable  bool
+	batchWide  bool
+}
+
+func newCaptionAudioFailure(packet deepgram.AudioPacket, err error) captionAudioFailure {
+	httpStatus, _ := deepgram.SafeHTTPStatus(err)
+	return captionAudioFailure{
+		packet:     packet,
+		errorClass: classifyCaptionAudioError(err),
+		httpStatus: httpStatus,
+		retryable:  deepgram.IsRetryable(err),
+		batchWide:  errors.Is(err, deepgram.ErrUnavailable) || errors.Is(err, deepgram.ErrClosed),
+	}
 }
 
 func (m *Manager) processCaptionAudioBatch(ctx context.Context, ingress *captionAudioIngress, batch captionAudioBatch) {
@@ -1183,6 +1201,9 @@ func (m *Manager) processCaptionAudioBatch(ctx context.Context, ingress *caption
 		failures, _, err = m.ingestCaptionAudioAttempt(ctx, batch.streamID, batch.generation, batch.connectionGeneration, remaining)
 		if err != nil || len(failures) == 0 || ingress.ctx.Err() != nil {
 			return
+		}
+		if !captionAudioFailuresRetryable(failures) {
+			break
 		}
 		if attempt == captionAudioRetryMax || ctx.Err() != nil {
 			break
@@ -1248,6 +1269,31 @@ func captionAudioFailureClass(failures []captionAudioFailure) string {
 	return class
 }
 
+func captionAudioFailuresRetryable(failures []captionAudioFailure) bool {
+	if len(failures) == 0 {
+		return false
+	}
+	for _, failure := range failures {
+		if !failure.retryable {
+			return false
+		}
+	}
+	return true
+}
+
+func captionAudioFailureHTTPStatus(failures []captionAudioFailure) int {
+	if len(failures) == 0 || failures[0].httpStatus == 0 {
+		return 0
+	}
+	status := failures[0].httpStatus
+	for _, failure := range failures[1:] {
+		if failure.httpStatus != status {
+			return 0
+		}
+	}
+	return status
+}
+
 func (m *Manager) recordCaptionAudioRetry(streamID string, generation, connectionGeneration uint64, ingress *captionAudioIngress) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1271,13 +1317,18 @@ func (m *Manager) recordCaptionAudioProviderDrop(streamID string, generation, co
 	m.mu.Unlock()
 	diagnosticCtx, cancel := context.WithTimeout(context.Background(), captionDiagnosticTimeout)
 	defer cancel()
-	m.report(diagnosticCtx, streamID, "worker.caption.audio_dropped", "failed", map[string]any{
+	attributes := map[string]any{
 		"job_generation":        generation,
 		"connection_generation": connectionGeneration,
 		"packet_count":          len(failures),
 		"retry_count":           retryCount,
 		"error_class":           captionAudioFailureClass(failures),
-	})
+		"retryable":             captionAudioFailuresRetryable(failures),
+	}
+	if httpStatus := captionAudioFailureHTTPStatus(failures); httpStatus != 0 {
+		attributes["http_status"] = httpStatus
+	}
+	m.report(diagnosticCtx, streamID, "worker.caption.audio_dropped", "failed", attributes)
 }
 
 func stopCaptionAudioIngress(ctx context.Context, ingress *captionAudioIngress) {
@@ -1458,9 +1509,14 @@ func (m *Manager) IngestCaptionAudioForGeneration(ctx context.Context, streamID 
 		return err
 	}
 	for _, failure := range failures {
-		m.report(ctx, streamID, "worker.caption.audio_failed", "failed", map[string]any{
+		attributes := map[string]any{
 			"error_class": failure.errorClass,
-		})
+			"retryable":   failure.retryable,
+		}
+		if failure.httpStatus != 0 {
+			attributes["http_status"] = failure.httpStatus
+		}
+		m.report(ctx, streamID, "worker.caption.audio_failed", "failed", attributes)
 	}
 	if len(failures) > 0 {
 		return ErrCaptionAudioUnavailable
@@ -1493,7 +1549,7 @@ func (m *Manager) ingestCaptionAudioAttempt(ctx context.Context, streamID string
 	}
 	failures := make([]captionAudioFailure, 0)
 	accepted := 0
-	for _, packet := range packets {
+	for index, packet := range packets {
 		if err := ctx.Err(); err != nil {
 			return failures, accepted, err
 		}
@@ -1501,7 +1557,16 @@ func (m *Manager) ingestCaptionAudioAttempt(ctx context.Context, streamID string
 			return nil, accepted, ErrCaptionAudioPayloadInvalid
 		}
 		if err := captionSession.Ingest(ctx, packet); err != nil {
-			failures = append(failures, captionAudioFailure{packet: packet, errorClass: classifyCaptionAudioError(err)})
+			failure := newCaptionAudioFailure(packet, err)
+			failures = append(failures, failure)
+			if failure.batchWide {
+				for _, remainingPacket := range packets[index+1:] {
+					remainingFailure := failure
+					remainingFailure.packet = remainingPacket
+					failures = append(failures, remainingFailure)
+				}
+				break
+			}
 			continue
 		}
 		accepted++
@@ -1584,6 +1649,7 @@ func (m *Manager) Status() Status {
 		status.CaptionProviderTranscriptMessages = providerStatus.TranscriptMessages
 		status.CaptionProviderErrors = providerStatus.ProviderErrors
 		status.CaptionProviderLastErrorClass = providerStatus.LastErrorClass
+		status.CaptionProviderLastHTTPStatus = providerStatus.LastHTTPStatus
 	}
 	if m.captionIngress != nil {
 		status.CaptionAudioQueueBatches, status.CaptionAudioQueuePackets, status.CaptionAudioQueueBytes = m.captionIngress.snapshot()

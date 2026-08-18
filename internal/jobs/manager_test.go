@@ -346,9 +346,45 @@ type controlledCaptionSession struct {
 type retryCaptionSession struct {
 	mu                sync.Mutex
 	failuresRemaining int
+	failureErr        error
 	calls             int
 	packets           []deepgram.AudioPacket
 	called            chan struct{}
+}
+
+type classifiedCaptionProviderError struct {
+	errorClass string
+	httpStatus int
+	retryable  bool
+}
+
+func (e classifiedCaptionProviderError) Error() string { return "provider detail must not be reported" }
+func (e classifiedCaptionProviderError) Unwrap() error { return deepgram.ErrUnavailable }
+func (e classifiedCaptionProviderError) SafeErrorClass() string {
+	return e.errorClass
+}
+func (e classifiedCaptionProviderError) SafeHTTPStatus() int { return e.httpStatus }
+func (e classifiedCaptionProviderError) Retryable() bool     { return e.retryable }
+
+type capturedReport struct {
+	name       string
+	attributes map[string]any
+}
+
+type channelReporter struct {
+	reports chan capturedReport
+}
+
+func (r *channelReporter) Event(_ context.Context, _, name, _ string, attributes map[string]any) error {
+	select {
+	case r.reports <- capturedReport{name: name, attributes: attributes}:
+	default:
+	}
+	return nil
+}
+
+func (*channelReporter) Metric(context.Context, string, string, string, float64, map[string]any) error {
+	return nil
 }
 
 type closeBlockingCaptionSession struct {
@@ -386,6 +422,9 @@ func (s *retryCaptionSession) Ingest(_ context.Context, packet deepgram.AudioPac
 	default:
 	}
 	if failed {
+		if s.failureErr != nil {
+			return s.failureErr
+		}
 		return deepgram.ErrUnavailable
 	}
 	return nil
@@ -589,9 +628,9 @@ func TestManagerStartsSelectedCaptionProfileAndPublishesDeepgramResults(t *testi
 	if len(session.packets) != 1 || session.packets[0].SSRC != 42 || session.packets[0].UserID != "speaker-42" {
 		t.Fatalf("caption audio was not forwarded: %#v", session.packets)
 	}
-	session.status = deepgram.Status{ActiveConnections: 1, AudioPacketsSent: 1, TranscriptMessages: 2, ProviderErrors: 1, LastErrorClass: "provider_read_closed"}
+	session.status = deepgram.Status{ActiveConnections: 1, AudioPacketsSent: 1, TranscriptMessages: 2, ProviderErrors: 1, LastErrorClass: "provider_auth_rejected", LastHTTPStatus: http.StatusUnauthorized}
 	captionStatus := manager.Status()
-	if !captionStatus.CaptionSessionActive || captionStatus.CaptionProviderConnections != 1 || captionStatus.CaptionProviderAudioPackets != 1 || captionStatus.CaptionProviderTranscriptMessages != 2 || captionStatus.CaptionProviderErrors != 1 || captionStatus.CaptionProviderLastErrorClass != "provider_read_closed" {
+	if !captionStatus.CaptionSessionActive || captionStatus.CaptionProviderConnections != 1 || captionStatus.CaptionProviderAudioPackets != 1 || captionStatus.CaptionProviderTranscriptMessages != 2 || captionStatus.CaptionProviderErrors != 1 || captionStatus.CaptionProviderLastErrorClass != "provider_auth_rejected" || captionStatus.CaptionProviderLastHTTPStatus != http.StatusUnauthorized {
 		t.Fatalf("caption provider diagnostics were not exposed safely: %#v", captionStatus)
 	}
 	if err := session.handler(t.Context(), deepgram.Transcript{Text: "interim", SpeakerUserID: "speaker-42"}); err != nil {
@@ -869,6 +908,99 @@ func TestManagerCaptionIngressCountsFinalProviderDrop(t *testing.T) {
 	status := manager.Status()
 	if status.CaptionAudioRetries != captionAudioRetryMax-1 || status.CaptionAudioProviderDrops != 1 {
 		t.Fatalf("unexpected final caption drop status: %#v", status)
+	}
+	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerCaptionIngressStopsRetryingTerminalProviderRejection(t *testing.T) {
+	reporter := &channelReporter{reports: make(chan capturedReport, 16)}
+	session := &retryCaptionSession{
+		failuresRemaining: 100,
+		failureErr: classifiedCaptionProviderError{
+			errorClass: "provider_auth_rejected",
+			httpStatus: http.StatusUnauthorized,
+			retryable:  false,
+		},
+		called: make(chan struct{}, 16),
+	}
+	manager := NewManager(&fakePublisher{}, reporter)
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error) {
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	generation := manager.Status().JobGeneration
+	packets := make([]deepgram.AudioPacket, 5)
+	for i := range packets {
+		packets[i] = deepgram.AudioPacket{SSRC: 42, UserID: "speaker-42", JobGeneration: generation, ConnectionGeneration: 1, Sequence: uint16(i + 1), Opus: []byte{1}}
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packets); err != nil {
+		t.Fatal(err)
+	}
+
+	var drop capturedReport
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for drop.name == "" {
+		select {
+		case report := <-reporter.reports:
+			if report.name == "worker.caption.audio_dropped" {
+				drop = report
+			}
+		case <-deadline.C:
+			t.Fatal("terminal provider drop was not reported")
+		}
+	}
+	calls, _ := session.snapshot()
+	status := manager.Status()
+	if calls != 1 || status.CaptionAudioRetries != 0 || status.CaptionAudioProviderDrops != len(packets) {
+		t.Fatalf("terminal failure was amplified: calls=%d status=%#v", calls, status)
+	}
+	if drop.attributes["error_class"] != "provider_auth_rejected" || drop.attributes["http_status"] != http.StatusUnauthorized || drop.attributes["retryable"] != false || drop.attributes["retry_count"] != 0 {
+		t.Fatalf("unexpected safe terminal diagnostic: %#v", drop.attributes)
+	}
+	if _, leaked := drop.attributes["error"]; leaked {
+		t.Fatalf("raw provider error leaked: %#v", drop.attributes)
+	}
+	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerCaptionIngressFailsFastAcrossProviderOutageBatch(t *testing.T) {
+	session := &retryCaptionSession{failuresRemaining: 100, called: make(chan struct{}, 32)}
+	manager := NewManager(&fakePublisher{}, observability.Client{})
+	manager.SetCaptionRuntime(RuntimeSecretResolverFunc(func(_ context.Context, _, secretName string) (control.RuntimeSecret, error) {
+		return control.RuntimeSecret{SecretName: secretName, Value: "dg-runtime-key", ExpiresInSec: 300}, nil
+	}), CaptionSessionFactoryFunc(func(deepgram.Config, []byte, deepgram.Handler) (CaptionSession, error) {
+		return session, nil
+	}))
+	manager.ApplyRuntimeConfig(captionRuntimeConfig(control.RuntimeProfile{ID: "caption-01", Kind: "caption", Config: captionProfileConfig("ja")}))
+	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01", CaptionProfileID: "caption-01"}); err != nil {
+		t.Fatal(err)
+	}
+	generation := manager.Status().JobGeneration
+	packets := make([]deepgram.AudioPacket, 5)
+	for i := range packets {
+		packets[i] = deepgram.AudioPacket{SSRC: 42, UserID: "speaker-42", JobGeneration: generation, ConnectionGeneration: 1, Sequence: uint16(i + 1), Opus: []byte{1}}
+	}
+	if err := manager.EnqueueCaptionAudioForGeneration(t.Context(), "stream-01", generation, packets); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for manager.Status().CaptionAudioProviderDrops == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	calls, _ := session.snapshot()
+	status := manager.Status()
+	if calls != captionAudioRetryMax || status.CaptionAudioRetries != captionAudioRetryMax-1 || status.CaptionAudioProviderDrops != len(packets) {
+		t.Fatalf("provider outage retried per packet: calls=%d status=%#v", calls, status)
 	}
 	if err := manager.Stop(t.Context(), "stream-01"); err != nil {
 		t.Fatal(err)

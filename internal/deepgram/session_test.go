@@ -14,8 +14,9 @@ import (
 )
 
 type fakeDialResult struct {
-	socket *fakeSocket
-	err    error
+	socket     *fakeSocket
+	statusCode int
+	err        error
 }
 
 type fakeDialRecord struct {
@@ -39,7 +40,7 @@ type delayedFirstDialer struct {
 	once    sync.Once
 }
 
-func (d *delayedFirstDialer) Dial(_ context.Context, _ string, _ http.Header) (socket, error) {
+func (d *delayedFirstDialer) Dial(_ context.Context, _ string, _ http.Header) (socket, int, error) {
 	d.mu.Lock()
 	d.calls++
 	call := d.calls
@@ -47,21 +48,21 @@ func (d *delayedFirstDialer) Dial(_ context.Context, _ string, _ http.Header) (s
 	if call == 1 {
 		d.once.Do(func() { close(d.started) })
 		<-d.release
-		return d.first, nil
+		return d.first, http.StatusSwitchingProtocols, nil
 	}
-	return d.second, nil
+	return d.second, http.StatusSwitchingProtocols, nil
 }
 
-func (d *fakeDialer) Dial(_ context.Context, endpoint string, header http.Header) (socket, error) {
+func (d *fakeDialer) Dial(_ context.Context, endpoint string, header http.Header) (socket, int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.records = append(d.records, fakeDialRecord{endpoint: endpoint, header: header.Clone()})
 	if len(d.results) == 0 {
-		return nil, errors.New("no fake socket configured")
+		return nil, 0, errors.New("no fake socket configured")
 	}
 	result := d.results[0]
 	d.results = d.results[1:]
-	return result.socket, result.err
+	return result.socket, result.statusCode, result.err
 }
 
 func (d *fakeDialer) snapshot() []fakeDialRecord {
@@ -185,6 +186,26 @@ func TestListenURLUsesRawDiscordOpusSettings(t *testing.T) {
 	}
 }
 
+func TestListenURLOmitsUtteranceEndWhenInterimResultsAreDisabled(t *testing.T) {
+	config := testConfig(0)
+	config.InterimResults = false
+	config.UtteranceEndMS = 1000
+	rawURL, err := ListenURL(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Get("interim_results") != "false" {
+		t.Fatalf("interim_results = %q, want false", parsed.Query().Get("interim_results"))
+	}
+	if _, present := parsed.Query()["utterance_end_ms"]; present {
+		t.Fatalf("utterance_end_ms must be omitted without interim results: %v", parsed.Query())
+	}
+}
+
 func TestSessionLazyDialsAndSendsBinaryAudioAndTextKeepAlive(t *testing.T) {
 	sock := newFakeSocket()
 	sock.closeAfterCloseStream = true
@@ -299,6 +320,103 @@ func TestSessionReconnectsAfterAudioWriteFailureWithoutLeakingDetails(t *testing
 	}
 	if len(dialer.snapshot()) != 2 {
 		t.Fatalf("dial count = %d, want 2", len(dialer.snapshot()))
+	}
+}
+
+func TestSessionClassifiesTerminalHandshakeRejectionWithoutRedial(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		wantClass  string
+	}{
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, wantClass: "provider_auth_rejected"},
+		{name: "forbidden", statusCode: http.StatusForbidden, wantClass: "provider_auth_rejected"},
+		{name: "bad request", statusCode: http.StatusBadRequest, wantClass: "provider_request_rejected"},
+		{name: "unexpected success response", statusCode: http.StatusOK, wantClass: "provider_request_rejected"},
+		{name: "redirect", statusCode: http.StatusFound, wantClass: "provider_request_rejected"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dialer := &fakeDialer{results: []fakeDialResult{{
+				statusCode: tt.statusCode,
+				err:        errors.New("provider rejected dg-runtime-key endpointing=300"),
+			}}}
+			session, err := newSession(testConfig(0), []byte("dg-runtime-key"), func(context.Context, Transcript) error { return nil }, testOptions(dialer))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = session.Close(t.Context()) })
+
+			err = session.Ingest(t.Context(), AudioPacket{SSRC: 42, Opus: []byte{1}})
+			if !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("handshake error = %v, want %v", err, ErrUnavailable)
+			}
+			if got, ok := SafeErrorClass(err); !ok || got != tt.wantClass {
+				t.Fatalf("safe error class = %q, %v; want %q, true", got, ok, tt.wantClass)
+			}
+			if got, ok := SafeHTTPStatus(err); !ok || got != tt.statusCode {
+				t.Fatalf("safe HTTP status = %d, %v; want %d, true", got, ok, tt.statusCode)
+			}
+			if IsRetryable(err) {
+				t.Fatalf("terminal HTTP %d rejection was retryable", tt.statusCode)
+			}
+			if strings.Contains(err.Error(), "dg-runtime-key") || strings.Contains(err.Error(), "endpointing") {
+				t.Fatalf("handshake error leaked sensitive details: %v", err)
+			}
+
+			secondErr := session.Ingest(t.Context(), AudioPacket{SSRC: 42, Opus: []byte{2}})
+			if got, _ := SafeErrorClass(secondErr); got != tt.wantClass {
+				t.Fatalf("terminal error was not retained safely: %v", secondErr)
+			}
+			if calls := len(dialer.snapshot()); calls != 1 {
+				t.Fatalf("terminal rejection redialed: calls=%d want=1", calls)
+			}
+			status := session.Status()
+			if status.LastErrorClass != tt.wantClass || status.LastHTTPStatus != tt.statusCode {
+				t.Fatalf("unexpected safe provider status: %#v", status)
+			}
+		})
+	}
+}
+
+func TestSessionClassifiesTransientHandshakeFailureAndRedials(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		wantClass  string
+	}{
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, wantClass: "provider_rate_limited"},
+		{name: "provider unavailable", statusCode: http.StatusServiceUnavailable, wantClass: "provider_unavailable"},
+		{name: "transport", statusCode: 0, wantClass: "provider_dial_failed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sock := newFakeSocket()
+			sock.closeAfterCloseStream = true
+			dialer := &fakeDialer{results: []fakeDialResult{
+				{statusCode: tt.statusCode, err: errors.New("transient provider detail must not escape")},
+				{socket: sock, statusCode: http.StatusSwitchingProtocols},
+			}}
+			session, err := newSession(testConfig(0), []byte("dg-runtime-key"), func(context.Context, Transcript) error { return nil }, testOptions(dialer))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = session.Close(t.Context()) })
+
+			err = session.Ingest(t.Context(), AudioPacket{SSRC: 42, Opus: []byte{1}})
+			if got, ok := SafeErrorClass(err); !ok || got != tt.wantClass {
+				t.Fatalf("safe error class = %q, %v; want %q, true", got, ok, tt.wantClass)
+			}
+			if !IsRetryable(err) {
+				t.Fatalf("transient failure was not retryable: %v", err)
+			}
+			if err := session.Ingest(t.Context(), AudioPacket{SSRC: 42, Opus: []byte{2}}); err != nil {
+				t.Fatalf("transient failure did not reconnect: %v", err)
+			}
+			if calls := len(dialer.snapshot()); calls != 2 {
+				t.Fatalf("transient failure dial count=%d want=2", calls)
+			}
+		})
 	}
 }
 
