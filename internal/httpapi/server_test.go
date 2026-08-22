@@ -603,7 +603,7 @@ func TestCaptionAudioVerifierRequiresStrictSignedClaims(t *testing.T) {
 	}
 }
 
-func TestCaptionAudioEndpointAcceptsContractPayloadWithSignedToken(t *testing.T) {
+func TestCaptionAudioEndpointAcceptsMatchingJobGeneration(t *testing.T) {
 	const signingKey = "caption-signing-key"
 	manager, captionSession := captionReadyManager(t)
 	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
@@ -644,22 +644,37 @@ func TestCaptionAudioEndpointAcceptsContractPayloadWithSignedToken(t *testing.T)
 }
 
 func TestCaptionAudioEndpointRequiresNonzeroJobGeneration(t *testing.T) {
-	const signingKey = "caption-generation-signing-key"
-	manager, _ := captionReadyManager(t)
-	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
-	defer server.Close()
-	body := `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ=="}]}`
-	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", signedCaptionAudioAuthorization(t, signingKey, "stream-01"), body)
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusBadRequest {
-		t.Fatalf("missing generation status = %d, want 400", res.StatusCode)
-	}
-	var response map[string]string
-	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-		t.Fatal(err)
-	}
-	if response["code"] != "job_generation_required" {
-		t.Fatalf("unexpected missing generation response: %#v", response)
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "missing",
+			body: `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","connection_generation":1,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ=="}]}`,
+		},
+		{
+			name: "zero",
+			body: `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","job_generation":0,"connection_generation":1,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ=="}]}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const signingKey = "caption-generation-signing-key"
+			manager, _ := captionReadyManager(t)
+			server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+			defer server.Close()
+			res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", signedCaptionAudioAuthorization(t, signingKey, "stream-01"), test.body)
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", res.StatusCode)
+			}
+			var response map[string]string
+			if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+				t.Fatal(err)
+			}
+			if response["code"] != "job_generation_required" {
+				t.Fatalf("unexpected generation response: %#v", response)
+			}
+		})
 	}
 }
 
