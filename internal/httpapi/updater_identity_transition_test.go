@@ -48,6 +48,9 @@ func assertUpdaterIdentityStatus(t *testing.T, handler http.Handler, wantStatus 
 	if res.Code != wantStatus {
 		t.Fatalf("status = %d body = %s, want %d", res.Code, res.Body.String(), wantStatus)
 	}
+	if got := res.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("cache control = %q, want no-store", got)
+	}
 	if wantServiceID != "" && !strings.Contains(res.Body.String(), `"service_id":"`+wantServiceID+`"`) {
 		t.Fatalf("response does not contain authoritative service id %q: %s", wantServiceID, res.Body.String())
 	}
