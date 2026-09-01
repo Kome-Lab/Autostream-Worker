@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/example/autostream-worker/internal/events"
+	"github.com/example/autostream-worker/internal/sceneappearance"
 )
 
 const (
@@ -105,6 +106,7 @@ type Snapshot struct {
 	Chat         []ChatMessage
 	Captions     []Caption
 	Conversation []ConversationItem
+	appearance   *renderAppearance
 }
 
 type Scene struct {
@@ -137,6 +139,7 @@ type Scene struct {
 	captions       []Caption
 	conversation   []ConversationItem
 	seenMessages   map[string]time.Time
+	appearance     *renderAppearance
 }
 
 func New(config Config) (*Scene, error) {
@@ -242,7 +245,28 @@ func (s *Scene) Reset(generation uint64, streamID, streamName string) {
 	s.streamID = strings.TrimSpace(streamID)
 	s.streamName = cleanText(streamName, 160)
 	s.generation = generation
+	s.appearance = nil
 	s.resetStateLocked()
+}
+
+// ConfigureAppearance installs one already-validated, immutable start
+// snapshot. Backgrounds are scaled once at the job boundary, never fetched or
+// decoded from the per-frame render path.
+func (s *Scene) ConfigureAppearance(prepared sceneappearance.Prepared) error {
+	if s == nil {
+		return ErrNoActiveScene
+	}
+	appearance, err := prepareRenderAppearance(prepared)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.streamID == "" {
+		return ErrNoActiveScene
+	}
+	s.appearance = appearance
+	return nil
 }
 
 func (s *Scene) Close() {
@@ -263,6 +287,7 @@ func (s *Scene) Close() {
 	s.fonts = map[int]*fontSet{}
 	s.streamID, s.streamName = "", ""
 	s.generation = 0
+	s.appearance = nil
 	s.resetStateLocked()
 }
 
@@ -277,6 +302,7 @@ func (s *Scene) Clear(streamID string) {
 		return
 	}
 	s.streamID, s.streamName = "", ""
+	s.appearance = nil
 	s.resetStateLocked()
 }
 
@@ -351,6 +377,7 @@ func (s *Scene) Snapshot(at time.Time) Snapshot {
 		CurrentTime: at.In(jstLocation()), Participants: participants,
 		Chat: append([]ChatMessage(nil), s.chat...), Captions: append([]Caption(nil), s.captions...),
 		Conversation: append([]ConversationItem(nil), s.conversation...),
+		appearance:   s.appearance,
 	}
 }
 

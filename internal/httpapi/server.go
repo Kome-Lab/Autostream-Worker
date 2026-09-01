@@ -22,6 +22,7 @@ import (
 	"github.com/example/autostream-worker/internal/ingesttoken"
 	"github.com/example/autostream-worker/internal/jobs"
 	"github.com/example/autostream-worker/internal/observability"
+	"github.com/example/autostream-worker/internal/sceneappearance"
 	"github.com/example/autostream-worker/internal/version"
 )
 
@@ -584,6 +585,10 @@ func writeEventResult(w http.ResponseWriter, event events.OverlayEvent, err erro
 }
 
 func writeRequestError(w http.ResponseWriter, err error) {
+	if code, ok := sceneappearance.CodeOf(err); ok {
+		writeJSON(w, sceneAppearanceHTTPStatus(code), map[string]string{"code": string(code)})
+		return
+	}
 	switch {
 	case errors.Is(err, jobs.ErrCaptionProfileInvalid):
 		writeJSON(w, http.StatusConflict, map[string]string{"code": "caption_profile_invalid", "message": "selected caption profile is invalid"})
@@ -626,6 +631,27 @@ func writeRequestError(w http.ResponseWriter, err error) {
 		code = "validation_failed"
 	}
 	writeJSON(w, status, map[string]string{"code": code, "message": err.Error()})
+}
+
+func sceneAppearanceHTTPStatus(code sceneappearance.ErrorCode) int {
+	switch code {
+	case sceneappearance.CodeMediaAssetUnauthorized:
+		return http.StatusForbidden
+	case sceneappearance.CodeMediaAssetNotFound:
+		return http.StatusNotFound
+	case sceneappearance.CodeMediaAssetTimeout:
+		return http.StatusGatewayTimeout
+	case sceneappearance.CodeMediaAssetTooLarge:
+		return http.StatusRequestEntityTooLarge
+	case sceneappearance.CodeMediaAssetVariantFailed:
+		return http.StatusBadGateway
+	case sceneappearance.CodeCapabilityRequired:
+		return http.StatusConflict
+	case sceneappearance.CodeStaleJobGeneration, sceneappearance.CodeRevisionPayloadConflict:
+		return http.StatusConflict
+	default:
+		return http.StatusUnprocessableEntity
+	}
 }
 
 func writeStopJobError(w http.ResponseWriter, err error) {

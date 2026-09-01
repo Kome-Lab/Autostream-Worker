@@ -30,8 +30,13 @@ type Config struct {
 }
 
 type Client struct {
-	Config Config
-	HTTP   *http.Client
+	Config              Config
+	HTTP                *http.Client
+	RuntimeCapabilities RuntimeCapabilities
+}
+
+type RuntimeCapabilities struct {
+	SceneAppearanceV1 bool
 }
 
 type Registration struct {
@@ -189,8 +194,8 @@ func isLocalDevHost(host string) bool {
 	return normalized == "localhost" || normalized == "127.0.0.1" || normalized == "host.docker.internal"
 }
 
-func serviceCapabilities() map[string]any {
-	return map[string]any{
+func serviceCapabilities(runtimeCapabilities RuntimeCapabilities) map[string]any {
+	capabilities := map[string]any{
 		"overlay_events":                true,
 		"caption_events":                true,
 		"caption_audio_ingest":          true,
@@ -203,6 +208,10 @@ func serviceCapabilities() map[string]any {
 		"health_endpoint":               true,
 		"job_endpoint":                  true,
 	}
+	if runtimeCapabilities.SceneAppearanceV1 {
+		capabilities["scene_appearance_v1"] = true
+	}
+	return capabilities
 }
 
 func reportHostname() string {
@@ -222,7 +231,7 @@ func (c Client) Register(ctx context.Context) error {
 		Version:      c.Config.Version,
 		Commit:       version.Commit,
 		BuildDate:    version.BuildDate,
-		Capabilities: serviceCapabilities(),
+		Capabilities: serviceCapabilities(c.RuntimeCapabilities),
 		Hostname:     reportHostname(),
 		OS:           runtime.GOOS,
 		Arch:         runtime.GOARCH,
@@ -245,7 +254,7 @@ func (c Client) HeartbeatWithMetrics(ctx context.Context, status, currentStreamI
 		Version:         c.Config.Version,
 		Commit:          version.Commit,
 		BuildDate:       version.BuildDate,
-		Capabilities:    serviceCapabilities(),
+		Capabilities:    serviceCapabilities(c.RuntimeCapabilities),
 		Hostname:        reportHostname(),
 		OS:              runtime.GOOS,
 		Arch:            runtime.GOARCH,

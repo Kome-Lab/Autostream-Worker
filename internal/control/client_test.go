@@ -27,7 +27,7 @@ func TestRegisterPostsServiceRegistration(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "secret-token", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: "https://worker.example.com", Version: "0.1.0"}}
+	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "secret-token", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: "https://worker.example.com", Version: "0.1.0"}, RuntimeCapabilities: RuntimeCapabilities{SceneAppearanceV1: true}}
 	if err := client.Register(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -39,6 +39,9 @@ func TestRegisterPostsServiceRegistration(t *testing.T) {
 	}
 	if got.Capabilities["scene_frames_mjpeg_srt"] != true {
 		t.Fatalf("scene video SRT capability is missing: %#v", got.Capabilities)
+	}
+	if got.Capabilities["scene_appearance_v1"] != true {
+		t.Fatalf("scene appearance capability is missing after runtime wiring: %#v", got.Capabilities)
 	}
 	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH {
 		t.Fatalf("registration did not include runtime platform: %#v", got)
@@ -61,7 +64,7 @@ func TestHeartbeatPostsStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "secret-token", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: "https://worker.example.com"}}
+	client := Client{Config: Config{ControlPanelURL: server.URL, Token: "secret-token", ServiceID: "worker-01", ServiceName: "Worker 01", ServicePublicURL: "https://worker.example.com"}, RuntimeCapabilities: RuntimeCapabilities{SceneAppearanceV1: true}}
 	if err := client.HeartbeatWithMetrics(t.Context(), "", "stream-01", map[string]float64{"worker.scene_updates_total": 2}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +74,9 @@ func TestHeartbeatPostsStatus(t *testing.T) {
 	if got.OS != runtime.GOOS || got.Arch != runtime.GOARCH || got.Capabilities["job_endpoint"] != true {
 		t.Fatalf("heartbeat did not include platform/capabilities: %#v", got)
 	}
+	if got.Capabilities["scene_appearance_v1"] != true {
+		t.Fatalf("heartbeat omitted wired scene appearance runtime: %#v", got.Capabilities)
+	}
 	if got.Commit != version.Commit || got.BuildDate != version.BuildDate {
 		t.Fatalf("heartbeat did not include build metadata: %#v", got)
 	}
@@ -79,6 +85,17 @@ func TestHeartbeatPostsStatus(t *testing.T) {
 	}
 	if got.Metrics["node.cpu_count"] <= 0 || got.Metrics["process.heap_alloc_bytes"] <= 0 || got.Metrics["process.uptime_seconds"] < 0 {
 		t.Fatalf("heartbeat did not include host/process metrics: %#v", got.Metrics)
+	}
+}
+
+func TestSceneAppearanceCapabilityRequiresRuntimeGate(t *testing.T) {
+	withoutRuntime := serviceCapabilities(RuntimeCapabilities{})
+	if _, advertised := withoutRuntime["scene_appearance_v1"]; advertised {
+		t.Fatalf("schema-only client advertised scene runtime support: %#v", withoutRuntime)
+	}
+	withRuntime := serviceCapabilities(RuntimeCapabilities{SceneAppearanceV1: true})
+	if withRuntime["scene_appearance_v1"] != true {
+		t.Fatalf("wired runtime did not advertise scene support: %#v", withRuntime)
 	}
 }
 

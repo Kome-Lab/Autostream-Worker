@@ -15,6 +15,7 @@ import (
 	"github.com/example/autostream-worker/internal/deepgram"
 	"github.com/example/autostream-worker/internal/encoder"
 	"github.com/example/autostream-worker/internal/events"
+	"github.com/example/autostream-worker/internal/sceneappearance"
 )
 
 var (
@@ -51,19 +52,20 @@ const (
 )
 
 type StreamContext struct {
-	StreamID              string `json:"stream_id"`
-	StreamName            string `json:"stream_name,omitempty"`
-	EncoderRecorderURL    string `json:"encoder_recorder_url,omitempty"`
-	StreamIngestToken     string `json:"stream_ingest_token,omitempty"`
-	OverlayProfileID      string `json:"overlay_profile_id,omitempty"`
-	CaptionProfileID      string `json:"caption_profile_id,omitempty"`
-	EncoderProfileID      string `json:"encoder_profile_id,omitempty"`
-	VideoWidth            int    `json:"video_width,omitempty"`
-	VideoHeight           int    `json:"video_height,omitempty"`
-	VideoFPS              int    `json:"video_fps,omitempty"`
-	VideoIngestURL        string `json:"video_ingest_url,omitempty"`
-	VideoIngestPassphrase string `json:"video_ingest_passphrase,omitempty"`
-	VideoIngestPBKeylen   int    `json:"video_ingest_pbkeylen,omitempty"`
+	StreamID              string                    `json:"stream_id"`
+	StreamName            string                    `json:"stream_name,omitempty"`
+	EncoderRecorderURL    string                    `json:"encoder_recorder_url,omitempty"`
+	StreamIngestToken     string                    `json:"stream_ingest_token,omitempty"`
+	OverlayProfileID      string                    `json:"overlay_profile_id,omitempty"`
+	CaptionProfileID      string                    `json:"caption_profile_id,omitempty"`
+	SceneAppearance       *sceneappearance.Snapshot `json:"scene_appearance,omitempty"`
+	EncoderProfileID      string                    `json:"encoder_profile_id,omitempty"`
+	VideoWidth            int                       `json:"video_width,omitempty"`
+	VideoHeight           int                       `json:"video_height,omitempty"`
+	VideoFPS              int                       `json:"video_fps,omitempty"`
+	VideoIngestURL        string                    `json:"video_ingest_url,omitempty"`
+	VideoIngestPassphrase string                    `json:"video_ingest_passphrase,omitempty"`
+	VideoIngestPBKeylen   int                       `json:"video_ingest_pbkeylen,omitempty"`
 }
 
 type VideoSceneConfig struct {
@@ -87,6 +89,23 @@ type SceneRenderer interface {
 // policy at the same job boundary as its Deepgram settings.
 type sceneDisplayConfigurer interface {
 	ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts, showLegacyCaptionBar bool)
+}
+
+type sceneAppearanceConfigurer interface {
+	ConfigureAppearance(sceneappearance.Prepared) error
+}
+
+type SceneAppearanceRuntime interface {
+	Prepare(context.Context, string, *sceneappearance.Snapshot) (sceneappearance.Prepared, error)
+}
+
+type SceneAppearanceRuntimeFunc func(context.Context, string, *sceneappearance.Snapshot) (sceneappearance.Prepared, error)
+
+func (f SceneAppearanceRuntimeFunc) Prepare(ctx context.Context, streamID string, snapshot *sceneappearance.Snapshot) (sceneappearance.Prepared, error) {
+	if f == nil {
+		return sceneappearance.Prepared{}, sceneappearance.NewError(sceneappearance.CodeCapabilityRequired)
+	}
+	return f(ctx, streamID, snapshot)
 }
 
 type captionDisplayConfig struct {
@@ -157,6 +176,7 @@ type Manager struct {
 	captionIngress           *captionAudioIngress
 	captionSessionGeneration uint64
 	sceneRenderer            SceneRenderer
+	sceneAppearanceRuntime   SceneAppearanceRuntime
 	sceneVideo               VideoSceneConfig
 	videoOutput              VideoOutput
 	jobGeneration            uint64
@@ -359,9 +379,25 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	profile, profileSelected := m.captionProfiles[stream.CaptionProfileID]
 	resolver := m.secretResolver
 	factory := m.captionFactory
+	appearanceRuntime := m.sceneAppearanceRuntime
+	_, appearanceRendererAvailable := m.sceneRenderer.(sceneAppearanceConfigurer)
 	nextGeneration := m.jobGeneration + 1
 	nextCaptionSessionGeneration := m.captionSessionGeneration + 1
 	m.mu.Unlock()
+
+	var preparedAppearance sceneappearance.Prepared
+	if stream.SceneAppearance != nil {
+		if appearanceRuntime == nil || !appearanceRendererAvailable {
+			return sceneappearance.NewError(sceneappearance.CodeCapabilityRequired)
+		}
+		preparedAppearance, err = appearanceRuntime.Prepare(ctx, stream.StreamID, stream.SceneAppearance)
+		if err != nil {
+			if _, ok := sceneappearance.CodeOf(err); !ok {
+				err = sceneappearance.NewError(sceneappearance.CodeMediaAssetVariantFailed)
+			}
+			return err
+		}
+	}
 
 	var captionSession CaptionSession
 	displayConfig := defaultCaptionDisplayConfig()
@@ -423,8 +459,18 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	m.captionSession = captionSession
 	m.sceneVideo = videoConfig
 	sceneRenderer := m.sceneRenderer
+	appearanceConfigurer, appearanceRendererAvailable := sceneRenderer.(sceneAppearanceConfigurer)
 	videoOutput := m.videoOutput
 	videoRequested := videoOutputRequested(stream)
+	if stream.SceneAppearance != nil && !appearanceRendererAvailable {
+		m.current = StreamContext{}
+		m.captionSession = nil
+		m.sceneVideo = VideoSceneConfig{}
+		m.mu.Unlock()
+		m.stopEventDelivery()
+		closeCaptionSession(captionSession)
+		return sceneappearance.NewError(sceneappearance.CodeCapabilityRequired)
+	}
 	if videoRequested && (sceneRenderer == nil || videoOutput == nil) {
 		m.current = StreamContext{}
 		m.captionSession = nil
@@ -435,15 +481,31 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		return ErrVideoOutputUnavailable
 	}
 	var captionIngress *captionAudioIngress
-	if captionSession != nil {
-		captionIngress = newCaptionAudioIngress()
-		m.captionIngress = captionIngress
-	}
 	if configurer, ok := sceneRenderer.(sceneDisplayConfigurer); ok {
 		configurer.ConfigureDisplay(displayConfig.maxItems, displayConfig.reorderWindow, displayConfig.interimTTL, displayConfig.finalTTL, displayConfig.showVoiceTranscripts, displayConfig.showLegacyCaptionBar)
 	}
 	if sceneRenderer != nil {
 		sceneRenderer.Reset(generation, stream.StreamID, stream.StreamName)
+	}
+	if stream.SceneAppearance != nil {
+		if err := appearanceConfigurer.ConfigureAppearance(preparedAppearance); err != nil {
+			if _, ok := sceneappearance.CodeOf(err); !ok {
+				err = sceneappearance.NewError(sceneappearance.CodeMediaAssetVariantFailed)
+			}
+			m.current = StreamContext{}
+			m.captionSession = nil
+			m.captionIngress = nil
+			m.sceneVideo = VideoSceneConfig{}
+			m.mu.Unlock()
+			m.stopEventDelivery()
+			sceneRenderer.Clear(stream.StreamID)
+			closeCaptionSession(captionSession)
+			return err
+		}
+	}
+	if captionSession != nil {
+		captionIngress = newCaptionAudioIngress()
+		m.captionIngress = captionIngress
 	}
 	m.startedAt = time.Now().UTC()
 	m.events = nil
@@ -528,6 +590,12 @@ func (m *Manager) SetSceneRenderer(renderer SceneRenderer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sceneRenderer = renderer
+}
+
+func (m *Manager) SetSceneAppearanceRuntime(runtime SceneAppearanceRuntime) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sceneAppearanceRuntime = runtime
 }
 
 func (m *Manager) SetVideoOutput(output VideoOutput) {

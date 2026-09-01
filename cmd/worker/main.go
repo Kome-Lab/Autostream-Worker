@@ -20,6 +20,7 @@ import (
 	"github.com/example/autostream-worker/internal/jobs"
 	"github.com/example/autostream-worker/internal/observability"
 	"github.com/example/autostream-worker/internal/scene"
+	"github.com/example/autostream-worker/internal/sceneappearance"
 	"github.com/example/autostream-worker/internal/version"
 )
 
@@ -72,7 +73,13 @@ func main() {
 		log.Fatalf("initialize worker scene renderer: %v", err)
 	}
 	defer sceneRenderer.Close()
+	appearanceRuntime := sceneappearance.New(sceneappearance.FetcherFunc(func(fetchCtx context.Context, streamID string, descriptor sceneappearance.AssetDescriptor) (sceneappearance.AssetResponse, error) {
+		return (control.Client{Config: control.ConfigFromEnv()}).FetchSceneAsset(fetchCtx, streamID, descriptor)
+	}), sceneappearance.Options{})
+	defer appearanceRuntime.Close()
 	manager.SetSceneRenderer(sceneRenderer)
+	manager.SetSceneAppearanceRuntime(appearanceRuntime)
+	controlClient.RuntimeCapabilities.SceneAppearanceV1 = true
 	manager.SetVideoOutput(newJobVideoOutput(manager))
 	manager.SetCaptionRuntime(jobs.RuntimeSecretResolverFunc(func(resolveCtx context.Context, streamID, secretName string) (control.RuntimeSecret, error) {
 		return (control.Client{Config: control.ConfigFromEnv()}).ResolveRuntimeSecret(resolveCtx, streamID, secretName)
@@ -95,7 +102,7 @@ func main() {
 			log.Printf("control panel heartbeat failed: %v", err)
 		})
 	} else if control.NodeConfigPendingFromEnv() {
-		go runPendingControlPanelRegistrationLoop(ctx, manager, requireControlPanelRuntimeConfig(), updaterIdentity)
+		go runPendingControlPanelRegistrationLoop(ctx, manager, requireControlPanelRuntimeConfig(), updaterIdentity, controlClient.RuntimeCapabilities)
 	} else if requireControlPanelRuntimeConfig() {
 		if strings.TrimSpace(controlClient.Config.ConfigError) != "" {
 			log.Fatalf("node config invalid: %v", controlClient.Config.ConfigError)
@@ -170,12 +177,12 @@ func controlRuntimeConfigFromEnv(ctx context.Context) (control.RuntimeConfig, er
 	return control.Client{Config: control.ConfigFromEnv()}.RuntimeConfig(ctx)
 }
 
-func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.Manager, requireRuntimeConfig bool, updaterIdentity *httpapi.UpdaterIdentityLatch) {
+func runPendingControlPanelRegistrationLoop(ctx context.Context, manager *jobs.Manager, requireRuntimeConfig bool, updaterIdentity *httpapi.UpdaterIdentityLatch, runtimeCapabilities control.RuntimeCapabilities) {
 	lastState := ""
 	registeredServiceID := ""
 	for {
 		cfg := control.ConfigFromEnv()
-		client := control.Client{Config: cfg}
+		client := control.Client{Config: cfg, RuntimeCapabilities: runtimeCapabilities}
 		wait := controlPanelRegistrationInterval(cfg)
 		state := ""
 		if err := requireMatchingUpdaterIdentity(updaterIdentity, cfg.ServiceID); err != nil {

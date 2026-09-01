@@ -9,10 +9,75 @@ import (
 	"strings"
 	"time"
 
+	"github.com/example/autostream-worker/internal/sceneappearance"
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
 )
+
+type renderAppearance struct {
+	backgroundMode  string
+	headerTitleMode string
+	customTitle     string
+	backgrounds     map[image.Point]*image.RGBA
+}
+
+func prepareRenderAppearance(prepared sceneappearance.Prepared) (*renderAppearance, error) {
+	appearance := &renderAppearance{
+		backgroundMode: prepared.BackgroundMode, headerTitleMode: prepared.HeaderTitleMode,
+		customTitle: cleanText(prepared.CustomTitle, 80),
+	}
+	switch appearance.headerTitleMode {
+	case sceneappearance.HeaderTitleModeDefault:
+		if prepared.CustomTitle != "" {
+			return nil, sceneappearance.NewError(sceneappearance.CodeRevisionPayloadConflict)
+		}
+	case sceneappearance.HeaderTitleModeCustom:
+		if appearance.customTitle == "" {
+			return nil, sceneappearance.NewError(sceneappearance.CodeRevisionPayloadConflict)
+		}
+	default:
+		return nil, sceneappearance.NewError(sceneappearance.CodeRevisionPayloadConflict)
+	}
+	switch appearance.backgroundMode {
+	case sceneappearance.BackgroundModeDefault:
+		if prepared.Background != nil {
+			return nil, sceneappearance.NewError(sceneappearance.CodeRevisionPayloadConflict)
+		}
+		return appearance, nil
+	case sceneappearance.BackgroundModeImage:
+		if prepared.Background == nil || prepared.Background.Bounds().Empty() {
+			return nil, sceneappearance.NewError(sceneappearance.CodeMediaAssetDecodeFailed)
+		}
+	default:
+		return nil, sceneappearance.NewError(sceneappearance.CodeRevisionPayloadConflict)
+	}
+	appearance.backgrounds = map[image.Point]*image.RGBA{}
+	for _, size := range []image.Point{{X: 1920, Y: 1080}, {X: 1280, Y: 720}, {X: 854, Y: 480}} {
+		appearance.backgrounds[size] = scaleBackgroundCover(prepared.Background, size.X, size.Y)
+	}
+	return appearance, nil
+}
+
+func scaleBackgroundCover(source image.Image, width, height int) *image.RGBA {
+	destination := image.NewRGBA(image.Rect(0, 0, width, height))
+	sourceRect := source.Bounds()
+	sourceWidth, sourceHeight := sourceRect.Dx(), sourceRect.Dy()
+	crop := sourceRect
+	if sourceWidth*height > width*sourceHeight {
+		cropWidth := int(int64(sourceHeight) * int64(width) / int64(height))
+		cropWidth = min(sourceWidth, max(1, cropWidth))
+		crop.Min.X += (sourceWidth - cropWidth) / 2
+		crop.Max.X = crop.Min.X + cropWidth
+	} else if sourceWidth*height < width*sourceHeight {
+		cropHeight := int(int64(sourceWidth) * int64(height) / int64(width))
+		cropHeight = min(sourceHeight, max(1, cropHeight))
+		crop.Min.Y += (sourceHeight - cropHeight) / 2
+		crop.Max.Y = crop.Min.Y + cropHeight
+	}
+	xdraw.CatmullRom.Scale(destination, destination.Bounds(), source, crop, draw.Src, nil)
+	return destination
+}
 
 var (
 	backgroundColor = color.RGBA{7, 11, 23, 255}
@@ -40,7 +105,15 @@ func (s *Scene) RenderSize(width, height int, at time.Time) (*image.RGBA, error)
 		return nil, ErrNoActiveScene
 	}
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	draw.Draw(img, img.Bounds(), &image.Uniform{C: backgroundColor}, image.Point{}, draw.Src)
+	if snapshot.appearance != nil && snapshot.appearance.backgroundMode == sceneappearance.BackgroundModeImage {
+		background := snapshot.appearance.backgrounds[image.Point{X: width, Y: height}]
+		if background == nil {
+			return nil, sceneappearance.NewError(sceneappearance.CodeMediaAssetDimensionMismatch)
+		}
+		draw.Draw(img, img.Bounds(), background, background.Bounds().Min, draw.Src)
+	} else {
+		draw.Draw(img, img.Bounds(), &image.Uniform{C: backgroundColor}, image.Point{}, draw.Src)
+	}
 	renderSnapshot(img, snapshot, fonts, s.avatars, s.showLegacyCaptionBar)
 	return img, nil
 }
@@ -71,13 +144,23 @@ func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars 
 	}
 	headerHeight := maxInt(px(96), fonts.strongHeight+px(40))
 	draw.Draw(img, image.Rect(0, 0, width, headerHeight), &image.Uniform{C: panelColor}, image.Point{}, draw.Src)
-	title := "AutoStream Live"
-	if snapshot.StreamName != "" {
-		title += "  •  " + snapshot.StreamName
-	}
-	drawText(img, px(34), px(34)+fonts.strongHeight, title, textColor, fonts.strong)
 	clock := snapshot.CurrentTime.Format("2006/01/02 15:04:05 JST")
 	clockWidth := measureText(fonts.body, clock)
+	title := "AutoStream Live"
+	customTitle := snapshot.appearance != nil && snapshot.appearance.headerTitleMode == sceneappearance.HeaderTitleModeCustom
+	if customTitle {
+		title = snapshot.appearance.customTitle
+	} else if snapshot.StreamName != "" {
+		title += "  •  " + snapshot.StreamName
+	}
+	if customTitle {
+		clockX := width - px(34) - clockWidth
+		drawTextClipped(img, px(34), px(34)+fonts.strongHeight, title, clockX-px(34)-px(24), textColor, fonts.strong)
+	} else {
+		// Preserve the exact legacy title drawing path when scene_appearance is
+		// omitted or explicitly uses the default header mode.
+		drawText(img, px(34), px(34)+fonts.strongHeight, title, textColor, fonts.strong)
+	}
 	drawText(img, width-px(34)-clockWidth, px(36)+fonts.bodyHeight, clock, mutedColor, fonts.body)
 
 	outer := px(24)
