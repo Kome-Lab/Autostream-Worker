@@ -27,8 +27,8 @@ func TestPublishPostsWorkerEvent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{URL: server.URL, Token: "secret-token", ServiceID: "worker-01", Timeout: time.Second}}
-	if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", Payload: map[string]any{"ok": true}}); err != nil {
+	client := Client{Config: Config{ServiceID: "worker-01", Timeout: time.Second}}
+	if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", Payload: map[string]any{"ok": true}, URL: server.URL, Token: "secret-token"}); err != nil {
 		t.Fatal(err)
 	}
 	if gotAuth != "Bearer secret-token" || got.StreamID != "stream-01" || got.ServiceID != "worker-01" || got.Timestamp.IsZero() {
@@ -36,7 +36,7 @@ func TestPublishPostsWorkerEvent(t *testing.T) {
 	}
 }
 
-func TestPublishUsesEventTokenWhenProvided(t *testing.T) {
+func TestPublishUsesJobScopedToken(t *testing.T) {
 	var gotAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
@@ -44,13 +44,13 @@ func TestPublishUsesEventTokenWhenProvided(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{URL: server.URL, Token: "env-token", Timeout: time.Second}}
-	err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", Token: "job-stream-ingest-token"})
+	client := Client{Config: Config{Timeout: time.Second}}
+	err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", URL: server.URL, Token: "job-stream-ingest-token"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gotAuth != "Bearer job-stream-ingest-token" {
-		t.Fatalf("expected job token to override env token, got %q", gotAuth)
+		t.Fatalf("expected job-scoped token, got %q", gotAuth)
 	}
 }
 
@@ -88,8 +88,8 @@ func TestPublishErrorDoesNotLeakTokenOrBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second}}
-	err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"})
+	client := Client{Config: Config{Timeout: time.Second}}
+	err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", URL: server.URL, Token: "secret-token"})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -110,8 +110,8 @@ func TestPublishDoesNotFollowRedirectsWithBearerToken(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second}}
-	err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"})
+	client := Client{Config: Config{Timeout: time.Second}}
+	err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", URL: server.URL, Token: "secret-token"})
 	if err == nil {
 		t.Fatal("expected redirect response to fail")
 	}
@@ -132,8 +132,8 @@ func TestPublishRetriesTransientFailures(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second, RetryMax: 2, RetryBaseDelay: time.Millisecond}}
-	if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"}); err != nil {
+	client := Client{Config: Config{Timeout: time.Second, RetryMax: 2, RetryBaseDelay: time.Millisecond}}
+	if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", URL: server.URL, Token: "secret-token"}); err != nil {
 		t.Fatal(err)
 	}
 	if attempts != 2 {
@@ -155,8 +155,8 @@ func TestPublishRetriesConflictAndRequestTimeout(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := Client{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second, RetryMax: 1, RetryBaseDelay: time.Millisecond}}
-			if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"}); err != nil {
+			client := Client{Config: Config{Timeout: time.Second, RetryMax: 1, RetryBaseDelay: time.Millisecond}}
+			if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", URL: server.URL, Token: "secret-token"}); err != nil {
 				t.Fatal(err)
 			}
 			if attempts != 2 {
@@ -169,7 +169,7 @@ func TestPublishRetriesConflictAndRequestTimeout(t *testing.T) {
 func TestPublishRetriesTransportFailure(t *testing.T) {
 	attempts := 0
 	client := Client{
-		Config: Config{URL: "https://encoder.example.com", Token: "secret-token", Timeout: time.Second, RetryMax: 1, RetryBaseDelay: time.Millisecond},
+		Config: Config{Timeout: time.Second, RetryMax: 1, RetryBaseDelay: time.Millisecond},
 		HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			attempts++
 			if attempts == 1 {
@@ -178,7 +178,7 @@ func TestPublishRetriesTransportFailure(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusAccepted, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: req}, nil
 		})},
 	}
-	if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"}); err != nil {
+	if err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", URL: "https://encoder.example.com", Token: "secret-token"}); err != nil {
 		t.Fatal(err)
 	}
 	if attempts != 2 {
@@ -205,8 +205,8 @@ func TestPublishDoesNotRetryValidationFailures(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := Client{Config: Config{URL: server.URL, Token: "secret-token", Timeout: time.Second, RetryMax: 2, RetryBaseDelay: time.Millisecond}}
-	err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time"})
+	client := Client{Config: Config{Timeout: time.Second, RetryMax: 2, RetryBaseDelay: time.Millisecond}}
+	err := client.Publish(t.Context(), Event{ID: "event-01", StreamID: "stream-01", Type: "overlay.current_time", URL: server.URL, Token: "secret-token"})
 	if err == nil {
 		t.Fatal("expected non-transient error")
 	}
@@ -226,8 +226,7 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func TestValidateRejectsNonHTTPEncoderURL(t *testing.T) {
-	cfg := Config{URL: "ftp://encoder.example.com/events", Token: "<SERVICE_TOKEN>", Timeout: time.Second}
-	err := cfg.Validate()
+	err := validateTargetURL("ftp://encoder.example.com/events")
 	if err == nil {
 		t.Fatal("expected validation error")
 	}
@@ -237,8 +236,7 @@ func TestValidateRejectsNonHTTPEncoderURL(t *testing.T) {
 }
 
 func TestValidateRejectsRemoteHTTPEncoderURL(t *testing.T) {
-	cfg := Config{URL: "http://encoder.example.com", Token: "<SERVICE_TOKEN>", Timeout: time.Second}
-	err := cfg.Validate()
+	err := validateTargetURL("http://encoder.example.com")
 	if err == nil {
 		t.Fatal("expected validation error")
 	}
@@ -248,15 +246,13 @@ func TestValidateRejectsRemoteHTTPEncoderURL(t *testing.T) {
 }
 
 func TestValidateAllowsLocalHTTPEncoderURL(t *testing.T) {
-	cfg := Config{URL: "http://127.0.0.1:18084", Token: "<SERVICE_TOKEN>", Timeout: time.Second}
-	if err := cfg.Validate(); err != nil {
+	if err := validateTargetURL("http://127.0.0.1:18084"); err != nil {
 		t.Fatalf("expected local http URL to be allowed: %v", err)
 	}
 }
 
 func TestValidateRejectsEncoderURLQueryOrFragment(t *testing.T) {
-	cfg := Config{URL: "https://encoder.example.com?token=bad", Token: "<SERVICE_TOKEN>", Timeout: time.Second}
-	err := cfg.Validate()
+	err := validateTargetURL("https://encoder.example.com?token=bad")
 	if err == nil {
 		t.Fatal("expected validation error")
 	}

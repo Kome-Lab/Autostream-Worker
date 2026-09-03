@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -89,11 +88,7 @@ func (v TokenVerifier) Verify(header string) bool {
 	if runtimeToken := control.NodeRuntimeTokenFromEnv(); runtimeToken != "" {
 		return subtle.ConstantTimeCompare([]byte(token), []byte(runtimeToken)) == 1
 	}
-	if !allowControlPanelTokenFallback() {
-		return false
-	}
-	fallback := os.Getenv("CONTROL_PANEL_TOKEN")
-	return fallback != "" && subtle.ConstantTimeCompare([]byte(token), []byte(fallback)) == 1
+	return false
 }
 
 func (v TokenVerifier) VerifyWorkerEvents(header, streamID string) bool {
@@ -140,28 +135,6 @@ func bearerToken(header string) string {
 		return ""
 	}
 	return strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
-}
-
-func allowControlPanelTokenFallback() bool {
-	if envBool("AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG", false) {
-		return false
-	}
-	return !strings.EqualFold(strings.TrimSpace(os.Getenv("AUTOSTREAM_ENV")), "production")
-}
-
-func envBool(key string, fallback bool) bool {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return fallback
-	}
-	switch strings.ToLower(raw) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return fallback
-	}
 }
 
 type Server struct {
@@ -242,29 +215,6 @@ func (s Server) updaterVersion(w http.ResponseWriter, r *http.Request) {
 		ServiceType:    identity.ServiceType,
 		ConfigRevision: identity.ConfigRevision,
 	})
-}
-
-func ConfigRevisionFromEnv() (int64, error) {
-	raw := os.Getenv("AUTOSTREAM_CONFIG_REVISION")
-	if raw == "" {
-		return 1, nil
-	}
-	if raw != strings.TrimSpace(raw) {
-		return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must be an unpadded positive integer")
-	}
-	if raw[0] == '0' {
-		return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must not contain leading zeroes")
-	}
-	for _, char := range raw {
-		if char < '0' || char > '9' {
-			return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must contain decimal digits only")
-		}
-	}
-	revision, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || revision < 1 {
-		return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must be an integer greater than or equal to 1")
-	}
-	return revision, nil
 }
 
 func (s Server) status(w http.ResponseWriter, r *http.Request) {

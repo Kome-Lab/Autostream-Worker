@@ -348,7 +348,8 @@ func TestValidateRejectsControlPanelURLQueryOrFragment(t *testing.T) {
 	}
 }
 
-func TestConfigFromEnv(t *testing.T) {
+func TestConfigFromEnvDoesNotUseProcessIdentityFallbacks(t *testing.T) {
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", "")
 	t.Setenv("CONTROL_PANEL_URL", "https://control.example.com")
 	t.Setenv("CONTROL_PANEL_TOKEN", "<SERVICE_TOKEN>")
 	t.Setenv("SERVICE_ID", "worker-01")
@@ -358,10 +359,10 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC", "5")
 
 	cfg := ConfigFromEnv()
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("process environment identity was accepted without node config")
 	}
-	if cfg.HeartbeatEvery != 5*time.Second || cfg.ServicePublicURL == "" {
+	if cfg.HeartbeatEvery != 5*time.Second || cfg.ControlPanelURL != "" || cfg.Token != "" || cfg.ServiceID != "" || cfg.ServiceName != "" || cfg.ServicePublicURL != "" || cfg.BindAddress != "" {
 		t.Fatalf("unexpected config: %#v", cfg)
 	}
 }

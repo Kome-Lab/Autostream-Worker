@@ -3,9 +3,6 @@ services:
     image: ${AUTOSTREAM_IMAGE_REGISTRY:-ghcr.io/kome-lab/autostream-docker}/worker:${AUTOSTREAM_DOCKER_VERSION:-latest}
     restart: unless-stopped
     env_file: .env
-    environment:
-      AUTOSTREAM_CONFIG_REVISION: ${AUTOSTREAM_CONFIG_REVISION:-1}
-      AUTOSTREAM_BIND_ADDR: 0.0.0.0:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}
     ports: !override
       - "127.0.0.1:${AUTOSTREAM_WORKER_PORT:-8084}:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}"
     volumes:

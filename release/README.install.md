@@ -99,10 +99,15 @@ sudo systemctl restart autostream-worker
 sudo systemctl status autostream-worker
 ```
 
-Set `AUTOSTREAM_CONFIG_REVISION=1` for the first applied configuration and
-increment it after each configuration change. `AUTOSTREAM_BIND_ADDR` accepts an
-unprivileged port from `1024` through `65535`; the example uses
-`127.0.0.1:8084`.
+The panel-managed node config must select
+`listener.credential: node-listener.json`. The systemd unit loads the
+root-owned `/opt/autostream/local-executor/ports/worker.json` source as that
+credential. Its exact schema is `schema_version`, `service_type`,
+`bind_address`, and `config_revision`; use schema version `2`, service type `worker`, a positive
+revision, and an unprivileged bind port from `1024` through `65535`. The
+documented host endpoint is `127.0.0.1:8084`. Public `api.host` / `api.port`
+values are independent and never fall back as the local listener. A missing or
+invalid credential stops Worker before it listens.
 
 The host must provide a Japanese Noto font. Worker only renders low-rate JPEG
 scene images; Encoder/Recorder performs video encoding and audio muxing, so

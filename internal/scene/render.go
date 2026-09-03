@@ -114,7 +114,7 @@ func (s *Scene) RenderSize(width, height int, at time.Time) (*image.RGBA, error)
 	} else {
 		draw.Draw(img, img.Bounds(), &image.Uniform{C: backgroundColor}, image.Point{}, draw.Src)
 	}
-	renderSnapshot(img, snapshot, fonts, s.avatars, s.showLegacyCaptionBar)
+	renderSnapshot(img, snapshot, fonts, s.avatars)
 	return img, nil
 }
 
@@ -132,7 +132,7 @@ func (s *Scene) fontsForHeight(height int) (*fontSet, error) {
 	return loaded, nil
 }
 
-func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars *avatarCache, showLegacyCaptionBar bool) {
+func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars *avatarCache) {
 	width, height := img.Bounds().Dx(), img.Bounds().Dy()
 	scale := float64(height) / defaultHeight
 	px := func(value int) int {
@@ -157,8 +157,8 @@ func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars 
 		clockX := width - px(34) - clockWidth
 		drawTextClipped(img, px(34), px(34)+fonts.strongHeight, title, clockX-px(34)-px(24), textColor, fonts.strong)
 	} else {
-		// Preserve the exact legacy title drawing path when scene_appearance is
-		// omitted or explicitly uses the default header mode.
+		// The source-characterized default appearance remains the v2 fallback
+		// when scene_appearance is omitted or selects the default header mode.
 		drawText(img, px(34), px(34)+fonts.strongHeight, title, textColor, fonts.strong)
 	}
 	drawText(img, width-px(34)-clockWidth, px(36)+fonts.bodyHeight, clock, mutedColor, fonts.body)
@@ -166,11 +166,7 @@ func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars 
 	outer := px(24)
 	gap := px(18)
 	panelTop := headerHeight + outer
-	captionHeight := 0
-	if showLegacyCaptionBar && len(snapshot.Captions) > 0 {
-		captionHeight = maxInt(px(170), fonts.captionHeight*3+px(32))
-	}
-	panelBottom := height - outer - captionHeight
+	panelBottom := height - outer
 	if panelBottom <= panelTop {
 		panelBottom = height - outer
 	}
@@ -184,10 +180,6 @@ func renderSnapshot(img *image.RGBA, snapshot Snapshot, fonts *fontSet, avatars 
 	drawPanel(img, participantRect)
 	drawChat(img, chatRect, snapshot.Chat, snapshot.Conversation, fonts, avatars, px)
 	drawParticipants(img, participantRect, snapshot.Participants, fonts, avatars, px)
-	if captionHeight > 0 {
-		captionRect := image.Rect(outer, height-outer-captionHeight+px(12), width-outer, height-outer)
-		drawCaptions(img, captionRect, snapshot.Captions, snapshot.Participants, fonts, px)
-	}
 }
 
 func drawPanel(img *image.RGBA, rect image.Rectangle) {
@@ -315,54 +307,6 @@ func drawParticipants(img *image.RGBA, area image.Rectangle, participants []Part
 		label := fmt.Sprintf("ほか %d 人が接続中", remaining)
 		drawTextClipped(img, area.Min.X+padding, area.Max.Y-padding, label, area.Dx()-padding*2, mutedColor, fonts.body)
 	}
-}
-
-func drawCaptions(img *image.RGBA, area image.Rectangle, captions []Caption, participants []Participant, fonts *fontSet, px func(int) int) {
-	if area.Empty() || len(captions) == 0 {
-		return
-	}
-	draw.Draw(img, area, &image.Uniform{C: color.RGBA{3, 7, 18, 232}}, image.Point{}, draw.Over)
-	padding := px(24)
-	lines := make([]string, 0, 3)
-	for i := len(captions) - 1; i >= 0 && len(lines) < 3; i-- {
-		caption := captions[i]
-		prefix := strings.TrimSpace(caption.SpeakerName)
-		if isUnknownSpeakerName(prefix) || prefix == caption.SpeakerUserID {
-			prefix = participantName(caption.SpeakerUserID, participants)
-		}
-		if prefix == "" {
-			prefix = "MIC"
-		}
-		line := caption.Text
-		if prefix != "" {
-			line = prefix + ": " + line
-		}
-		wrapped := wrapText(line, area.Dx()-padding*2, fonts.caption, 2)
-		lines = append(wrapped, lines...)
-	}
-	if len(lines) > 3 {
-		lines = lines[len(lines)-3:]
-	}
-	totalHeight := len(lines) * (fonts.captionHeight + px(4))
-	y := area.Min.Y + (area.Dy()-totalHeight)/2 + fonts.captionHeight
-	for _, line := range lines {
-		lineWidth := measureText(fonts.caption, line)
-		x := area.Min.X + (area.Dx()-lineWidth)/2
-		if x < area.Min.X+padding {
-			x = area.Min.X + padding
-		}
-		drawText(img, x, y, line, textColor, fonts.caption)
-		y += fonts.captionHeight + px(4)
-	}
-}
-
-func participantName(userID string, participants []Participant) string {
-	for _, participant := range participants {
-		if participant.UserID == userID {
-			return participant.DisplayName
-		}
-	}
-	return ""
 }
 
 func drawAvatar(dst *image.RGBA, x, y, size int, source image.Image, speaking bool) {

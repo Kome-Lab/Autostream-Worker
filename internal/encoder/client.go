@@ -33,8 +33,6 @@ type Publisher interface {
 }
 
 type Config struct {
-	URL            string
-	Token          string
 	ServiceID      string
 	Timeout        time.Duration
 	RetryMax       int
@@ -46,15 +44,9 @@ type Client struct {
 	HTTP   *http.Client
 }
 
-func ConfigFromEnv() Config {
-	serviceID := strings.TrimSpace(os.Getenv("SERVICE_ID"))
-	if serviceID == "" {
-		serviceID = "worker-01"
-	}
+func ConfigFromEnv(serviceID string) Config {
 	return Config{
-		URL:       os.Getenv("ENCODER_RECORDER_URL"),
-		Token:     os.Getenv("ENCODER_RECORDER_TOKEN"),
-		ServiceID: serviceID,
+		ServiceID: strings.TrimSpace(serviceID),
 		Timeout:   envDuration("ENCODER_RECORDER_TIMEOUT_SEC", 5*time.Second),
 		// Manager owns the durable bounded retry queue. Keep one HTTP attempt
 		// per logical delivery attempt by default so attempt metadata and
@@ -65,25 +57,25 @@ func ConfigFromEnv() Config {
 	}
 }
 
-func (c Config) Validate() error {
-	if strings.TrimSpace(c.URL) == "" {
-		return errors.New("ENCODER_RECORDER_URL is required")
+func validateTargetURL(rawURL string) error {
+	if strings.TrimSpace(rawURL) == "" {
+		return errors.New("encoder_recorder_url is required")
 	}
-	parsed, err := url.Parse(c.URL)
+	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return errors.New("ENCODER_RECORDER_URL must be an absolute URL")
+		return errors.New("encoder_recorder_url must be an absolute URL")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("ENCODER_RECORDER_URL must use http or https")
+		return errors.New("encoder_recorder_url must use http or https")
 	}
 	if parsed.User != nil {
-		return errors.New("ENCODER_RECORDER_URL must not include credentials")
+		return errors.New("encoder_recorder_url must not include credentials")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return errors.New("ENCODER_RECORDER_URL must not include query or fragment")
+		return errors.New("encoder_recorder_url must not include query or fragment")
 	}
 	if parsed.Scheme == "http" && !isLocalDevHost(parsed.Hostname()) {
-		return errors.New("ENCODER_RECORDER_URL must use https for remote hosts")
+		return errors.New("encoder_recorder_url must use https for remote hosts")
 	}
 	return nil
 }
@@ -94,17 +86,12 @@ func isLocalDevHost(host string) bool {
 }
 
 func (c Client) Publish(ctx context.Context, event Event) error {
-	targetURL := strings.TrimSpace(c.Config.URL)
-	if strings.TrimSpace(event.URL) != "" {
-		targetURL = strings.TrimSpace(event.URL)
-	}
-	targetConfig := c.Config
-	targetConfig.URL = targetURL
-	if err := targetConfig.Validate(); err != nil {
+	targetURL := strings.TrimSpace(event.URL)
+	if err := validateTargetURL(targetURL); err != nil {
 		return err
 	}
-	if strings.TrimSpace(c.Config.Token) == "" && strings.TrimSpace(event.Token) == "" {
-		return errors.New("ENCODER_RECORDER_TOKEN is required")
+	if strings.TrimSpace(event.Token) == "" {
+		return errors.New("stream_ingest_token is required")
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
@@ -160,10 +147,7 @@ func (c Client) publishOnce(ctx context.Context, targetURL string, body []byte, 
 	if err != nil {
 		return err
 	}
-	token := strings.TrimSpace(c.Config.Token)
-	if strings.TrimSpace(tokenOverride) != "" {
-		token = strings.TrimSpace(tokenOverride)
-	}
+	token := strings.TrimSpace(tokenOverride)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	client := c.HTTP

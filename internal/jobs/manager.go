@@ -76,19 +76,13 @@ type VideoSceneConfig struct {
 }
 
 type SceneRenderer interface {
+	ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts bool)
 	Reset(generation uint64, streamID, streamName string)
 	Clear(streamID string)
 	Apply(generation uint64, event events.OverlayEvent) error
 	RenderSize(width, height int, at time.Time) (*image.RGBA, error)
 	AvatarRefreshInterval() time.Duration
 	RefreshAvatars()
-}
-
-// sceneDisplayConfigurer is optional so existing renderers remain compatible
-// while the built-in scene can apply the selected caption profile's display
-// policy at the same job boundary as its Deepgram settings.
-type sceneDisplayConfigurer interface {
-	ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts, showLegacyCaptionBar bool)
 }
 
 type sceneAppearanceConfigurer interface {
@@ -114,7 +108,6 @@ type captionDisplayConfig struct {
 	interimTTL           time.Duration
 	finalTTL             time.Duration
 	showVoiceTranscripts bool
-	showLegacyCaptionBar bool
 }
 
 type VideoOutput interface {
@@ -481,8 +474,8 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		return ErrVideoOutputUnavailable
 	}
 	var captionIngress *captionAudioIngress
-	if configurer, ok := sceneRenderer.(sceneDisplayConfigurer); ok {
-		configurer.ConfigureDisplay(displayConfig.maxItems, displayConfig.reorderWindow, displayConfig.interimTTL, displayConfig.finalTTL, displayConfig.showVoiceTranscripts, displayConfig.showLegacyCaptionBar)
+	if sceneRenderer != nil {
+		sceneRenderer.ConfigureDisplay(displayConfig.maxItems, displayConfig.reorderWindow, displayConfig.interimTTL, displayConfig.finalTTL, displayConfig.showVoiceTranscripts)
 	}
 	if sceneRenderer != nil {
 		sceneRenderer.Reset(generation, stream.StreamID, stream.StreamName)
@@ -782,8 +775,8 @@ func (m *Manager) UpdateCaptionRuntimeSettings(ctx context.Context, streamID, pr
 	m.mu.Unlock()
 
 	go m.runCaptionAudioIngress(newIngress)
-	if configurer, ok := sceneRenderer.(sceneDisplayConfigurer); ok {
-		configurer.ConfigureDisplay(displayConfig.maxItems, displayConfig.reorderWindow, displayConfig.interimTTL, displayConfig.finalTTL, displayConfig.showVoiceTranscripts, displayConfig.showLegacyCaptionBar)
+	if sceneRenderer != nil {
+		sceneRenderer.ConfigureDisplay(displayConfig.maxItems, displayConfig.reorderWindow, displayConfig.interimTTL, displayConfig.finalTTL, displayConfig.showVoiceTranscripts)
 	}
 
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -959,7 +952,6 @@ func captionDisplayConfigFromProfile(config map[string]any) (captionDisplayConfi
 	display.interimTTL = time.Duration(interimTTLSeconds) * time.Second
 	display.finalTTL = time.Duration(finalTTLSeconds) * time.Second
 	display.showVoiceTranscripts = booleanConfigDefault(config, "show_voice_transcripts", true)
-	display.showLegacyCaptionBar = booleanConfigDefault(config, "show_legacy_caption_bar", false)
 	return display, true
 }
 

@@ -38,10 +38,6 @@ func (l *UpdaterIdentityLatch) ResolveFromEnv() (UpdaterIdentity, error) {
 	if l.serviceType != control.ServiceType {
 		return UpdaterIdentity{}, fmt.Errorf("updater service type must be %q", control.ServiceType)
 	}
-	revision, err := ConfigRevisionFromEnv()
-	if err != nil {
-		return UpdaterIdentity{}, err
-	}
 	if control.NodeConfigPendingFromEnv() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
@@ -54,10 +50,13 @@ func (l *UpdaterIdentityLatch) ResolveFromEnv() (UpdaterIdentity, error) {
 	if strings.TrimSpace(cfg.ConfigError) != "" {
 		return UpdaterIdentity{}, errors.New(cfg.ConfigError)
 	}
+	if strings.TrimSpace(cfg.ServiceID) == "" {
+		return UpdaterIdentity{}, ErrUpdaterIdentityPending
+	}
 	return l.bind(UpdaterIdentity{
 		ServiceID:      strings.TrimSpace(cfg.ServiceID),
 		ServiceType:    control.ServiceType,
-		ConfigRevision: revision,
+		ConfigRevision: cfg.ConfigRevision,
 	})
 }
 

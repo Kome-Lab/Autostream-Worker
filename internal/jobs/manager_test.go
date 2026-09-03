@@ -77,19 +77,20 @@ func (f *fakeSceneRenderer) RenderSize(width, height int, _ time.Time) (*image.R
 }
 func (*fakeSceneRenderer) AvatarRefreshInterval() time.Duration { return time.Minute }
 func (*fakeSceneRenderer) RefreshAvatars()                      {}
+func (*fakeSceneRenderer) ConfigureDisplay(int, time.Duration, time.Duration, time.Duration, bool) {
+}
 
-func (f *captionDisplaySceneRenderer) ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts, showLegacyCaptionBar bool) {
+func (f *captionDisplaySceneRenderer) ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts bool) {
 	f.displays = append(f.displays, captionDisplayConfig{
 		maxItems:             maxItems,
 		reorderWindow:        reorderWindow,
 		interimTTL:           interimTTL,
 		finalTTL:             finalTTL,
 		showVoiceTranscripts: showVoiceTranscripts,
-		showLegacyCaptionBar: showLegacyCaptionBar,
 	})
 }
 
-func TestManagerSceneLifecycleAppliesEventsBeforeLegacyForwardFailure(t *testing.T) {
+func TestManagerSceneLifecycleAppliesEventsBeforeForwardFailure(t *testing.T) {
 	scene := &fakeSceneRenderer{}
 	manager := NewManager(&fakePublisher{err: errors.New("encoder unavailable")}, observability.Client{})
 	manager.SetSceneRenderer(scene)
@@ -103,7 +104,7 @@ func TestManagerSceneLifecycleAppliesEventsBeforeLegacyForwardFailure(t *testing
 	if _, err := manager.CustomOverlay(t.Context(), "stream-01", "overlay.discord_chat", map[string]any{
 		"message_id": "message-01", "author_id": "user-01", "content": "hello",
 	}, testTime()); err == nil {
-		t.Fatal("expected the legacy encoder forward failure to remain visible")
+		t.Fatal("expected the encoder forward failure to remain visible")
 	}
 	if len(scene.events) != 1 || scene.events[0].Type != "overlay.discord_chat" {
 		t.Fatalf("local scene was not updated before forward failure: %#v", scene.events)
@@ -1525,7 +1526,7 @@ func TestManagerRetriesTransportFailure(t *testing.T) {
 	if err := manager.Start(t.Context(), StreamContext{StreamID: "stream-01"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.CustomOverlay(t.Context(), "stream-01", "overlay.discord_chat", map[string]any{"message_id": "msg-01", "text": "hello"}, testTime()); err == nil {
+	if _, err := manager.CustomOverlay(t.Context(), "stream-01", "overlay.discord_chat", map[string]any{"message_id": "msg-01", "author_id": "user-01", "content": "hello"}, testTime()); err == nil {
 		t.Fatal("expected transport failure to be reported to the caller")
 	}
 	waitForManager(t, time.Second, func() bool { return len(pub.snapshot()) == 1 })

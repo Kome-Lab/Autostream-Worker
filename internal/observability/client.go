@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 )
@@ -39,45 +38,28 @@ type Signal struct {
 	Timestamp   time.Time      `json:"timestamp"`
 }
 
-func ConfigFromEnv() Config {
-	return Config{
-		URL:       os.Getenv("OBSERVABILITY_URL"),
-		Token:     os.Getenv("OBSERVABILITY_TOKEN"),
-		ServiceID: envDefault("SERVICE_ID", "worker-01"),
-		Timeout:   envDuration("OBSERVABILITY_TIMEOUT_SEC", 5*time.Second),
-	}
-}
-
-func NewClientFromEnv() Client {
-	return Client{Config: ConfigFromEnv()}
-}
-
-func (c Client) Enabled() bool {
-	return strings.TrimSpace(c.Config.URL) != "" && strings.TrimSpace(c.Config.Token) != ""
-}
-
 func (c Client) Validate() error {
 	if strings.TrimSpace(c.Config.URL) == "" {
-		return errors.New("OBSERVABILITY_URL is required")
+		return errors.New("observability URL is required")
 	}
 	if strings.TrimSpace(c.Config.Token) == "" {
-		return errors.New("OBSERVABILITY_TOKEN is required")
+		return errors.New("observability token is required")
 	}
 	parsed, err := url.Parse(c.Config.URL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return errors.New("OBSERVABILITY_URL must be an absolute URL")
+		return errors.New("observability URL must be an absolute URL")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("OBSERVABILITY_URL must use http or https")
+		return errors.New("observability URL must use http or https")
 	}
 	if parsed.User != nil {
-		return errors.New("OBSERVABILITY_URL must not include credentials")
+		return errors.New("observability URL must not include credentials")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return errors.New("OBSERVABILITY_URL must not include query or fragment")
+		return errors.New("observability URL must not include query or fragment")
 	}
 	if parsed.Scheme == "http" && !isLocalDevHost(parsed.Hostname()) {
-		return errors.New("OBSERVABILITY_URL must use https for remote hosts")
+		return errors.New("observability URL must use https for remote hosts")
 	}
 	return nil
 }
@@ -145,23 +127,4 @@ func noRedirectClient() *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
-}
-
-func envDefault(key, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-		return value
-	}
-	return fallback
-}
-
-func envDuration(key string, fallback time.Duration) time.Duration {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	duration, err := time.ParseDuration(value + "s")
-	if err != nil || duration <= 0 {
-		return fallback
-	}
-	return duration
 }

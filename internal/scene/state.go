@@ -50,7 +50,6 @@ type Config struct {
 	ConversationMaxItems      int
 	ConversationReorderWindow time.Duration
 	ShowVoiceTranscripts      bool
-	ShowLegacyCaptionBar      bool
 	Avatar                    AvatarConfig
 }
 
@@ -124,7 +123,6 @@ type Scene struct {
 	conversationMaxItems      int
 	conversationReorderWindow time.Duration
 	showVoiceTranscripts      bool
-	showLegacyCaptionBar      bool
 	fontFile                  string
 	fonts                     map[int]*fontSet
 	avatars                   *avatarCache
@@ -157,7 +155,7 @@ func New(config Config) (*Scene, error) {
 		maxCaptions: config.MaxCaptions, interimCaptionTTL: config.InterimCaptionTTL, finalCaptionTTL: config.FinalCaptionTTL,
 		maxParticipants: config.MaxParticipants, conversationMaxItems: config.ConversationMaxItems,
 		conversationReorderWindow: config.ConversationReorderWindow, showVoiceTranscripts: config.ShowVoiceTranscripts,
-		showLegacyCaptionBar: config.ShowLegacyCaptionBar, fontFile: config.FontFile, fonts: map[int]*fontSet{config.Height: fonts}, avatars: newAvatarCache(config.Avatar),
+		fontFile: config.FontFile, fonts: map[int]*fontSet{config.Height: fonts}, avatars: newAvatarCache(config.Avatar),
 		participants: map[string]Participant{}, speakingIDs: map[string]bool{}, seenMessages: map[string]time.Time{},
 	}, nil
 }
@@ -165,8 +163,8 @@ func New(config Config) (*Scene, error) {
 // ConfigureDisplay applies the per-job conversation policy without rebuilding
 // the renderer or losing the current font/avatar caches. Callers provide
 // already-validated profile values; zero values are ignored for duration/count
-// fields so an older caller cannot accidentally disable retention.
-func (s *Scene) ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts, showLegacyCaptionBar bool) {
+// fields so an incomplete profile cannot accidentally disable retention.
+func (s *Scene) ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalTTL time.Duration, showVoiceTranscripts bool) {
 	if s == nil {
 		return
 	}
@@ -188,7 +186,6 @@ func (s *Scene) ConfigureDisplay(maxItems int, reorderWindow, interimTTL, finalT
 		s.finalCaptionTTL = finalTTL
 	}
 	s.showVoiceTranscripts = showVoiceTranscripts
-	s.showLegacyCaptionBar = showLegacyCaptionBar
 }
 
 func normalizeConfig(config Config) Config {
@@ -510,8 +507,8 @@ func (s *Scene) applyActiveSpeakerLocked(payload map[string]any) error {
 
 func (s *Scene) applyChatLocked(payload map[string]any, now time.Time) error {
 	messageID := cleanText(stringValue(payload, "message_id"), 128)
-	authorID := cleanText(preferredString(payload, "author_id", "user_id"), 128)
-	content := cleanText(preferredString(payload, "content", "text"), 1000)
+	authorID := cleanText(stringValue(payload, "author_id"), 128)
+	content := cleanText(stringValue(payload, "content"), 1000)
 	if messageID == "" || authorID == "" || content == "" {
 		return errors.New("discord chat message_id, author_id and content are required")
 	}
@@ -560,7 +557,7 @@ func (s *Scene) applyCaptionLocked(payload map[string]any, now time.Time, final 
 	speakerUserID := cleanText(stringValue(payload, "speaker_user_id"), 128)
 	utteranceID := cleanText(stringValue(payload, "utterance_id"), 160)
 	revision := intValue(payload, "revision")
-	speakerName := cleanText(preferredString(payload, "speaker_display_name", "display_name"), 80)
+	speakerName := cleanText(stringValue(payload, "speaker_display_name"), 80)
 	speakerUserID, speakerName = s.resolveCaptionSpeakerLocked(speakerUserID, speakerName)
 	avatarURL := ""
 	isBot := false
@@ -577,14 +574,7 @@ func (s *Scene) applyCaptionLocked(payload map[string]any, now time.Time, final 
 	for i := len(s.captions) - 1; i >= 0; i-- {
 		caption := s.captions[i]
 		matches := false
-		if utteranceID != "" {
-			matches = caption.UtteranceID == utteranceID
-		} else {
-			// Legacy caption callers have no stable utterance key. Only the
-			// current interim for this speaker can be replaced in that mode;
-			// a final caption may belong to a later utterance.
-			matches = !caption.Final && caption.SpeakerUserID == speakerUserID
-		}
+		matches = utteranceID != "" && caption.UtteranceID == utteranceID
 		if matches {
 			sameCaptionIndex = i
 			break
@@ -823,13 +813,6 @@ func (s *Scene) Render(at time.Time) (*image.RGBA, error) {
 func stringValue(payload map[string]any, key string) string {
 	value, _ := payload[key].(string)
 	return value
-}
-
-func preferredString(payload map[string]any, canonical, legacy string) string {
-	if value := strings.TrimSpace(stringValue(payload, canonical)); value != "" {
-		return value
-	}
-	return stringValue(payload, legacy)
 }
 
 func intValue(payload map[string]any, key string) int {

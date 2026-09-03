@@ -24,6 +24,8 @@ type Config struct {
 	ServiceID        string
 	ServiceName      string
 	ServicePublicURL string
+	BindAddress      string
+	ConfigRevision   int64
 	Version          string
 	HeartbeatEvery   time.Duration
 	ConfigError      string
@@ -120,13 +122,8 @@ type RuntimeProfile struct {
 
 func ConfigFromEnv() Config {
 	cfg := Config{
-		ControlPanelURL:  os.Getenv("CONTROL_PANEL_URL"),
-		Token:            os.Getenv("CONTROL_PANEL_TOKEN"),
-		ServiceID:        envDefault("SERVICE_ID", "worker-01"),
-		ServiceName:      envDefault("SERVICE_NAME", "Worker"),
-		ServicePublicURL: os.Getenv("SERVICE_PUBLIC_URL"),
-		Version:          envDefault("SERVICE_VERSION", version.Current()),
-		HeartbeatEvery:   envDuration("CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC", 30*time.Second),
+		Version:        envDefault("SERVICE_VERSION", version.Current()),
+		HeartbeatEvery: envDuration("CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC", 30*time.Second),
 	}
 	applyNodeConfigFromEnv(&cfg, ServiceType)
 	return cfg
@@ -137,16 +134,16 @@ func (c Config) Validate() error {
 		return errors.New(c.ConfigError)
 	}
 	if strings.TrimSpace(c.ControlPanelURL) == "" {
-		return errors.New("CONTROL_PANEL_URL is required")
+		return errors.New("node config panel.url is required")
 	}
 	if strings.TrimSpace(c.Token) == "" {
-		return errors.New("CONTROL_PANEL_TOKEN is required")
+		return errors.New("node config auth.token is required")
 	}
 	if strings.TrimSpace(c.ServiceID) == "" {
-		return errors.New("SERVICE_ID is required")
+		return errors.New("node config node.id is required")
 	}
 	if strings.TrimSpace(c.ServiceName) == "" {
-		return errors.New("SERVICE_NAME is required")
+		return errors.New("node config node.name is required")
 	}
 	if err := validateHTTPURL(c.ControlPanelURL, "CONTROL_PANEL_URL"); err != nil {
 		return err

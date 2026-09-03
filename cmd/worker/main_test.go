@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,27 +13,20 @@ import (
 	"github.com/example/autostream-worker/internal/httpapi"
 )
 
-func TestWorkerBindAddrFromEnvPreservesLegacyFallbackPort8080(t *testing.T) {
-	t.Setenv("AUTOSTREAM_BIND_ADDR", "")
-
-	got, err := workerBindAddrFromEnv()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "127.0.0.1:8080" {
-		t.Fatalf("default bind address = %q, want bridge-compatible 127.0.0.1:8080", got)
+func TestWorkerBindAddrRequiresNodeConfigValue(t *testing.T) {
+	if _, err := workerBindAddr(""); err == nil {
+		t.Fatal("missing node config bind address was accepted")
 	}
 }
 
-func TestWorkerBindAddrFromEnvAcceptsConfigurableUnprivilegedPort(t *testing.T) {
+func TestWorkerBindAddrAcceptsConfiguredUnprivilegedPort(t *testing.T) {
 	for _, value := range []string{
 		"127.0.0.1:1024",
 		"127.0.0.1:18084",
 		"127.0.0.1:65535",
 	} {
 		t.Run(value, func(t *testing.T) {
-			t.Setenv("AUTOSTREAM_BIND_ADDR", value)
-			got, err := workerBindAddrFromEnv()
+			got, err := workerBindAddr(value)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -42,10 +37,8 @@ func TestWorkerBindAddrFromEnvAcceptsConfigurableUnprivilegedPort(t *testing.T) 
 	}
 }
 
-func TestWorkerBindAddrFromEnvAcceptsIPv6(t *testing.T) {
-	t.Setenv("AUTOSTREAM_BIND_ADDR", "[::1]:18084")
-
-	got, err := workerBindAddrFromEnv()
+func TestWorkerBindAddrAcceptsIPv6(t *testing.T) {
+	got, err := workerBindAddr("[::1]:18084")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +47,7 @@ func TestWorkerBindAddrFromEnvAcceptsIPv6(t *testing.T) {
 	}
 }
 
-func TestWorkerBindAddrFromEnvRejectsInvalidOrPrivilegedPort(t *testing.T) {
+func TestWorkerBindAddrRejectsInvalidOrPrivilegedPort(t *testing.T) {
 	for _, value := range []string{
 		"127.0.0.1",
 		"127.0.0.1:0",
@@ -63,17 +56,15 @@ func TestWorkerBindAddrFromEnvRejectsInvalidOrPrivilegedPort(t *testing.T) {
 		"127.0.0.1:not-a-port",
 	} {
 		t.Run(strings.ReplaceAll(value, ":", "_"), func(t *testing.T) {
-			t.Setenv("AUTOSTREAM_BIND_ADDR", value)
-			if _, err := workerBindAddrFromEnv(); err == nil {
-				t.Fatalf("workerBindAddrFromEnv() accepted %q", value)
+			if _, err := workerBindAddr(value); err == nil {
+				t.Fatalf("workerBindAddr() accepted %q", value)
 			}
 		})
 	}
 }
 
 func TestRequireMatchingUpdaterIdentityRejectsRegistrationIDDrift(t *testing.T) {
-	t.Setenv("AUTOSTREAM_NODE_CONFIG", "")
-	t.Setenv("SERVICE_ID", "worker-authoritative")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", writeWorkerNodeConfig(t))
 	latch := httpapi.NewUpdaterIdentityLatch(control.ServiceType)
 
 	if err := requireMatchingUpdaterIdentity(latch, "worker-authoritative"); err != nil {
@@ -85,10 +76,6 @@ func TestRequireMatchingUpdaterIdentityRejectsRegistrationIDDrift(t *testing.T) 
 }
 
 func TestBuildPublisherUsesAuthoritativeServiceID(t *testing.T) {
-	t.Setenv("SERVICE_ID", "")
-	t.Setenv("ENCODER_RECORDER_URL", "https://encoder.example.com")
-	t.Setenv("ENCODER_RECORDER_TOKEN", "legacy-token")
-
 	publisher := buildPublisher("worker-stk-skylab-01")
 	client, ok := publisher.(encoder.Client)
 	if !ok {
@@ -97,6 +84,25 @@ func TestBuildPublisherUsesAuthoritativeServiceID(t *testing.T) {
 	if client.Config.ServiceID != "worker-stk-skylab-01" {
 		t.Fatalf("publisher service ID = %q, want authoritative node ID", client.Config.ServiceID)
 	}
+}
+
+func writeWorkerNodeConfig(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	credentialDir := filepath.Join(dir, "credentials")
+	if err := os.Mkdir(credentialDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credentialDir, "node-listener.json"), []byte(`{"schema_version":2,"service_type":"worker","bind_address":"127.0.0.1:18084","config_revision":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", credentialDir)
+	body := "panel:\n  url: \"https://panel.example.jp\"\nnode:\n  id: \"worker-authoritative\"\n  name: \"Worker\"\n  type: \"worker\"\nlistener:\n  credential: \"node-listener.json\"\napi:\n  host: \"worker.example.jp\"\n  port: 8443\n  ssl_enabled: true\nauth:\n  token: \"runtime-token\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestWorkerProfileDefaultsFromRuntimeConfigUsesOnlyOwnServiceProfiles(t *testing.T) {

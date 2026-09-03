@@ -624,12 +624,13 @@ Type=simple
 User=autostream
 Group=autostream
 EnvironmentFile=-/etc/autostream/worker.env
+LoadCredential=node-listener.json:/opt/autostream/local-executor/ports/worker.json
 ExecStart=/usr/local/bin/autostream-worker
 
 [Install]
 WantedBy=multi-user.target
 EOF
-printf '%s\n' 'AUTOSTREAM_BIND_ADDR=127.0.0.1:18084' \
+printf '%s\n' 'AUTOSTREAM_NODE_CONFIG=/etc/autostream-worker/config.yml' \
   > "${EXTRACTED_ROOT}/.env.example"
 printf '%s\n' 'integration fixture' > "${EXTRACTED_ROOT}/README.install.md"
 jq -n \

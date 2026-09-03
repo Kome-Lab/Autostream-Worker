@@ -8,12 +8,11 @@ import (
 
 func TestHostAndContainerBindContract(t *testing.T) {
 	env := readFile(t, ".env.example")
-	if !strings.Contains(env, "AUTOSTREAM_BIND_ADDR=127.0.0.1:8084") {
-		t.Error(".env.example must bind the host service to 127.0.0.1:8084")
-	}
 	for _, required := range []string{
 		"AUTOSTREAM_WORKER_PORT=8084",
 		"AUTOSTREAM_WORKER_CONTAINER_PORT=8080",
+		"listener.credential: node-listener.json",
+		"bind_address and config_revision",
 	} {
 		if !strings.Contains(env, required) {
 			t.Errorf(".env.example is missing Docker port default %q", required)
@@ -22,12 +21,10 @@ func TestHostAndContainerBindContract(t *testing.T) {
 	if !strings.Contains(env, "1024") || !strings.Contains(env, "65535") {
 		t.Error(".env.example must document the supported unprivileged port range")
 	}
-	if !strings.Contains(env, "legacy 127.0.0.1:8080 fallback") {
-		t.Error(".env.example must document the env-unset legacy port fallback")
-	}
-	if !strings.Contains(env, "AUTOSTREAM_CONFIG_REVISION=1") ||
-		!strings.Contains(strings.ToLower(env), "root-owned") {
-		t.Error(".env.example must document the root-owned updater probe config revision")
+	for _, removed := range []string{"AUTOSTREAM_BIND_ADDR", "AUTOSTREAM_CONFIG_REVISION", "api.bind_host", "ENCODER_RECORDER_URL", "ENCODER_RECORDER_TOKEN", "OBSERVABILITY_URL", "OBSERVABILITY_TOKEN"} {
+		if strings.Contains(env, removed) {
+			t.Errorf(".env.example retains removed runtime key %q", removed)
+		}
 	}
 	if !strings.Contains(env, "AUTOSTREAM_SCENE_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc") ||
 		!strings.Contains(env, "no basic-font fallback") {
@@ -53,19 +50,24 @@ func TestHostAndContainerBindContract(t *testing.T) {
 
 	base := readFile(t, "docker-compose.yml")
 	for _, required := range []string{
-		"AUTOSTREAM_CONFIG_REVISION: ${AUTOSTREAM_CONFIG_REVISION:-1}",
-		"AUTOSTREAM_BIND_ADDR: 0.0.0.0:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}",
+		"CREDENTIALS_DIRECTORY: /run/autostream-credentials",
+		"source: node-listener",
+		"target: /run/autostream-credentials/node-listener.json",
+		`"service_type":"worker"`,
+		`"bind_address":"0.0.0.0:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}"`,
+		`"config_revision":${AUTOSTREAM_CONFIG_REVISION:?AUTOSTREAM_CONFIG_REVISION is required}`,
 		`127.0.0.1:${AUTOSTREAM_WORKER_PORT:-8084}:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}`,
 	} {
 		if !strings.Contains(base, required) {
 			t.Errorf("base compose is missing %q", required)
 		}
 	}
+	if strings.Count(base, "${AUTOSTREAM_CONFIG_REVISION:") != 1 || strings.Contains(base, "\n      AUTOSTREAM_CONFIG_REVISION:") {
+		t.Error("base compose must use the revision only as the node-listener JSON generation input")
+	}
 
 	local := readFile(t, "docker-compose.local.yml")
 	for _, required := range []string{
-		"AUTOSTREAM_CONFIG_REVISION: ${AUTOSTREAM_CONFIG_REVISION:-1}",
-		"AUTOSTREAM_BIND_ADDR: 0.0.0.0:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}",
 		`127.0.0.1:${AUTOSTREAM_WORKER_PORT:-8084}:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}`,
 	} {
 		if !strings.Contains(local, required) {
@@ -75,8 +77,6 @@ func TestHostAndContainerBindContract(t *testing.T) {
 
 	production := readFile(t, "docker-compose.prod.yml")
 	for _, required := range []string{
-		"AUTOSTREAM_CONFIG_REVISION: ${AUTOSTREAM_CONFIG_REVISION:-1}",
-		"AUTOSTREAM_BIND_ADDR: 0.0.0.0:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}",
 		"ports: !override",
 		`127.0.0.1:${AUTOSTREAM_WORKER_PORT:-8084}:${AUTOSTREAM_WORKER_CONTAINER_PORT:-8080}`,
 	} {
@@ -84,30 +84,44 @@ func TestHostAndContainerBindContract(t *testing.T) {
 			t.Errorf("production compose is missing %q", required)
 		}
 	}
+	for name, body := range map[string]string{"base": base, "local": local, "production": production} {
+		for _, removed := range []string{"AUTOSTREAM_BIND_ADDR", "ENCODER_RECORDER_URL", "ENCODER_RECORDER_TOKEN"} {
+			if strings.Contains(body, removed) {
+				t.Errorf("%s compose retains removed runtime key %q", name, removed)
+			}
+		}
+		if strings.Contains(body, "\n      AUTOSTREAM_CONFIG_REVISION:") || (name != "base" && strings.Contains(body, "AUTOSTREAM_CONFIG_REVISION")) {
+			t.Errorf("%s compose injects the removed runtime revision environment key", name)
+		}
+	}
 
 	unit := readFile(t, "systemd/autostream-worker.service.example")
 	primaryEnv := "EnvironmentFile=/etc/autostream/worker.env"
-	managedEnv := "EnvironmentFile=-/opt/autostream/local-executor/ports/worker.env"
+	listenerCredential := "LoadCredential=node-listener.json:/opt/autostream/local-executor/ports/worker.json"
 	if !strings.Contains(unit, primaryEnv) {
-		t.Error("systemd unit must load the configurable bind address from worker.env")
+		t.Error("systemd unit must load operational settings from worker.env")
 	}
-	if !strings.Contains(unit, managedEnv) {
-		t.Error("systemd unit must optionally load the Control Panel managed port sidecar")
-	}
-	if strings.Index(unit, managedEnv) <= strings.Index(unit, primaryEnv) {
-		t.Error("managed port sidecar must load after worker.env so its bind address and revision win")
+	if !strings.Contains(unit, listenerCredential) {
+		t.Error("systemd unit must load the Panel-issued listener credential")
 	}
 	if strings.Contains(unit, "8084") {
 		t.Error("systemd unit must not hard-code the worker port")
 	}
-	if !strings.Contains(unit, "AUTOSTREAM_CONFIG_REVISION") ||
-		!strings.Contains(unit, "root-owned") {
-		t.Error("systemd unit must document the root-owned config revision environment")
+	if strings.Contains(unit, "AUTOSTREAM_BIND_ADDR") {
+		t.Error("systemd unit retains removed bind environment key")
+	}
+	for _, removed := range []string{"AUTOSTREAM_CONFIG_REVISION", "/ports/worker.env"} {
+		if strings.Contains(unit, removed) {
+			t.Errorf("systemd unit retains removed listener environment contract %q", removed)
+		}
 	}
 
 	install := readFile(t, "release/README.install.md")
 	for _, required := range []string{
-		"AUTOSTREAM_CONFIG_REVISION=1",
+		"node-listener.json",
+		"listener.credential",
+		"bind_address",
+		"config_revision",
 		"version, service_id, service_type, and config_revision",
 		`PROBE_HOST="${PROBE_HOST:-127.0.0.1}"`,
 		"PROBE_HOST='[::1]'",
@@ -119,6 +133,9 @@ func TestHostAndContainerBindContract(t *testing.T) {
 
 	readme := readFile(t, "README.md")
 	for _, required := range []string{
+		"node-listener.json",
+		"listener.credential",
+		"bind_address",
 		"host/reverse-proxy responsibility",
 		"`1024` through `65535`",
 		"The production health authority is the host Local Executor.",

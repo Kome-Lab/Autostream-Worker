@@ -37,8 +37,8 @@ func TestSceneReducesCanonicalEventsAndRendersSupportedSizes(t *testing.T) {
 				},
 			}, now))
 			apply(t, s, events.CustomOverlayEvent("stream-01", "overlay.discord_chat", map[string]any{
-				"message_id": "message-01", "author_id": "canonical-user", "user_id": "legacy-user",
-				"display_name": "Alice", "content": "canonical text", "text": "legacy text", "is_bot": false,
+				"message_id": "message-01", "author_id": "canonical-user",
+				"display_name": "Alice", "content": "canonical text", "is_bot": false,
 				"created_at": now.Format(time.RFC3339), "attachments": []any{map[string]any{"url": "https://example.com/secret.png"}},
 			}, now))
 			apply(t, s, events.CustomOverlayEvent("stream-01", "caption.telop", map[string]any{"text": "途中字幕", "speaker_user_id": "user-01"}, now))
@@ -51,7 +51,7 @@ func TestSceneReducesCanonicalEventsAndRendersSupportedSizes(t *testing.T) {
 				t.Fatalf("multiple speakers or bot flag was lost: %#v", snapshot.Participants)
 			}
 			if len(snapshot.Chat) != 1 || snapshot.Chat[0].AuthorID != "canonical-user" || snapshot.Chat[0].Content != "canonical text" {
-				t.Fatalf("canonical chat fields were not preferred: %#v", snapshot.Chat)
+				t.Fatalf("canonical chat fields were not applied: %#v", snapshot.Chat)
 			}
 			if len(snapshot.Captions) != 1 || snapshot.Captions[0].Text != "途中字幕" || snapshot.Captions[0].Final {
 				t.Fatalf("caption state was not applied: %#v", snapshot.Captions)

@@ -7,7 +7,7 @@ AutoStream の Worker service です。
 - Control Panel から stream job context を受け取ります。
 - overlay、caption、participant、active-speaker、current-time event から16:9の配信映像を描画します。
 - Discord Bot の Discord Opus packet を受け取り、Deepgram のリアルタイム字幕を生成します。
-- 描画した映像をjob-scoped暗号化SRTで選択済みEncoder/Recorderへ送り、互換・診断用eventも転送します。
+- 描画した映像をjob-scoped暗号化SRTで選択済みEncoder/Recorderへ送り、診断用eventも転送します。
 - Control Panel へ heartbeat と signal を送信し、Control Panel 経由で Observability に反映します。
 
 ## 主な環境変数
@@ -17,8 +17,6 @@ AUTOSTREAM_NODE_CONFIG=/etc/autostream-worker/config.yml
 AUTOSTREAM_ENV=production
 AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG=true
 AUTOSTREAM_SCENE_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
-AUTOSTREAM_BIND_ADDR=127.0.0.1:8084
-AUTOSTREAM_CONFIG_REVISION=1
 TZ=Asia/Tokyo
 ```
 
@@ -29,29 +27,24 @@ configured-FPS CBR video encode, audio mux, preview, recording, and delivery.
 The Worker host therefore requires a Japanese Noto font but does not require
 FFmpeg. `AUTOSTREAM_SCENE_FONT_FILE` is an
 optional absolute-path override. When it is unset, Worker uses the exact path
-`/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` so preserved legacy
-`worker.env` files remain upgrade-compatible. If the selected file is missing
+`/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` so existing
+`worker.env` files keep the same font selection. If the selected file is missing
 or invalid, startup fails closed; Worker never falls back to a non-Japanese
 basic font. On
 Debian/Ubuntu, install `fontconfig` and `fonts-noto-cjk`.
 
-`AUTOSTREAM_CONFIG_REVISION` is a root-owned positive integer used by the local
-executor to bind `/updater/version` to the applied service configuration.
-It defaults to `1`; increment it after a configuration change. Invalid, signed,
-fractional, padded, zero, or negative values stop the Worker before it starts
-serving HTTP.
+Panel-managed `config.yml` must select `listener.credential: node-listener.json`.
+For systemd, `LoadCredential` exposes the strict four-field JSON from
+`/opt/autostream/local-executor/ports/worker.json`; its `bind_address` is the
+only local listener authority and its positive `config_revision` is reported by
+`/updater/version`. The JSON also carries `schema_version: 2` and
+`service_type: worker`. Missing, malformed, writable, or mismatched credentials
+fail closed. There is no bind or revision environment fallback.
 
-The Control Panel local executor writes managed bind/revision overrides to
-`/opt/autostream/local-executor/ports/worker.env`. systemd loads this optional root-owned
-sidecar after `worker.env`, so managed values win without breaking existing
-hosts where the sidecar does not exist.
-
-systemd 版の待受ポートは `/etc/autostream/worker.env` の
-`AUTOSTREAM_BIND_ADDR` で変更できます。ポートは非特権範囲の
-`1024`～`65535` を指定してください。標準の env ファイルは IPv4
-loopback の `127.0.0.1:8084` を明示します。変数自体がない既存環境では、
-アップグレードだけでポートを移動しないようバイナリの従来値
-`127.0.0.1:8080` を維持します。
+`api.host` and `api.port` remain the public/reverse-proxy endpoint and do not
+select the local socket. The listener `bind_address` must use an unprivileged
+port from `1024` through `65535`; the standard host value is
+`127.0.0.1:8084`.
 例えば `127.0.0.1:18084` に変更した場合、`/health` と
 `/updater/version` も同じ `18084` で待ち受けます。不正な形式、範囲外、
 または特権ポートを指定した場合は Worker が起動時に安全側で停止します。
@@ -73,17 +66,18 @@ intentionally omit an in-container `healthcheck`: the runtime image has no
 purpose-built HTTP probe client, and the image contract does not add or repurpose `curl`, `wget`, or another unrelated executable solely for container health.
 For managed Docker changes, the Local Executor probes the loopback published port for both `/health` and `/updater/version`; the published port is the health port.
 A recreate is accepted only when health, service identity, version, and
-`AUTOSTREAM_CONFIG_REVISION` match; otherwise the executor rolls back or reports
+the listener credential's `config_revision` match; otherwise the executor rolls back or reports
 `rollback_failed`.
 
 ```powershell
 $env:AUTOSTREAM_WORKER_PORT = "18084"
+$env:AUTOSTREAM_CONFIG_REVISION = "1" # Compose JSON generation input only
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
-`AUTOSTREAM_NODE_CONFIG` には Control Panel の Node登録で生成した `config.yml` を指定します。Node Runtime Token と stream-scoped token の検証に使う `stream_ingest.signing_key` はこのファイルに入り、標準構成では `CONTROL_PANEL_TOKEN`、`AUTOSTREAM_STREAM_INGEST_SIGNING_KEY`、`OBSERVABILITY_TOKEN` を env に手入力しません。Worker から Observability へ直接送る互換fallbackを使う場合だけ、`OBSERVABILITY_URL` と `OBSERVABILITY_TOKEN=<OBSERVABILITY_INGEST_TOKEN>` を追加します。
+`AUTOSTREAM_NODE_CONFIG` には Control Panel の Node登録で生成した `config.yml` を指定します。Node Runtime Token、service identity、public endpoint、listener credential selector、stream-scoped token の検証に使う `stream_ingest.signing_key` はこのファイルから読み込みます。WorkerのsignalsはControl Panelのtyped Observability経路へ送信します。
 
-Encoder/Recorder のevent送信先とworker-event tokenは、通常はControl Panelのstream job contextで `encoder_recorder_url` / `stream_ingest_token` として渡されます。映像用のSRT URL・passphrase・key lengthも同じstart処理内で一度だけ渡され、URLやargv、log、statusへ秘密を埋め込みません。`ENCODER_RECORDER_URL` と `ENCODER_RECORDER_TOKEN` はlocal migration / dry-run互換fallbackのみで使い、本番envには置きません。
+Encoder/Recorder のevent送信先とworker-event tokenはControl Panelのstream job contextで `encoder_recorder_url` / `stream_ingest_token` として渡されます。映像用のSRT URL・passphrase・key lengthも同じstart処理内で一度だけ渡され、URLやargv、log、statusへ秘密を埋め込みません。
 
 `AUTOSTREAM_REQUIRE_CONTROL_PANEL_RUNTIME_CONFIG=true` または `AUTOSTREAM_ENV=production` の場合、Worker は Control Panel registration と runtime config 取得に失敗すると起動を停止します。runtime config に含まれる自 service の primary assignment だけを受け付け、standby または別 Worker に割り当てられた stream の `/jobs/start` は拒否します。
 

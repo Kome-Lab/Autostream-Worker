@@ -18,7 +18,6 @@ import (
 	"github.com/example/autostream-worker/internal/encoder"
 	"github.com/example/autostream-worker/internal/httpapi"
 	"github.com/example/autostream-worker/internal/jobs"
-	"github.com/example/autostream-worker/internal/observability"
 	"github.com/example/autostream-worker/internal/scene"
 	"github.com/example/autostream-worker/internal/sceneappearance"
 	"github.com/example/autostream-worker/internal/version"
@@ -40,15 +39,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	addr, err := workerBindAddrFromEnv()
+	controlClient := control.Client{Config: control.ConfigFromEnv()}
+	addr, err := workerBindAddr(controlClient.Config.BindAddress)
 	if err != nil {
-		log.Fatalf("invalid AUTOSTREAM_BIND_ADDR: %v", err)
+		log.Fatalf("invalid node listener credential bind_address: %v", err)
 	}
 	updaterIdentity := httpapi.NewUpdaterIdentityLatch(control.ServiceType)
 	if _, err := updaterIdentity.ResolveFromEnv(); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
 		log.Fatalf("invalid updater identity: %v", err)
 	}
-	controlClient := control.Client{Config: control.ConfigFromEnv()}
 	if err := requireMatchingUpdaterIdentity(updaterIdentity, controlClient.Config.ServiceID); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
 		log.Fatalf("invalid updater identity: %v", err)
 	}
@@ -107,7 +106,7 @@ func main() {
 		if strings.TrimSpace(controlClient.Config.ConfigError) != "" {
 			log.Fatalf("node config invalid: %v", controlClient.Config.ConfigError)
 		} else {
-			log.Fatal("CONTROL_PANEL_URL and CONTROL_PANEL_TOKEN are required in this environment")
+			log.Fatal("panel-managed node config is required in this environment")
 		}
 	}
 
@@ -152,12 +151,10 @@ func main() {
 	}
 }
 
-func workerBindAddrFromEnv() (string, error) {
-	const defaultAddr = "127.0.0.1:8080"
-
-	addr := strings.TrimSpace(os.Getenv("AUTOSTREAM_BIND_ADDR"))
+func workerBindAddr(configured string) (string, error) {
+	addr := strings.TrimSpace(configured)
 	if addr == "" {
-		addr = defaultAddr
+		return "", errors.New("node listener credential bind_address is required")
 	}
 	_, portText, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -317,25 +314,10 @@ func envBool(key string, fallback bool) bool {
 }
 
 func buildPublisher(serviceID string) encoder.Publisher {
-	cfg := encoder.ConfigFromEnv()
-	// The node config is the authoritative identity in production. The
-	// encoder client still has a legacy SERVICE_ID fallback for local
-	// compatibility, but using that fallback here would make signed
-	// stream-scoped tokens fail Encoder's service-id fence.
-	if serviceID = strings.TrimSpace(serviceID); serviceID != "" {
-		cfg.ServiceID = serviceID
-	}
-	if cfg.URL == "" || cfg.Token == "" {
-		log.Printf("static encoder route is incomplete; job-scoped encoder URL and signed ingest token will be preferred")
-	}
-	return encoder.Client{Config: cfg}
+	return encoder.Client{Config: encoder.ConfigFromEnv(serviceID)}
 }
 
 func buildReporter(controlClient control.Client) jobs.Reporter {
-	obs := observability.NewClientFromEnv()
-	if obs.Enabled() {
-		return obs
-	}
 	if controlClient.Config.ControlPanelURL != "" && controlClient.Config.Token != "" {
 		return controlClient
 	}

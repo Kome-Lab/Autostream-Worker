@@ -16,7 +16,7 @@ import (
 
 func TestRunConfigureCommandWritesNodeConfig(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/node-agent/configure" {
+		if r.URL.Path != "/services/runtime-identity/configuration" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		var payload map[string]string
@@ -27,7 +27,7 @@ func TestRunConfigureCommandWritesNodeConfig(t *testing.T) {
 			t.Fatalf("configure request did not include runtime platform: %#v", payload)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"config_yml":"panel:\n  url: \"https://panel.example.jp\"\nnode:\n  id: \"worker-01\"\n  name: \"Worker 01\"\n  type: \"worker\"\napi:\n  host: \"worker.example.jp\"\n  port: 8443\n  ssl_enabled: true\nauth:\n  token_id: \"runtime-token-id\"\n  token: \"runtime-token\"\n"}`))
+		_, _ = w.Write([]byte(`{"config_yml":"panel:\n  url: \"https://panel.example.jp\"\nnode:\n  id: \"worker-01\"\n  name: \"Worker 01\"\n  type: \"worker\"\nlistener:\n  credential: \"node-listener.json\"\napi:\n  host: \"worker.example.jp\"\n  port: 8443\n  ssl_enabled: true\nauth:\n  token_id: \"runtime-token-id\"\n  token: \"runtime-token\"\n"}`))
 	}))
 	defer server.Close()
 
@@ -61,7 +61,7 @@ func TestRunConfigureCommandWritesNodeConfig(t *testing.T) {
 func TestRunConfigureCommandRejectsNodeTypeMismatchBeforeWrite(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"config_yml":"panel:\n  url: \"https://panel.example.jp\"\nnode:\n  id: \"worker-01\"\n  name: \"Discord 01\"\n  type: \"discord_bot\"\napi:\n  host: \"discord.example.jp\"\n  port: 8443\n  ssl_enabled: true\nauth:\n  token_id: \"runtime-token-id\"\n  token: \"runtime-token\"\n"}`))
+		_, _ = w.Write([]byte(`{"config_yml":"panel:\n  url: \"https://panel.example.jp\"\nnode:\n  id: \"worker-01\"\n  name: \"Discord 01\"\n  type: \"discord_bot\"\nlistener:\n  credential: \"node-listener.json\"\napi:\n  host: \"discord.example.jp\"\n  port: 8443\n  ssl_enabled: true\nauth:\n  token_id: \"runtime-token-id\"\n  token: \"runtime-token\"\n"}`))
 	}))
 	defer server.Close()
 

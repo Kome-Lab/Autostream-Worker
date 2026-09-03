@@ -98,7 +98,7 @@ func fetchNodeConfig(ctx context.Context, panelURL, nodeID, configureToken strin
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(panelURL, "/")+"/api/node-agent/configure", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(panelURL, "/")+"/services/runtime-identity/configuration", bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}
