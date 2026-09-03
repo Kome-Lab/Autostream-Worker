@@ -3,9 +3,9 @@ module github.com/example/autostream-worker
 go 1.26.5
 
 require (
-	github.com/example/autostream-contracts v0.0.0
 	github.com/coder/websocket v1.8.15
 	github.com/datarhei/gosrt v0.11.0
+	github.com/example/autostream-contracts v0.0.0
 	golang.org/x/image v0.45.0
 )
 
@@ -13,6 +13,7 @@ replace github.com/example/autostream-contracts => github.com/Kome-Lab/Autostrea
 
 require (
 	github.com/benburkert/openpgp v0.0.0-20160410205803-c2471f86866c // indirect
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
 	golang.org/x/net v0.53.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
