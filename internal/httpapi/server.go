@@ -540,6 +540,9 @@ func writeRequestError(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
+	case errors.Is(err, jobs.ErrLegacyDiscordChatFields):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "validation_failed", "message": jobs.ErrLegacyDiscordChatFields.Error()})
+		return
 	case errors.Is(err, jobs.ErrCaptionProfileInvalid):
 		writeJSON(w, http.StatusConflict, map[string]string{"code": "caption_profile_invalid", "message": "selected caption profile is invalid"})
 		return

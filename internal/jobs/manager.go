@@ -36,6 +36,7 @@ var (
 	ErrStreamStopping                           = errors.New("stream job is stopping")
 	ErrStoppedTargetReceiptUnavailable          = errors.New("stopped target receipt is unavailable")
 	ErrVideoOutputUnavailable                   = errors.New("worker video output is unavailable")
+	ErrLegacyDiscordChatFields                  = errors.New("discord chat payload contains legacy fields")
 )
 
 const (
@@ -2057,6 +2058,16 @@ func (m *Manager) publishWithGenerations(ctx context.Context, event events.Overl
 	if expectedCaptionSessionGeneration != 0 && expectedCaptionSessionGeneration != m.captionSessionGeneration {
 		m.mu.Unlock()
 		return events.OverlayEvent{}, ErrCaptionSessionGenerationMismatch
+	}
+	if event.Type == "overlay.discord_chat" {
+		_, hasLegacyUserID := event.Payload["user_id"]
+		_, hasLegacyText := event.Payload["text"]
+		// Reject key presence, including null, before replacing pending events
+		// or applying the event to the local scene.
+		if hasLegacyUserID || hasLegacyText {
+			m.mu.Unlock()
+			return events.OverlayEvent{}, ErrLegacyDiscordChatFields
+		}
 	}
 	encoderRecorderURL := m.current.EncoderRecorderURL
 	streamIngestToken := m.current.StreamIngestToken
