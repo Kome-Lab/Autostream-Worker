@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1536,9 +1537,9 @@ func TestManagerRetriesTransportFailure(t *testing.T) {
 }
 
 func TestManagerStopsAtBoundedRetryLimit(t *testing.T) {
-	attempts := 0
+	var attempts atomic.Int32
 	pub := &fakePublisher{handler: func(encoder.Event) error {
-		attempts++
+		attempts.Add(1)
 		return encoder.NewRetryablePublishError(http.StatusServiceUnavailable, "http_status")
 	}}
 	manager := NewManager(pub, nil)
@@ -1548,13 +1549,13 @@ func TestManagerStopsAtBoundedRetryLimit(t *testing.T) {
 	if _, err := manager.Participants(t.Context(), "stream-01", []events.Participant{{UserID: "user-01"}}, testTime()); err == nil {
 		t.Fatal("expected bounded delivery failure")
 	}
-	waitForManager(t, 3*time.Second, func() bool { return attempts >= maxWorkerEventAttempts })
-	if attempts != maxWorkerEventAttempts {
-		t.Fatalf("retry limit was not enforced: attempts=%d want=%d", attempts, maxWorkerEventAttempts)
+	waitForManager(t, 3*time.Second, func() bool { return attempts.Load() >= maxWorkerEventAttempts })
+	if got := attempts.Load(); got != maxWorkerEventAttempts {
+		t.Fatalf("retry limit was not enforced: attempts=%d want=%d", got, maxWorkerEventAttempts)
 	}
 	time.Sleep(250 * time.Millisecond)
-	if attempts != maxWorkerEventAttempts {
-		t.Fatalf("retry continued past the bound: attempts=%d", attempts)
+	if got := attempts.Load(); got != maxWorkerEventAttempts {
+		t.Fatalf("retry continued past the bound: attempts=%d", got)
 	}
 }
 
