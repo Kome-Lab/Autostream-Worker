@@ -26,4 +26,9 @@ jobs:
       - name: Test managed service installer with root-owned Linux fixtures
         run: sudo bash release/test-install-autostream-worker-integration.sh
       - run: go test ./...
+      - name: Race-test decomposed Worker packages
+        timeout-minutes: 15
+        env:
+          GOMAXPROCS: '2'
+        run: go test -mod=readonly -p 1 -race -count=1 ./internal/jobs ./internal/deepgram
       - run: go build ./...
