@@ -11,6 +11,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify Bundle 9 authored sources and raw distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/ci -p 'test_artifact_assembly.py' -v
+          python3 -m unittest discover -s scripts/ci -p 'test_verify_bundle9_sources.py' -v
+          python3 scripts/ci/verify_bundle9_sources.py \
+            --repository Autostream-Worker --tree "$(git rev-parse HEAD)"
+          for script in release/installer-tests/*/*.sh; do bash -n "${script}"; done
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod

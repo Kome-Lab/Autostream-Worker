@@ -1,0 +1,390 @@
+[
+  {
+    "target_id": "B9-M093",
+    "repository": "Kome-Lab/Autostream-Worker",
+    "original_path": "release/install-autostream-worker",
+    "original_sha256": "24556e8fcbdb3326f070df79962d5a695385edefe6759c9070c7f2e0c094b1fb",
+    "before_physical_lines": 1967,
+    "disposition": "generated-from-bounded-authoring",
+    "responsibility": "preamble/options;validation/identity;locks/journal;staging;account/systemd changes;activation/health;rollback/cleanup;main dispatch",
+    "destinations": [
+      {
+        "path": "authoring/install-autostream-worker/account-rollback.sh.inc",
+        "sha256": "94307d928283e26cd709c355dc410e521129d0ea3b74e99accb7ca9c0349002a",
+        "symbols": [],
+        "physical_lines": 191
+      },
+      {
+        "path": "authoring/install-autostream-worker/artifact-verification.sh.inc",
+        "sha256": "aa5785a3095336d8458e344e0b0044a1fb45bb793ca1df656728d4aa3f66a35e",
+        "symbols": [],
+        "physical_lines": 285
+      },
+      {
+        "path": "authoring/install-autostream-worker/cleanup.sh.inc",
+        "sha256": "b2feede2ba8ac0cc69093a0fcce760300da7a7c5542f31073958d13713dce6fc",
+        "symbols": [],
+        "physical_lines": 88
+      },
+      {
+        "path": "authoring/install-autostream-worker/directory-rollback.sh.inc",
+        "sha256": "15b55ff11c30d0c2c1073a7d5a19e36898af0d0b96fa21eb85e064a4daaf3d6b",
+        "symbols": [],
+        "physical_lines": 117
+      },
+      {
+        "path": "authoring/install-autostream-worker/host-preflight.sh.inc",
+        "sha256": "4c276b149b6628262515c6cb960aec74bf37e834ffd2f040b29cc733b59ad447",
+        "symbols": [],
+        "physical_lines": 245
+      },
+      {
+        "path": "authoring/install-autostream-worker/path-journal.sh.inc",
+        "sha256": "1a9d192d25e49414b49b2872fe391e585e519419dff013f80a0587fbb56e6162",
+        "symbols": [],
+        "physical_lines": 233
+      },
+      {
+        "path": "authoring/install-autostream-worker/preflight-input.sh.inc",
+        "sha256": "6c0a77628a3060d3a441cb68b3697c6919229331e20178953b720615f4f6e878",
+        "symbols": [],
+        "physical_lines": 310
+      },
+      {
+        "path": "authoring/install-autostream-worker/public-activation.sh.inc",
+        "sha256": "352e0d33cb6f1b6208b396f140849a47b17157833e812f9f939fe7fddd0f7c6a",
+        "symbols": [],
+        "physical_lines": 277
+      },
+      {
+        "path": "authoring/install-autostream-worker/release-verification.sh.inc",
+        "sha256": "0c5ab551b304f07a4c2bbff89b06a6f52c4017964faa92f549e4e21961132d90",
+        "symbols": [],
+        "physical_lines": 221
+      },
+      {
+        "path": "release/install-autostream-worker",
+        "sha256": "24556e8fcbdb3326f070df79962d5a695385edefe6759c9070c7f2e0c094b1fb",
+        "symbols": [],
+        "physical_lines": 1967
+      }
+    ]
+  },
+  {
+    "target_id": "B9-M094",
+    "repository": "Kome-Lab/Autostream-Worker",
+    "original_path": "release/test-install-autostream-worker-integration.sh",
+    "original_sha256": "f8675bb69f9a7fed80538fa3218ab67847706f4db2d5518f7bc3403fc406891e",
+    "before_physical_lines": 1705,
+    "disposition": "responsibility-split",
+    "responsibility": "fixture setup/stubs;case families;assertions;cleanup;ordered entry",
+    "destinations": [
+      {
+        "path": "release/installer-tests/worker/account-and-staging-rollback-cases.sh",
+        "sha256": "fb3b820284e41321914d8eedd2721f24c42c848392a4b3efb24575c25f726bac",
+        "symbols": [],
+        "physical_lines": 314
+      },
+      {
+        "path": "release/installer-tests/worker/archive-fixture-and-validation.sh",
+        "sha256": "f93720a21f5d047427f36cbb0d2b8d10a019c877a8ddcd497e4e2fd9d82a167b",
+        "symbols": [],
+        "physical_lines": 269
+      },
+      {
+        "path": "release/installer-tests/worker/fixture-ownership-and-runtime.sh",
+        "sha256": "24e2cde849bd11db0af1d113189a7b4b211b82d9707e9fb88bc616f51557c772",
+        "symbols": [],
+        "physical_lines": 460
+      },
+      {
+        "path": "release/installer-tests/worker/fresh-install-and-legacy-signal-cases.sh",
+        "sha256": "d9143fa134ef5eb3396b1173976b56624f48fed620dd1cd50eaea6cf6c3950b1",
+        "symbols": [],
+        "physical_lines": 254
+      },
+      {
+        "path": "release/installer-tests/worker/legacy-rollback-cases.sh",
+        "sha256": "70639c086d24b3bad3181d393cec2918c3693894a8590d1040a2ad8b5368c18c",
+        "symbols": [],
+        "physical_lines": 202
+      },
+      {
+        "path": "release/installer-tests/worker/migration-and-reinstall-cases.sh",
+        "sha256": "da810cbe5a1a1ed55ad57af92ce727ee087820ede6053f6e350ca37fc044ea1a",
+        "symbols": [],
+        "physical_lines": 71
+      },
+      {
+        "path": "release/test-install-autostream-worker-integration.sh",
+        "sha256": "10790a0387c64bd7fdec9e91eb7cf7fe777ea07c3b6cbf5ab481c61f71ee0324",
+        "symbols": [],
+        "physical_lines": 143
+      }
+    ]
+  },
+  {
+    "target_id": "B9-M095",
+    "repository": "Kome-Lab/Autostream-Worker",
+    "original_path": "internal/jobs/manager_test.go",
+    "original_sha256": "250ecc88a49254f6232a8569329162fa8efa09da311beb88b98c4720f7711a2f",
+    "before_physical_lines": 1603,
+    "disposition": "responsibility-split",
+    "responsibility": "scene/video start and rollback;caption profile/session;queue/generation/retries;event delivery;test doubles",
+    "destinations": [
+      {
+        "path": "internal/jobs/manager_caption_fixture_test.go",
+        "sha256": "d413dab4b2e6a1b68f43ecb9d5a0d94839fc9963c0525840a048526b4cb8e4d9",
+        "symbols": [
+          "*channelReporter.Event",
+          "*channelReporter.Metric",
+          "*closeBlockingCaptionSession.Close",
+          "*closeBlockingCaptionSession.Ingest",
+          "*controlledCaptionSession.Close",
+          "*controlledCaptionSession.Ingest",
+          "*controlledCaptionSession.snapshot",
+          "*fakeCaptionSession.Close",
+          "*fakeCaptionSession.Ingest",
+          "*fakeCaptionSession.Status",
+          "*fakePublisher.Publish",
+          "*fakePublisher.snapshot",
+          "*retryCaptionSession.Close",
+          "*retryCaptionSession.Ingest",
+          "*retryCaptionSession.snapshot",
+          "capturedReport",
+          "channelReporter",
+          "classifiedCaptionProviderError",
+          "classifiedCaptionProviderError.Error",
+          "classifiedCaptionProviderError.Retryable",
+          "classifiedCaptionProviderError.SafeErrorClass",
+          "classifiedCaptionProviderError.SafeHTTPStatus",
+          "classifiedCaptionProviderError.Unwrap",
+          "closeBlockingCaptionSession",
+          "controlledCaptionSession",
+          "fakeCaptionSession",
+          "fakePublisher",
+          "retryCaptionSession",
+          "waitForCaptionSessionCalls"
+        ],
+        "physical_lines": 214
+      },
+      {
+        "path": "internal/jobs/manager_caption_generation_test.go",
+        "sha256": "44d33f98d8455f5967e976ce06fb2631df113ec86b9d82aaeb1cc845d23d3014",
+        "symbols": [
+          "TestClassifyCaptionAudioErrorUsesSafeStableClasses",
+          "TestManagerCancelsQueuedCaptionAudioAcrossStopAndRearm",
+          "TestManagerSupersedesOlderConnectionGenerationQueue"
+        ],
+        "physical_lines": 168
+      },
+      {
+        "path": "internal/jobs/manager_caption_ingress_test.go",
+        "sha256": "6b3f2143cf7eb757bc7abaa5101fbdc2b2d2d977347fec1937221d8f1863a3de",
+        "symbols": [
+          "TestManagerCaptionIngressCountsFinalProviderDrop",
+          "TestManagerCaptionIngressFailsFastAcrossProviderOutageBatch",
+          "TestManagerCaptionIngressQueueIsBounded",
+          "TestManagerCaptionIngressRequiresGenerationAndRetriesOnlyFailedPackets",
+          "TestManagerCaptionIngressStopsRetryingTerminalProviderRejection",
+          "TestManagerProcessesNextCaptionPacketAfterSendFailure"
+        ],
+        "physical_lines": 253
+      },
+      {
+        "path": "internal/jobs/manager_caption_profile_test.go",
+        "sha256": "c11ba58b36f972f1eec3915b537f0954860a7e93ad38c98f266a00482386a247",
+        "symbols": [
+          "TestManagerDoesNotEnableCaptionWithoutExplicitProfileID",
+          "TestManagerForwardsJobScopedEncoderRoute",
+          "TestManagerKeepsRunningCaptionSessionWhenRuntimeUpdateFails",
+          "TestManagerPublishesActiveSpeakerStopWithoutUserID",
+          "TestManagerRejectsLateCaptionResultFromPreviousGeneration",
+          "TestManagerReportsCaptionTranscriptPublishFailureWithoutTextLeak",
+          "TestManagerStartAppliesProfileDefaults",
+          "TestManagerStartsAndPublishesEvent",
+          "TestManagerStartsSelectedCaptionProfileAndPublishesDeepgramResults",
+          "TestManagerUpdatesRunningCaptionProfileWithoutChangingJobGeneration"
+        ],
+        "physical_lines": 385
+      },
+      {
+        "path": "internal/jobs/manager_event_delivery_test.go",
+        "sha256": "11772f1ba825804ba501255978a06544db425100f521f0507feb44e8e509328e",
+        "symbols": [
+          "TestManagerCancelsRetryOnStopAndRejectsOldGeneration",
+          "TestManagerReportsPublishFailure",
+          "TestManagerRetriesInitialParticipantsAfterEncoderReadiness",
+          "TestManagerRetriesTransportFailure",
+          "TestManagerStopsAtBoundedRetryLimit",
+          "TestManagerSupersedesPendingActiveSpeakerStartWithStop"
+        ],
+        "physical_lines": 184
+      },
+      {
+        "path": "internal/jobs/manager_lifecycle_fixture_test.go",
+        "sha256": "8fa77e42750c239b8526cbd680c2c1dcf172b252d0e0425edd4da0bad350ad99",
+        "symbols": [
+          "captionProfileConfig",
+          "captionRuntimeConfig",
+          "testTime",
+          "waitForManager"
+        ],
+        "physical_lines": 50
+      },
+      {
+        "path": "internal/jobs/manager_start_authority_test.go",
+        "sha256": "5a64e5261298a7f21a1b226a0d25826a4d0f28e8af1dc0ef97c1e527e9366065",
+        "symbols": [
+          "TestCustomOverlayRequiresKnownPrefix",
+          "TestManagerClosesPartialCaptionSessionWhenFactoryFails",
+          "TestManagerRejectsUnsupportedCaptionProviderBeforeSecretResolution",
+          "TestManagerRejectsWrongStream",
+          "TestManagerStartFailsAtomicallyWhenRuntimeSecretResolutionFails",
+          "TestManagerStartRequiresPrimaryAssignmentWhenPolicyEnforced"
+        ],
+        "physical_lines": 112
+      },
+      {
+        "path": "internal/jobs/manager_test.go",
+        "sha256": "d1180d3788a6f92bc8d7ddf7fb2f0a7e49a6fb3cf94703980c41ba98e958ad82",
+        "symbols": [
+          "*captionDisplaySceneRenderer.ConfigureDisplay",
+          "*fakeReporter.Event",
+          "*fakeReporter.Metric",
+          "*fakeSceneRenderer.Apply",
+          "*fakeSceneRenderer.AvatarRefreshInterval",
+          "*fakeSceneRenderer.Clear",
+          "*fakeSceneRenderer.ConfigureDisplay",
+          "*fakeSceneRenderer.RefreshAvatars",
+          "*fakeSceneRenderer.RenderSize",
+          "*fakeSceneRenderer.Reset",
+          "*fakeVideoOutput.Start",
+          "*fakeVideoOutput.Stop",
+          "TestManagerSceneLifecycleAppliesEventsBeforeForwardFailure",
+          "TestManagerSceneUsesCompatibilityVideoDefaultsAndResetsForSuccessor",
+          "TestManagerVideoOutputFailureClearsOnlyMatchingActiveJob",
+          "TestManagerVideoOutputFailureFailsClosedWhenStoppedReceiptCannotPersist",
+          "TestManagerVideoOutputFailureFencesRearmUntilCaptionShutdown",
+          "TestManagerVideoOutputStartsAfterSceneAndRollsBackAtomically",
+          "captionDisplaySceneRenderer",
+          "fakeReporter",
+          "fakeSceneRenderer",
+          "fakeVideoOutput"
+        ],
+        "physical_lines": 308
+      }
+    ]
+  },
+  {
+    "target_id": "B9-M096",
+    "repository": "Kome-Lab/Autostream-Worker",
+    "original_path": "internal/httpapi/server_test.go",
+    "original_sha256": "cfb8067037ec444d3551c10888e87c9ee97a1972823540fdeeafb4e0806607bc",
+    "before_physical_lines": 1237,
+    "disposition": "responsibility-split",
+    "responsibility": "listener/auth;job start/stop;chat/event;caption audio/generation;runtime config;test doubles",
+    "destinations": [
+      {
+        "path": "internal/httpapi/server_caption_fixture_test.go",
+        "sha256": "caa1674d1c69cb2f7788ae72550174c08c566cdaa835165ad62e0ae8c0e37f3e",
+        "symbols": [
+          "captionReadyManager",
+          "captionRuntimeConfigForHTTP",
+          "postJSON",
+          "signedCaptionAudioAuthorization",
+          "validCaptionAudioBody",
+          "writeNodeConfigForVerifierTest",
+          "writeNodeConfigForVerifierTestWithIdentity",
+          "writeNodeListenerCredentialForVerifierTest"
+        ],
+        "physical_lines": 144
+      },
+      {
+        "path": "internal/httpapi/server_caption_ingress_test.go",
+        "sha256": "5da2b9d4852b45f73c7fe4c28c227a95ee133692ebc9bff3012c13d4dc7d317d",
+        "symbols": [
+          "TestCaptionAudioEndpointAcceptsBeforeProviderIngestCompletes",
+          "TestCaptionAudioEndpointAcceptsMatchingJobGeneration",
+          "TestCaptionAudioEndpointRejectsGenericServiceToken",
+          "TestCaptionAudioEndpointRejectsOlderConnectionGeneration",
+          "TestCaptionAudioEndpointRejectsUnknownFieldsAndOversizedBodies",
+          "TestCaptionAudioEndpointRequiresNonzeroConnectionGeneration",
+          "TestCaptionAudioEndpointRequiresNonzeroJobGeneration",
+          "TestCaptionAudioEndpointReturnsConflictWhenCaptionProfileIsNotSelected",
+          "TestCaptionAudioVerifierRequiresStrictSignedClaims"
+        ],
+        "physical_lines": 321
+      },
+      {
+        "path": "internal/httpapi/server_event_ingress_test.go",
+        "sha256": "93dd746c3650eba13f90704ff43ffb5875e7182007b47fe95cdd7c0cd70c5c89",
+        "symbols": [
+          "TestDiscordChatOverlayEventIsAcceptedAndForwarded",
+          "TestNewServerFailsClosedOnInvalidListenerConfigRevision",
+          "TestProtectedEndpointsRejectMissingToken",
+          "TestStartAndGenerateCurrentTimeEvent",
+          "TestWorkerEventEndpointAcceptsSignedDiscordBotToken",
+          "TestWorkerEventEndpointRejectsOldJobGenerationAfterRearm"
+        ],
+        "physical_lines": 234
+      },
+      {
+        "path": "internal/httpapi/server_listener_stop_test.go",
+        "sha256": "1821bd562d96492db55c9dc1cdf8ad3190e478a9e5e8a593cef423815839177f",
+        "symbols": [
+          "TestStatusEndpointUsesAuthoritativeNodeConfigServiceID",
+          "TestStopJobKeepsStoppedTargetIdempotentAfterWorkerRestart",
+          "TestStopJobKeepsStoppedTargetIdempotentWithoutStoppingSuccessor",
+          "TestStopJobReturnsSafeReceiptPersistenceFailure",
+          "TestUpdaterVersionEndpointIsUnauthenticatedAndReturnsIdentityBoundProbe",
+          "responseCode"
+        ],
+        "physical_lines": 220
+      },
+      {
+        "path": "internal/httpapi/server_runtime_assignment_test.go",
+        "sha256": "f4599211a73d3e999b929087f69fdaae4e76145afc8df35755b9d2bc960fab97",
+        "symbols": [
+          "TestCaptionRuntimeSettingsKeepsSessionWhenRuntimeConfigRefreshFails",
+          "TestCaptionRuntimeSettingsRefreshesConfigAndReplacesRunningSession",
+          "TestJobStartFailsClosedWhenCaptionSecretResolutionFails",
+          "TestStartFailsClosedWhenRuntimeConfigRefreshFails",
+          "TestStartRefreshesRuntimeConfigBeforeAssignmentCheck",
+          "TestStartRejectsUnassignedStreamWhenRuntimePolicyIsEnforced"
+        ],
+        "physical_lines": 230
+      },
+      {
+        "path": "internal/httpapi/server_test.go",
+        "sha256": "d415c85fd4e627a0f712d4bf74cea3c3261d8437e847470fc13c796a07dd0a8e",
+        "symbols": [
+          "*blockingCaptionSession.Close",
+          "*blockingCaptionSession.Ingest",
+          "*captureCaptionSession.Close",
+          "*captureCaptionSession.Ingest",
+          "*captureCaptionSession.snapshotClosed",
+          "*captureCaptionSession.snapshotPackets",
+          "*capturePublisher.Publish",
+          "blockingCaptionSession",
+          "captureCaptionSession",
+          "capturePublisher"
+        ],
+        "physical_lines": 76
+      },
+      {
+        "path": "internal/httpapi/server_token_authority_test.go",
+        "sha256": "34e3ed19873db3e9876aa393dd611fa8ad75ecef5c6bbf36cb4038ff858fa10c",
+        "symbols": [
+          "TestErrorDoesNotEchoBearerToken",
+          "TestSHA256TokenVerifier",
+          "TestTokenVerifierFromEnvRejectsControlPanelTokenFallbackInProduction",
+          "TestTokenVerifierFromEnvRejectsControlPanelTokenFallbackWhenRuntimeConfigRequired",
+          "TestTokenVerifierFromEnvRejectsRemovedControlPanelTokenFallbackOutsideProduction",
+          "TestTokenVerifierReadsNodeRuntimeTokenAfterStartup"
+        ],
+        "physical_lines": 99
+      }
+    ]
+  }
+]

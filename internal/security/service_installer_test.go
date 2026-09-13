@@ -212,7 +212,7 @@ func TestWorkerManualInstallerUsesArchiveOnlyContract(t *testing.T) {
 }
 
 func TestWorkerInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing.T) {
-	body, err := os.ReadFile(filepath.Join(
+	body, err := readInstallerScenarioSource(filepath.Join(
 		"..", "..", "release", "test-install-autostream-worker-integration.sh",
 	))
 	if err != nil {
@@ -836,7 +836,7 @@ func TestWorkerInstallerCoversStagingDurabilityAndInterruptedRetry(t *testing.T)
 		t.Fatal("public-path migration must atomically replace the existing regular file without an absent-path window")
 	}
 
-	fixtureBytes, err := os.ReadFile(filepath.Join(
+	fixtureBytes, err := readInstallerScenarioSource(filepath.Join(
 		root, "release", "test-install-autostream-worker-integration.sh",
 	))
 	if err != nil {

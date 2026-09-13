@@ -1,0 +1,21 @@
+{
+  "format_version": 1,
+  "repository": "Autostream-Worker",
+  "artifacts": [
+    {
+      "target_id": "B9-M093",
+      "output": "release/install-autostream-worker",
+      "fragments": [
+        "authoring/install-autostream-worker/preflight-input.sh.inc",
+        "authoring/install-autostream-worker/path-journal.sh.inc",
+        "authoring/install-autostream-worker/directory-rollback.sh.inc",
+        "authoring/install-autostream-worker/account-rollback.sh.inc",
+        "authoring/install-autostream-worker/cleanup.sh.inc",
+        "authoring/install-autostream-worker/artifact-verification.sh.inc",
+        "authoring/install-autostream-worker/host-preflight.sh.inc",
+        "authoring/install-autostream-worker/release-verification.sh.inc",
+        "authoring/install-autostream-worker/public-activation.sh.inc"
+      ]
+    }
+  ]
+}
