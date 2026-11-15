@@ -159,9 +159,14 @@ func runWorkerCrossMedia(t *testing.T, ackLoss bool) {
 	t.Helper()
 	ctx, endpoint, httpClient := startWorkerCrossEncoder(t)
 	before := readWorkerCrossState(t, ctx, httpClient, endpoint)
-	if before.Posts != 0 || before.LogLines != 0 || before.CaptionCues != 0 || before.TranscriptEntries != 0 {
-		t.Fatalf("fixture is not empty: %+v", before)
+	// The fake stream starts through the real product path. ER's
+	// streamproc.writeStartMetadata writes one stream_process.started JSONL row
+	// before any Worker dispatch; it is not a Worker recording or a receipt.
+	const startupLogLines int64 = 1
+	if before.Posts != 0 || before.LogLines != startupLogLines || before.CaptionCues != 0 || before.TranscriptEntries != 0 {
+		t.Fatalf("unexpected source-defined startup baseline: %+v", before)
 	}
+	expectedLogLines := before.LogLines + 1
 	prefix := "/worker-normal"
 	if ackLoss {
 		prefix = "/worker-ack-loss"
@@ -193,8 +198,8 @@ func runWorkerCrossMedia(t *testing.T, ackLoss bool) {
 	after := readWorkerCrossState(t, ctx, httpClient, endpoint)
 	// These are observed temporary file counts. They do not assert fsync,
 	// durable receipt, shared CC08 peer integration, or provider completion.
-	if after.Posts != 1 || after.LogLines != 1 || after.CaptionCues != 1 || after.TranscriptEntries != 1 {
-		t.Fatalf("expected one actual Media recording: %+v", after)
+	if after.Posts != 1 || after.LogLines != expectedLogLines || after.CaptionCues != 1 || after.TranscriptEntries != 1 {
+		t.Fatalf("expected exactly one new Worker recording above startup baseline: %+v -> %+v", before, after)
 	}
 	if result := manager.CloseLifecycleAdmission(ctx, config.CurrentVector); result.Kind != lifecycle.StructurallyCoherent {
 		t.Fatalf("local writer cut: %+v", result)
@@ -210,7 +215,7 @@ func runWorkerCrossMedia(t *testing.T, ackLoss bool) {
 	if _, queryResult := manager.LifecycleCompletionSnapshot(config.CurrentVector); queryResult.Kind != expected {
 		t.Fatal("result query changed knowledge")
 	}
-	if observed := readWorkerCrossState(t, ctx, httpClient, endpoint); observed.Posts != 1 || observed.LogLines != 1 || observed.CaptionCues != 1 || observed.TranscriptEntries != 1 {
+	if observed := readWorkerCrossState(t, ctx, httpClient, endpoint); observed.Posts != 1 || observed.LogLines != expectedLogLines || observed.CaptionCues != 1 || observed.TranscriptEntries != 1 {
 		t.Fatal("query or cut replayed the external effect")
 	}
 }
