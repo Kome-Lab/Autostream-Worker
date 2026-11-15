@@ -1,0 +1,4 @@
+# Actual Worker Manager -> existing encoder.Client -> isolated legacy Media HTTP.
+# Recorded legacy effects are not a qualified G0 receipt or durable completion.
+github.com/example/autostream-worker/internal/jobs TestIUWS3CrossRepositoryWorkerMediaRecorded
+github.com/example/autostream-worker/internal/jobs TestIUWS3CrossRepositoryWorkerMediaACKLoss

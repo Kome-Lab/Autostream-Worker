@@ -181,7 +181,7 @@ func (m *Manager) InstallLifecycleParticipant(config LifecycleParticipantConfig)
 	if m.current.StreamID != config.StreamID || m.jobGeneration != *jobGeneration || m.stopping {
 		return &WorkerLifecycleError{workerResult(lifecycle.Stale, "ACTUAL_JOB_GENERATION_MISMATCH")}
 	}
-	if m.captionSession != nil || m.captionIngress != nil || m.sceneRenderer != nil || videoOutputRequested(m.current) || len(m.pendingEvents) != 0 || m.eventWritesInFlight != 0 {
+	if m.captionSession != nil || m.captionIngress != nil || m.sceneRenderer != nil || videoOutputRequested(m.current) || len(m.pendingEvents) != 0 || m.eventWritesInFlight != 0 || m.legacyDeliveryBorrows != 0 || m.legacyWriterAdmitted {
 		return &WorkerLifecycleError{workerResult(lifecycle.NeedsEvidence, "UNCONNECTED_WRITER_OR_BORROW_PRESENT")}
 	}
 	// Freeze shared record/profile slices without serializing the private port.
@@ -214,12 +214,13 @@ func (m *Manager) InstallLifecycleParticipant(config LifecycleParticipantConfig)
 func (m *Manager) beginLifecycleWriteLocked(ctx context.Context, eventID string) (*lifecycleWrite, error) {
 	p := m.lifecycleParticipant
 	if p == nil {
+		m.legacyWriterAdmitted = true
 		return nil, nil
 	}
 	if ctx.Err() != nil {
 		return nil, &WorkerLifecycleError{workerResult(lifecycle.RefusedUnchanged, "REQUEST_CANCELED_BEFORE_REGISTRATION")}
 	}
-	if m.captionSession != nil || m.captionIngress != nil || m.sceneRenderer != nil || videoOutputRequested(m.current) || len(m.pendingEvents) != 0 {
+	if m.captionSession != nil || m.captionIngress != nil || m.sceneRenderer != nil || videoOutputRequested(m.current) || len(m.pendingEvents) != 0 || m.legacyDeliveryBorrows != 0 || m.legacyWriterAdmitted {
 		return nil, &WorkerLifecycleError{workerResult(lifecycle.NeedsEvidence, "UNCONNECTED_WRITER_PRESENT")}
 	}
 	if p.uncertain {
@@ -415,7 +416,7 @@ func (m *Manager) LifecycleCompletionSnapshot(expected lifecycle.Record) (lifecy
 	if p == nil {
 		return lifecycle.Record{}, workerResult(lifecycle.NeedsEvidence, "PARTICIPANT_REQUIRED")
 	}
-	if m.captionSession != nil || m.captionIngress != nil || m.sceneRenderer != nil || videoOutputRequested(m.current) || len(m.pendingEvents) != 0 {
+	if m.captionSession != nil || m.captionIngress != nil || m.sceneRenderer != nil || videoOutputRequested(m.current) || len(m.pendingEvents) != 0 || m.legacyDeliveryBorrows != 0 || m.legacyWriterAdmitted {
 		return lifecycle.Record{}, workerResult(lifecycle.NeedsEvidence, "UNCONNECTED_WRITER_PRESENT")
 	}
 	if result := p.compare(expected, m.current.StreamID, m.jobGeneration); result.Kind != lifecycle.StructurallyCoherent {
@@ -446,7 +447,13 @@ func (m *Manager) LifecycleCompletionSnapshot(expected lifecycle.Record) (lifecy
 	for _, effect := range p.effects {
 		record.Completion.RequiredEffects = append(record.Completion.RequiredEffects, lifecycle.EffectRequirement{EffectID: effect, Target: p.config.EffectTarget, Correlation: p.config.CompletionHeader.Correlation})
 	}
-	for sequence, work := range p.active {
+	// Register order is stable for the same immutable snapshot revision.
+	for _, registered := range p.model.Works {
+		sequence := registered.Work.Sequence
+		work, active := p.active[sequence]
+		if !active {
+			continue
+		}
 		record.Completion.PhysicalObligations = append(record.Completion.PhysicalObligations, lifecycle.PhysicalObligation{ObligationID: lifecycle.ID("writer-borrow-" + strconv.FormatUint(sequence, 10)), Kind: lifecycle.WriterBorrow, OwnerID: p.config.Namespace.OwnerID, Resource: p.config.Namespace.Resource, WorkRef: work.WorkID, Knowledge: lifecycle.KnowledgeUnknown, Terminal: lifecycle.Fact[lifecycle.ID]{State: lifecycle.Unavailable, Unavailable: &lifecycle.UnavailableReason{Code: "ACTIVE_WRITER_BORROW"}}})
 	}
 	result := lifecycle.ValidateRecord(record, p.config.Profile)

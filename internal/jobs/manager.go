@@ -89,6 +89,8 @@ type Manager struct {
 	stopping                 bool
 	lifecycleParticipant     *workerLifecycleParticipant
 	eventWritesInFlight      int
+	legacyDeliveryBorrows    int
+	legacyWriterAdmitted     bool
 	lifecycleIncarnation     string
 	deliveryCtx              context.Context
 	deliveryCancel           context.CancelFunc
@@ -253,6 +255,9 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	}
 	m.current = stream
 	m.jobGeneration++
+	// This marker belongs to the newly admitted job. Cleanup/rollback never
+	// clears it, and an older outstanding delivery keeps its separate borrow.
+	m.legacyWriterAdmitted = false
 	generation := m.jobGeneration
 	m.captionSessionGeneration = nextCaptionSessionGeneration
 	m.startEventDeliveryLocked()

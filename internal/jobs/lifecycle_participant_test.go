@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,9 +18,11 @@ import (
 )
 
 type workerWitnessFixture struct {
-	mu    sync.Mutex
-	count int
-	fail  lifecycle.AdmissionEventKind
+	mu             sync.Mutex
+	count          int
+	fail           lifecycle.AdmissionEventKind
+	dispatches     int
+	secondDispatch chan struct{}
 }
 
 func (w *workerWitnessFixture) Append(_ context.Context, event lifecycle.AdmissionEvent) (lifecycle.Fact[lifecycle.ID], error) {
@@ -28,6 +31,12 @@ func (w *workerWitnessFixture) Append(_ context.Context, event lifecycle.Admissi
 	w.count++
 	if event.Kind == w.fail {
 		return lifecycle.Fact[lifecycle.ID]{}, errors.New("fixture ACK loss")
+	}
+	if event.Kind == lifecycle.RecordWorkDispatch {
+		w.dispatches++
+		if w.dispatches == 2 && w.secondDispatch != nil {
+			close(w.secondDispatch)
+		}
 	}
 	return workerWitnessFact(lifecycle.ID("fixture-journal-" + strconv.Itoa(w.count))), nil
 }
@@ -70,11 +79,21 @@ func (p *workerPublisherFixture) Publish(ctx context.Context, event encoder.Even
 
 // The owner facts and small limits here are explicit synthetic inputs. They
 // never provide a production witness or enable a default process participant.
-func workerLifecycleFixture(t *testing.T, publisher *workerPublisherFixture) (*Manager, LifecycleParticipantConfig) {
+func workerLifecycleFixture(t *testing.T, publisher *workerPublisherFixture, options ...StreamContext) (*Manager, LifecycleParticipantConfig) {
 	t.Helper()
+	stream := StreamContext{StreamID: "stream-01"}
+	if len(options) > 1 {
+		t.Fatal("one explicit fixture stream at most")
+	}
+	if len(options) == 1 {
+		if options[0].StreamID != "stream-01" || options[0].CaptionProfileID != "" || videoOutputRequested(options[0]) {
+			t.Fatal("fixture scope is the single caption/event writer")
+		}
+		stream = options[0]
+	}
 	m := NewManager(publisher, nil)
 	m.ApplyRuntimeConfig(captionRuntimeConfig())
-	if err := m.Start(t.Context(), StreamContext{StreamID: "stream-01"}); err != nil {
+	if err := m.Start(t.Context(), stream); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.Close(context.Background()) })
@@ -180,10 +199,15 @@ func TestIUWS3WorkerCutRejectsLateCallback(t *testing.T) {
 func TestIUWS3WorkerBusyBorrowNotQueueEmpty(t *testing.T) {
 	publisher := &workerPublisherFixture{entered: make(chan struct{}), release: make(chan struct{})}
 	m, config := workerLifecycleFixture(t, publisher)
+	witness := config.Witness.(*workerWitnessFixture)
+	witness.secondDispatch = make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(publisher.release) }) }
+	defer release()
 	if err := m.InstallLifecycleParticipant(config); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
+	done := make(chan error, 2)
 	go func() {
 		_, err := m.CaptionForGeneration(context.Background(), "stream-01", 1, "barrier caption", "fixture-speaker", time.Now())
 		done <- err
@@ -193,34 +217,52 @@ func TestIUWS3WorkerBusyBorrowNotQueueEmpty(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("writer did not reach barrier")
 	}
-	defer func() {
-		select {
-		case <-publisher.release:
-		default:
-			close(publisher.release)
-		}
+	go func() {
+		_, err := m.CaptionForGeneration(context.Background(), "stream-01", 1, "second barrier caption", "fixture-speaker", time.Now())
+		done <- err
 	}()
+	select {
+	case <-witness.secondDispatch:
+	case <-time.After(3 * time.Second):
+		t.Fatal("second writer was not registered")
+	}
 	if result := m.CloseLifecycleAdmission(t.Context(), config.CurrentVector); result.Kind != lifecycle.StructurallyCoherent {
 		t.Fatal(result)
 	}
 	record, result := m.LifecycleCompletionSnapshot(config.CurrentVector)
-	if result.Kind != lifecycle.Unknown || record.Completion == nil || len(record.Completion.PhysicalObligations) != 1 || len(record.Completion.Partitions[0].Holes) != 1 {
+	if result.Kind != lifecycle.Unknown || record.Completion == nil || len(record.Completion.PhysicalObligations) != 2 || len(record.Completion.Partitions[0].Holes) != 2 {
 		t.Fatalf("empty queue erased writer borrow: %+v", result)
 	}
-	close(publisher.release)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
+	if record.Completion.PhysicalObligations[0].ObligationID != "writer-borrow-1" || record.Completion.PhysicalObligations[1].ObligationID != "writer-borrow-2" {
+		t.Fatal("owner borrow projection is not in registration order")
+	}
+	first, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 64; i++ {
+		same, sameResult := m.LifecycleCompletionSnapshot(config.CurrentVector)
+		encoded, encodeErr := json.Marshal(same)
+		if encodeErr != nil || sameResult.Kind != lifecycle.Unknown || same.Header.RecordKey != record.Header.RecordKey || !bytes.Equal(first, encoded) {
+			t.Fatal("same immutable snapshot ID changed its byte layout")
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("writer did not release")
+	}
+	release()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("writer did not release")
+		}
 	}
 	released, result := m.LifecycleCompletionSnapshot(config.CurrentVector)
 	if result.Kind != lifecycle.PendingObligation {
 		t.Fatalf("local release conflated with external terminal: %+v", result)
 	}
-	if record.Header.RecordKey.RecordID == released.Header.RecordKey.RecordID || released.Header.RecordRevision != 8 {
+	if record.Header.RecordKey.RecordID == released.Header.RecordKey.RecordID || released.Header.RecordRevision != 11 {
 		t.Fatal("changed state reused immutable snapshot ID")
 	}
 }
@@ -289,6 +331,70 @@ func (unconnectedCaptionSession) Ingest(context.Context, deepgram.AudioPacket) e
 func (unconnectedCaptionSession) Close(context.Context) error                        { return nil }
 
 func TestIUWS3WorkerUnsupportedWritersRefused(t *testing.T) {
+	t.Run("legacy_dequeue_borrow", func(t *testing.T) {
+		publisher := &workerPublisherFixture{entered: make(chan struct{}), release: make(chan struct{})}
+		manager, frame := workerLifecycleFixture(t, publisher)
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(publisher.release) }) }
+		defer release()
+		event := encoder.Event{ID: "fixture-legacy-queued-event", StreamID: "stream-01", Generation: 1, Type: "caption.final", Payload: map[string]any{"text": "legacy synthetic caption"}, Timestamp: time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)}
+		if !manager.enqueueWorkerEvent(event) {
+			t.Fatal("legacy event did not enter actual queue")
+		}
+		select {
+		case <-publisher.entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("legacy dequeued event did not reach publisher barrier")
+		}
+		manager.mu.Lock()
+		queued, ordinary, borrow := len(manager.pendingEvents), manager.eventWritesInFlight, manager.legacyDeliveryBorrows
+		manager.mu.Unlock()
+		if queued != 0 || ordinary != 0 || borrow != 1 {
+			t.Fatal("dequeue-to-publish borrow is not retained independently of queue length")
+		}
+		var refusal *WorkerLifecycleError
+		if err := manager.InstallLifecycleParticipant(frame); !errors.As(err, &refusal) || refusal.Result.Kind != lifecycle.NeedsEvidence {
+			t.Fatal("omitted legacy borrow permitted EMPTY participant")
+		}
+		if _, result := manager.LifecycleCompletionSnapshot(frame.CurrentVector); result.Kind != lifecycle.NeedsEvidence {
+			t.Fatal("omitted legacy writer emitted completion")
+		}
+		release()
+		waitForManager(t, 3*time.Second, func() bool {
+			manager.mu.Lock()
+			defer manager.mu.Unlock()
+			return manager.legacyDeliveryBorrows == 0 && len(manager.events) == 1
+		})
+		if err := manager.InstallLifecycleParticipant(frame); err == nil {
+			t.Fatal("retiring a legacy borrow erased same-job history")
+		}
+	})
+	for _, failed := range []bool{false, true} {
+		name := "legacy_success_before_install"
+		if failed {
+			name = "legacy_failure_before_install"
+		}
+		t.Run(name, func(t *testing.T) {
+			publisher := &workerPublisherFixture{}
+			if failed {
+				publisher.err = errors.New("synthetic legacy failure")
+			}
+			manager, frame := workerLifecycleFixture(t, publisher)
+			_, err := manager.CaptionForGeneration(t.Context(), "stream-01", 1, "prior synthetic caption", "fixture-speaker", time.Now())
+			if (err != nil) != failed {
+				t.Fatal("legacy test outcome did not reach the selected boundary")
+			}
+			manager.mu.Lock()
+			queued, active := len(manager.pendingEvents), manager.eventWritesInFlight
+			manager.mu.Unlock()
+			if queued != 0 || active != 0 {
+				t.Fatal("legacy writer did not retire")
+			}
+			if err := manager.InstallLifecycleParticipant(frame); err == nil {
+				t.Fatal("same-job legacy history became EMPTY coverage")
+			}
+		})
+	}
 	m, config := workerLifecycleFixture(t, &workerPublisherFixture{})
 	m.mu.Lock()
 	m.captionSession = unconnectedCaptionSession{}

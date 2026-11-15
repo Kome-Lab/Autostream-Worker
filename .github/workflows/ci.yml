@@ -74,3 +74,91 @@ jobs:
           path: ${{ runner.temp }}/iu-*.json
           if-no-files-found: error
           retention-days: 14
+
+  v3-product-cross-repository-checks:
+    name: v3-product-cross-repository-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      GOTOOLCHAIN: local
+      GOWORK: 'off'
+      GOFLAGS: '-mod=readonly'
+      GOTELEMETRY: 'off'
+      GOMAXPROCS: '2'
+      IU_WORKER_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      # A reviewed Encoder candidate with the process helper is required before
+      # publishing this second Worker candidate. No live Provider is contacted.
+      IU_ER_CANDIDATE_SHA: '7c7ec14d2b06b866ebd5b006331f55ba01da8dfe'
+    defaults:
+      run:
+        working-directory: worker
+        shell: bash
+    steps:
+      - name: Checkout exact Worker candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.IU_WORKER_CANDIDATE_SHA }}
+          path: worker
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a frozen Encoder candidate
+        run: |
+          set -euo pipefail
+          test "$IU_ER_CANDIDATE_SHA" != 0000000000000000000000000000000000000000
+          test "${#IU_ER_CANDIDATE_SHA}" = 40
+      - name: Checkout exact Encoder candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Kome-Lab/Autostream-Encoder-Recorder
+          ref: ${{ env.IU_ER_CANDIDATE_SHA }}
+          path: encoder
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+          cache: false
+      - name: Verify exact source trees and the same immutable shared pin
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$IU_WORKER_CANDIDATE_SHA"
+          test "$(git -C ../encoder rev-parse HEAD)" = "$IU_ER_CANDIDATE_SHA"
+          test "$(go env GOVERSION)" = go1.26.5
+          git log -1 --format='Worker tested commit: %H%nWorker tested tree: %T'
+          git -C ../encoder log -1 --format='Encoder tested commit: %H%nEncoder tested tree: %T'
+          python3 scripts/ci/iu-source-boundary.py
+          python3 scripts/ci/iu-module-pin.py 381790940e0fed8532d9396f0a2a40c0bfd0a612 --download
+          (cd ../encoder && python3 scripts/ci/iu-source-boundary.py)
+          (cd ../encoder && python3 scripts/ci/iu-module-pin.py 8c17e7389ccdb3429f1e59a1a6147b27fe3c3793 --download)
+      - name: Actual Caption dispatch and ACK loss to independent Media, Native and Race
+        run: |
+          set -euo pipefail
+          export IU_WS3_ER_SOURCE="$GITHUB_WORKSPACE/encoder"
+          for mode in native race; do
+            flags=()
+            if test "$mode" = race; then
+              flags=(-race)
+              export CGO_ENABLED=1
+            else
+              export CGO_ENABLED=0
+            fi
+            export IU_WS3_ER_BINARY="$RUNNER_TEMP/iu-encoder-worker-$mode.test"
+            (cd ../encoder && go test -p 1 "${flags[@]}" -tags=iu_crossrepo -c ./internal/httpapi -o "$IU_WS3_ER_BINARY")
+            go test -p 1 "${flags[@]}" -tags=iu_crossrepo -count=1 -timeout=5m -json ./internal/jobs -run '^TestIUWS3CrossRepositoryWorkerMedia(Recorded|ACKLoss)$' | tee "$RUNNER_TEMP/iu-cross-repository-$mode.json"
+            python3 scripts/ci/iu-json-events.py scripts/ci/ws3-worker-crossrepo-required-tests.txt "$RUNNER_TEMP/iu-cross-repository-$mode.json"
+          done
+          # The legacy HTTP observations above retain typed CC04 pending/UNKNOWN;
+          # they do not qualify the receiver or establish durable G0 completion.
+          git diff --exit-code -- go.mod go.sum
+          git -C ../encoder diff --exit-code -- go.mod go.sum
+      - name: Preserve cross-repository execution evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: iu-worker-encoder-root-events-${{ github.sha }}
+          path: ${{ runner.temp }}/iu-cross-repository-*.json
+          if-no-files-found: error
+          retention-days: 14
