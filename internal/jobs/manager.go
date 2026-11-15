@@ -87,6 +87,9 @@ type Manager struct {
 	videoOutput              VideoOutput
 	jobGeneration            uint64
 	stopping                 bool
+	lifecycleParticipant     *workerLifecycleParticipant
+	eventWritesInFlight      int
+	lifecycleIncarnation     string
 	deliveryCtx              context.Context
 	deliveryCancel           context.CancelFunc
 	deliveryWake             chan struct{}
@@ -161,6 +164,10 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	}
 
 	m.mu.Lock()
+	if m.lifecycleParticipant != nil {
+		m.mu.Unlock()
+		return workerUnconnected("EXPLICIT_NEW_JOB_PARTICIPANT_REQUIRED")
+	}
 	if !m.streamAssignedLocked(stream.StreamID) {
 		m.mu.Unlock()
 		return errors.New("stream is not assigned to this worker service as primary")

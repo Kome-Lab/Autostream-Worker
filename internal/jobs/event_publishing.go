@@ -95,6 +95,15 @@ func (m *Manager) publishWithGenerations(ctx context.Context, event events.Overl
 			return events.OverlayEvent{}, ErrLegacyDiscordChatFields
 		}
 	}
+	lifecycleWrite, lifecycleErr := m.beginLifecycleWriteLocked(ctx, event.ID)
+	if lifecycleErr != nil {
+		m.mu.Unlock()
+		return events.OverlayEvent{}, lifecycleErr
+	}
+	m.eventWritesInFlight++
+	dispatched := false
+	acknowledged := false
+	defer func() { m.finishLifecycleWrite(lifecycleWrite, dispatched, acknowledged) }()
 	encoderRecorderURL := m.current.EncoderRecorderURL
 	streamIngestToken := m.current.StreamIngestToken
 	sceneRenderer := m.sceneRenderer
@@ -125,13 +134,22 @@ func (m *Manager) publishWithGenerations(ctx context.Context, event events.Overl
 		Attempt:    1,
 	}
 	m.publisherMu.Lock()
-	err := m.publisher.Publish(deliveryCtx, encoderEvent)
+	dispatched = true
+	var err error
+	if lifecycleWrite != nil {
+		err = lifecycleWrite.participant.config.Publisher.PublishOnce(deliveryCtx, encoderEvent)
+	} else {
+		err = m.publisher.Publish(deliveryCtx, encoderEvent)
+	}
+	acknowledged = err == nil
 	m.publisherMu.Unlock()
 	if err != nil {
 		class, status := encoder.PublishErrorMetadata(err)
 		retryable := encoder.IsRetryablePublishError(err)
 		m.recordWorkerEventFailure(ctx, encoderEvent, 1, retryable, class, status)
-		m.queueWorkerEventAfterFailure(encoderEvent, err)
+		if lifecycleWrite == nil {
+			m.queueWorkerEventAfterFailure(encoderEvent, err)
+		}
 		return events.OverlayEvent{}, errors.New("event publish failed")
 	}
 	if !m.recordDeliveredWorkerEvent(encoderEvent) {

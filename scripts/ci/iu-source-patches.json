@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "baseline": "381790940e0fed8532d9396f0a2a40c0bfd0a612",
+  "new": {
+    "docs/v3-lifecycle-producer.md": "db165921e9cf66c42f72bb3af051f93fa1f4debb7b42601bf7eb84e08a2e7ac3",
+    "internal/jobs/lifecycle_participant.go": "9bd20aa199fedafe712b94c1d5d1e804420165d8681e1938204ac2a301ddd72e",
+    "internal/jobs/lifecycle_participant_test.go": "6e6a598bde5a569ab91ff14887b35805fe839aa0f0ba8eb7eabd2451db11554c",
+    "scripts/ci/iu-checks.sh": "5b38d561751c06b119fa78c39a0745a006f6e0bd05bf6674a4e7c1f56f70b994",
+    "scripts/ci/iu-json-events.py": "bd8fce46868353156b77c9ec0f8fdfa1908fa27121460227e0951559fe12fadc",
+    "scripts/ci/iu-module-pin.py": "73149fa31efa702ad80579a901ed77d6d67f2d9b8d29184c95e46e595b5ccc32",
+    "scripts/ci/iu-required-tests.txt": "c0ad860910ef7c82c7858a5828e012cc750d6000c7797eec74335a300d1e6efe",
+    "scripts/ci/iu-secret-scan.py": "e684ff48169e29687e9b41f0aa219c0efe05291dfb51bdbfd71edc1d768eb8a6",
+    "scripts/ci/iu-source-boundary.py": "fa5794921736e16655acc5234d6f4e2a856ac9a8b511c37bdf1ae0e59d13b6c4",
+    "scripts/ci/iu-workflow-preserve.py": "2cb9c350c0c2763ed31b4a9e015c4f6a24573f399b68e86f77d63b962755cb0e",
+    "scripts/ci/test_iu_json_events.py": "f11ec9ce8cb0ebfcbfe30814c06db35798e107a90f43383a75a266ad329a4a01",
+    "scripts/ci/test_iu_workflow_preserve.py": "b35bf15473a55f8c3fc3b2be80c2ed1915a270b009b122ec689f2130044cc96a"
+  },
+  "patches": {
+    ".github/workflows/ci.yml": {
+      "before_sha256": "c6f0fbf9c124cadfdf15573e6efc68dd98aee2404c298aa360eb29b2e4e81587",
+      "after_sha256": "fe2620332d09e81c672216d30bdc598db9c021090d6389788b91f8124c27f2c3",
+      "edits": [
+        {
+          "old": "      - run: go build ./...\n",
+          "new": "      - run: go build ./...\n\n  v3-product-integration-checks:\n    name: v3-product-integration-checks\n    runs-on: ubuntu-24.04\n    timeout-minutes: 25\n    permissions:\n      contents: read\n    env:\n      GOTOOLCHAIN: local\n      GOWORK: 'off'\n      GOFLAGS: '-mod=readonly'\n      GOTELEMETRY: 'off'\n      GOMAXPROCS: '2'\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0\n        with:\n          go-version: '1.26.5'\n          check-latest: false\n          cache: false\n      - name: Required Caption writer, callback, borrow and generation inventory\n        run: bash scripts/ci/iu-checks.sh\n      - name: Preserve exact root execution evidence\n        if: always()\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n        with:\n          name: iu-worker-root-events-${{ github.sha }}\n          path: ${{ runner.temp }}/iu-*.json\n          if-no-files-found: error\n          retention-days: 14\n"
+        }
+      ]
+    },
+    "go.mod": {
+      "before_sha256": "d6b38d4c3431384b88607a6da0a969a9d1f3fa082083143c86ce67838dfd24b8",
+      "after_sha256": "b0cfe5876052e4c2a4fcc9418074558aa47100c9a9b23651e81d7a06ee955010",
+      "edits": [
+        {
+          "old": "\tgithub.com/benburkert/openpgp v0.0.0-20160410205803-c2471f86866c // indirect\n",
+          "new": "\tgithub.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c\n\tgithub.com/benburkert/openpgp v0.0.0-20160410205803-c2471f86866c // indirect\n"
+        }
+      ]
+    },
+    "go.sum": {
+      "before_sha256": "11a0f79b1c70fdfdad3db2f98bb3ae2b3b97b103512aa4c440006cefb34dbfb7",
+      "after_sha256": "4773d59e85ccd2caf80465d2ea742530af2d79dde8d1f916f9d3f565b8e2d202",
+      "edits": [
+        {
+          "old": "github.com/benburkert/openpgp v0.0.0-20160410205803-c2471f86866c h1:8XZeJrs4+ZYhJeJ2aZxADI2tGADS15AzIF8MQ8XAhT4=\n",
+          "new": "github.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c h1:HfswOPIR7VcFoko8a5LL0YqtRP1UGc6wfuFyggBOIXo=\ngithub.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c/go.mod h1:4mdtG844J5jWEQgB78LBHQEjzbhK+qc0ACLS7+Vlmzw=\ngithub.com/benburkert/openpgp v0.0.0-20160410205803-c2471f86866c h1:8XZeJrs4+ZYhJeJ2aZxADI2tGADS15AzIF8MQ8XAhT4=\n"
+        }
+      ]
+    },
+    "internal/jobs/caption_runtime.go": {
+      "before_sha256": "21e35c6a8ab932fdfc35fa9d18884fac1267224327cd9bce674e7daeee6204ed",
+      "after_sha256": "e7e9f8d9651d0c8d4b1718ce481f154779ca6bfc1055a1558e95e2e44dcdd5c0",
+      "edits": [
+        {
+          "old": "\tdefer m.lifecycleMu.Unlock()\n\n",
+          "new": "\tdefer m.lifecycleMu.Unlock()\n\tm.mu.Lock()\n\tif m.lifecycleParticipant != nil {\n\t\tm.mu.Unlock()\n\t\treturn workerUnconnected(\"CAPTION_PROVIDER_PARTICIPANT_UNCONNECTED\")\n\t}\n\tm.mu.Unlock()\n\n"
+        }
+      ]
+    },
+    "internal/jobs/event_publishing.go": {
+      "before_sha256": "476c5f0d050c0ba3fcc3cbb1f8ed3ae401980aa829a9b2e8fa53c9e94790a51a",
+      "after_sha256": "d477066fe58820010c79cda91e524298f84b884c6b52176165741befaf0385ad",
+      "edits": [
+        {
+          "old": "\tencoderRecorderURL := m.current.EncoderRecorderURL\n\tstreamIngestToken := m.current.StreamIngestToken\n\tsceneRenderer := m.sceneRenderer\n\tgeneration := m.jobGeneration\n\tdeliveryCtx := m.deliveryCtx\n\tm.mu.Unlock()\n\tif deliveryCtx == nil {\n\t\tdeliveryCtx = ctx\n\t}\n\tm.supersedePendingWorkerEvent(event, generation)\n\n\tif sceneRenderer != nil {\n\t\tif err := sceneRenderer.Apply(generation, event); err != nil {\n\t\t\tm.report(ctx, event.StreamID, \"worker.scene.apply_failed\", \"failed\", map[string]any{\"event_type\": event.Type})\n\t\t\treturn events.OverlayEvent{}, errors.New(\"scene event apply failed\")\n\t\t}\n\t}\n\n\tencoderEvent := encoder.Event{\n\t\tID:         event.ID,\n\t\tStreamID:   event.StreamID,\n\t\tType:       event.Type,\n\t\tPayload:    event.Payload,\n\t\tTimestamp:  event.Timestamp,\n\t\tURL:        encoderRecorderURL,\n\t\tToken:      streamIngestToken,\n\t\tGeneration: generation,\n\t\tAttempt:    1,\n\t}\n\tm.publisherMu.Lock()\n\terr := m.publisher.Publish(deliveryCtx, encoderEvent)\n\tm.publisherMu.Unlock()\n\tif err != nil {\n\t\tclass, status := encoder.PublishErrorMetadata(err)\n\t\tretryable := encoder.IsRetryablePublishError(err)\n\t\tm.recordWorkerEventFailure(ctx, encoderEvent, 1, retryable, class, status)\n\t\tm.queueWorkerEventAfterFailure(encoderEvent, err)\n",
+          "new": "\tlifecycleWrite, lifecycleErr := m.beginLifecycleWriteLocked(ctx, event.ID)\n\tif lifecycleErr != nil {\n\t\tm.mu.Unlock()\n\t\treturn events.OverlayEvent{}, lifecycleErr\n\t}\n\tm.eventWritesInFlight++\n\tdispatched := false\n\tacknowledged := false\n\tdefer func() { m.finishLifecycleWrite(lifecycleWrite, dispatched, acknowledged) }()\n\tencoderRecorderURL := m.current.EncoderRecorderURL\n\tstreamIngestToken := m.current.StreamIngestToken\n\tsceneRenderer := m.sceneRenderer\n\tgeneration := m.jobGeneration\n\tdeliveryCtx := m.deliveryCtx\n\tm.mu.Unlock()\n\tif deliveryCtx == nil {\n\t\tdeliveryCtx = ctx\n\t}\n\tm.supersedePendingWorkerEvent(event, generation)\n\n\tif sceneRenderer != nil {\n\t\tif err := sceneRenderer.Apply(generation, event); err != nil {\n\t\t\tm.report(ctx, event.StreamID, \"worker.scene.apply_failed\", \"failed\", map[string]any{\"event_type\": event.Type})\n\t\t\treturn events.OverlayEvent{}, errors.New(\"scene event apply failed\")\n\t\t}\n\t}\n\n\tencoderEvent := encoder.Event{\n\t\tID:         event.ID,\n\t\tStreamID:   event.StreamID,\n\t\tType:       event.Type,\n\t\tPayload:    event.Payload,\n\t\tTimestamp:  event.Timestamp,\n\t\tURL:        encoderRecorderURL,\n\t\tToken:      streamIngestToken,\n\t\tGeneration: generation,\n\t\tAttempt:    1,\n\t}\n\tm.publisherMu.Lock()\n\tdispatched = true\n\tvar err error\n\tif lifecycleWrite != nil {\n\t\terr = lifecycleWrite.participant.config.Publisher.PublishOnce(deliveryCtx, encoderEvent)\n\t} else {\n\t\terr = m.publisher.Publish(deliveryCtx, encoderEvent)\n\t}\n\tacknowledged = err == nil\n\tm.publisherMu.Unlock()\n\tif err != nil {\n\t\tclass, status := encoder.PublishErrorMetadata(err)\n\t\tretryable := encoder.IsRetryablePublishError(err)\n\t\tm.recordWorkerEventFailure(ctx, encoderEvent, 1, retryable, class, status)\n\t\tif lifecycleWrite == nil {\n\t\t\tm.queueWorkerEventAfterFailure(encoderEvent, err)\n\t\t}\n"
+        }
+      ]
+    },
+    "internal/jobs/manager.go": {
+      "before_sha256": "93e9d77406203dd205051431514c01892637cb49cb0fe8856e69e04ef8dbb500",
+      "after_sha256": "16f7a7d2e5a7baf585c41830878e685a28abc430677613099938f9208a1af446",
+      "edits": [
+        {
+          "old": "\tdeliveryCtx              context.Context\n\tdeliveryCancel           context.CancelFunc\n\tdeliveryWake             chan struct{}\n\tdeliveryWG               sync.WaitGroup\n\tpendingEvents            map[string]pendingWorkerEvent\n\tlatestEventByKey         map[string]string\n\tpublisherMu              sync.Mutex\n\n\tstartedAt                        time.Time\n\tstoppedOrder                     []stoppedTargetReceipt\n\tstoppedTargetReceiptPath         string\n\tevents                           []events.OverlayEvent\n\teventCounts                      map[string]int\n\tsendFailures                     int\n\tcaptionAudioStartedGeneration    uint64\n\tcaptionAudioConnectionGeneration uint64\n\tcaptionAudioQueueDrops           int\n\tcaptionAudioRetries              int\n\tcaptionAudioProviderDrops        int\n\tcaptionAudioSupersededDrops      int\n\tmaxEvents                        int\n}\n\nfunc NewManager(publisher encoder.Publisher, reporter Reporter) *Manager {\n\treturn newManager(publisher, reporter, \"\")\n}\n\n// NewManagerWithStoppedTargetReceiptFile retains a bounded set of recently\n// stopped stream IDs across process restarts. A delayed stop request can then\n// be safely acknowledged without touching a successor stream.\nfunc NewManagerWithStoppedTargetReceiptFile(publisher encoder.Publisher, reporter Reporter, path string) (*Manager, error) {\n\tmanager := newManager(publisher, reporter, path)\n\tif err := manager.loadStoppedTargetReceipts(); err != nil {\n\t\treturn nil, err\n\t}\n\treturn manager, nil\n}\n\nfunc newManager(publisher encoder.Publisher, reporter Reporter, stoppedTargetReceiptPath string) *Manager {\n\tif publisher == nil {\n\t\tpublisher = encoder.NoopPublisher{}\n\t}\n\treturn &Manager{\n\t\tpublisher:                publisher,\n\t\treporter:                 reporter,\n\t\tcaptionProfiles:          map[string]control.RuntimeProfile{},\n\t\tcaptionFactory:           deepgramSessionFactory{},\n\t\tstoppedTargetReceiptPath: strings.TrimSpace(stoppedTargetReceiptPath),\n\t\teventCounts:              map[string]int{},\n\t\tmaxEvents:                200,\n\t\tpendingEvents:            map[string]pendingWorkerEvent{},\n\t\tlatestEventByKey:         map[string]string{},\n\t}\n}\n\nfunc (m *Manager) Start(ctx context.Context, stream StreamContext) error {\n\tm.lifecycleMu.Lock()\n\tdefer m.lifecycleMu.Unlock()\n\n\tstream = m.applyStartProfileDefaults(stream)\n\tif strings.TrimSpace(stream.StreamID) == \"\" {\n\t\treturn errors.New(\"stream_id is required\")\n\t}\n\tstream.StreamID = strings.TrimSpace(stream.StreamID)\n\tstream.CaptionProfileID = strings.TrimSpace(stream.CaptionProfileID)\n\tvideoConfig, err := normalizeVideoSceneConfig(stream.VideoWidth, stream.VideoHeight, stream.VideoFPS)\n\tif err != nil {\n\t\treturn err\n\t}\n\tif err := validateVideoOutputRequest(stream); err != nil {\n\t\treturn err\n\t}\n\n\tm.mu.Lock()\n",
+          "new": "\tlifecycleParticipant     *workerLifecycleParticipant\n\teventWritesInFlight      int\n\tlifecycleIncarnation     string\n\tdeliveryCtx              context.Context\n\tdeliveryCancel           context.CancelFunc\n\tdeliveryWake             chan struct{}\n\tdeliveryWG               sync.WaitGroup\n\tpendingEvents            map[string]pendingWorkerEvent\n\tlatestEventByKey         map[string]string\n\tpublisherMu              sync.Mutex\n\n\tstartedAt                        time.Time\n\tstoppedOrder                     []stoppedTargetReceipt\n\tstoppedTargetReceiptPath         string\n\tevents                           []events.OverlayEvent\n\teventCounts                      map[string]int\n\tsendFailures                     int\n\tcaptionAudioStartedGeneration    uint64\n\tcaptionAudioConnectionGeneration uint64\n\tcaptionAudioQueueDrops           int\n\tcaptionAudioRetries              int\n\tcaptionAudioProviderDrops        int\n\tcaptionAudioSupersededDrops      int\n\tmaxEvents                        int\n}\n\nfunc NewManager(publisher encoder.Publisher, reporter Reporter) *Manager {\n\treturn newManager(publisher, reporter, \"\")\n}\n\n// NewManagerWithStoppedTargetReceiptFile retains a bounded set of recently\n// stopped stream IDs across process restarts. A delayed stop request can then\n// be safely acknowledged without touching a successor stream.\nfunc NewManagerWithStoppedTargetReceiptFile(publisher encoder.Publisher, reporter Reporter, path string) (*Manager, error) {\n\tmanager := newManager(publisher, reporter, path)\n\tif err := manager.loadStoppedTargetReceipts(); err != nil {\n\t\treturn nil, err\n\t}\n\treturn manager, nil\n}\n\nfunc newManager(publisher encoder.Publisher, reporter Reporter, stoppedTargetReceiptPath string) *Manager {\n\tif publisher == nil {\n\t\tpublisher = encoder.NoopPublisher{}\n\t}\n\treturn &Manager{\n\t\tpublisher:                publisher,\n\t\treporter:                 reporter,\n\t\tcaptionProfiles:          map[string]control.RuntimeProfile{},\n\t\tcaptionFactory:           deepgramSessionFactory{},\n\t\tstoppedTargetReceiptPath: strings.TrimSpace(stoppedTargetReceiptPath),\n\t\teventCounts:              map[string]int{},\n\t\tmaxEvents:                200,\n\t\tpendingEvents:            map[string]pendingWorkerEvent{},\n\t\tlatestEventByKey:         map[string]string{},\n\t}\n}\n\nfunc (m *Manager) Start(ctx context.Context, stream StreamContext) error {\n\tm.lifecycleMu.Lock()\n\tdefer m.lifecycleMu.Unlock()\n\n\tstream = m.applyStartProfileDefaults(stream)\n\tif strings.TrimSpace(stream.StreamID) == \"\" {\n\t\treturn errors.New(\"stream_id is required\")\n\t}\n\tstream.StreamID = strings.TrimSpace(stream.StreamID)\n\tstream.CaptionProfileID = strings.TrimSpace(stream.CaptionProfileID)\n\tvideoConfig, err := normalizeVideoSceneConfig(stream.VideoWidth, stream.VideoHeight, stream.VideoFPS)\n\tif err != nil {\n\t\treturn err\n\t}\n\tif err := validateVideoOutputRequest(stream); err != nil {\n\t\treturn err\n\t}\n\n\tm.mu.Lock()\n\tif m.lifecycleParticipant != nil {\n\t\tm.mu.Unlock()\n\t\treturn workerUnconnected(\"EXPLICIT_NEW_JOB_PARTICIPANT_REQUIRED\")\n\t}\n"
+        }
+      ]
+    }
+  }
+}

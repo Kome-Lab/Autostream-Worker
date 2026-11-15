@@ -69,6 +69,12 @@ func (m *Manager) SetCaptionRuntime(resolver RuntimeSecretResolver, factory Capt
 func (m *Manager) UpdateCaptionRuntimeSettings(ctx context.Context, streamID, profileID string) error {
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
+	m.mu.Lock()
+	if m.lifecycleParticipant != nil {
+		m.mu.Unlock()
+		return workerUnconnected("CAPTION_PROVIDER_PARTICIPANT_UNCONNECTED")
+	}
+	m.mu.Unlock()
 
 	streamID = strings.TrimSpace(streamID)
 	profileID = strings.TrimSpace(profileID)
