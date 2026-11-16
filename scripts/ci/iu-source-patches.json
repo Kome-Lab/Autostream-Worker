@@ -330,6 +330,32 @@
           "new": "\tt.Setenv(\"CREDENTIALS_DIRECTORY\", credentialDir)\n\n\tlatch := NewUpdaterIdentityLatch(control.ServiceType)\n\thandler := legacyNewServerWithRuntimeConfigAndUpdaterIdentity(control.ServiceType, nil, TokenVerifier{}, nil, latch)\n\tassertUpdaterIdentityStatus(t, handler, http.StatusServiceUnavailable, \"\")\n\n\twriteUpdaterIdentityNodeConfig(t, configPath, credentialPath, \"worker-authoritative\", control.ServiceType, 13)\n"
         }
       ]
+    },
+    "scripts/ci/source-owner-map.json": {
+      "before_sha256": "b437ca6caab70a46bcfc831d1712e3fab1fd566734f7da6db41840775b010e1f",
+      "after_sha256": "fb5e1003d9f5cea878f329dda10b791032a03b5be73e52afc9ba783b486cbbe3",
+      "edits": [
+        {
+          "old": "      },\n      {\n        \"path\": \"internal/httpapi/server_token_authority_test.go\",\n        \"sha256\": \"34e3ed19873db3e9876aa393dd611fa8ad75ecef5c6bbf36cb4038ff858fa10c\",\n        \"symbols\": [\n          \"TestErrorDoesNotEchoBearerToken\",\n          \"TestSHA256TokenVerifier\",\n",
+          "new": "      },\n      {\n        \"path\": \"internal/httpapi/server_token_authority_test.go\",\n        \"sha256\": \"535ee1ada14bfc5e217e3004badb57fd6589c4910e16abca94945078782b3ef9\",\n        \"symbols\": [\n          \"TestErrorDoesNotEchoBearerToken\",\n          \"TestSHA256TokenVerifier\",\n"
+        },
+        {
+          "old": "      },\n      {\n        \"path\": \"internal/httpapi/server_runtime_assignment_test.go\",\n        \"sha256\": \"f4599211a73d3e999b929087f69fdaae4e76145afc8df35755b9d2bc960fab97\",\n        \"symbols\": [\n          \"TestCaptionRuntimeSettingsKeepsSessionWhenRuntimeConfigRefreshFails\",\n          \"TestCaptionRuntimeSettingsRefreshesConfigAndReplacesRunningSession\",\n",
+          "new": "      },\n      {\n        \"path\": \"internal/httpapi/server_runtime_assignment_test.go\",\n        \"sha256\": \"59bcb46a71237805bf021b1c95972575af8d57bb8c5bb035bb56023c9b0ca934\",\n        \"symbols\": [\n          \"TestCaptionRuntimeSettingsKeepsSessionWhenRuntimeConfigRefreshFails\",\n          \"TestCaptionRuntimeSettingsRefreshesConfigAndReplacesRunningSession\",\n"
+        },
+        {
+          "old": "      },\n      {\n        \"path\": \"internal/httpapi/server_listener_stop_test.go\",\n        \"sha256\": \"1821bd562d96492db55c9dc1cdf8ad3190e478a9e5e8a593cef423815839177f\",\n        \"symbols\": [\n          \"TestStatusEndpointUsesAuthoritativeNodeConfigServiceID\",\n          \"TestStopJobKeepsStoppedTargetIdempotentAfterWorkerRestart\",\n",
+          "new": "      },\n      {\n        \"path\": \"internal/httpapi/server_listener_stop_test.go\",\n        \"sha256\": \"8da08ed0c8e80026653f7211349df84b22cab2de3e0e6f9f2f7d9b142e41f7ce\",\n        \"symbols\": [\n          \"TestStatusEndpointUsesAuthoritativeNodeConfigServiceID\",\n          \"TestStopJobKeepsStoppedTargetIdempotentAfterWorkerRestart\",\n"
+        },
+        {
+          "old": "      },\n      {\n        \"path\": \"internal/httpapi/server_event_ingress_test.go\",\n        \"sha256\": \"93dd746c3650eba13f90704ff43ffb5875e7182007b47fe95cdd7c0cd70c5c89\",\n        \"symbols\": [\n          \"TestDiscordChatOverlayEventIsAcceptedAndForwarded\",\n          \"TestNewServerFailsClosedOnInvalidListenerConfigRevision\",\n",
+          "new": "      },\n      {\n        \"path\": \"internal/httpapi/server_event_ingress_test.go\",\n        \"sha256\": \"5513d31f26c409891e1192b6326d7e76bbede6ff9feb3eed93e9e108e5d3d2d0\",\n        \"symbols\": [\n          \"TestDiscordChatOverlayEventIsAcceptedAndForwarded\",\n          \"TestNewServerFailsClosedOnInvalidListenerConfigRevision\",\n"
+        },
+        {
+          "old": "      },\n      {\n        \"path\": \"internal/httpapi/server_caption_ingress_test.go\",\n        \"sha256\": \"5da2b9d4852b45f73c7fe4c28c227a95ee133692ebc9bff3012c13d4dc7d317d\",\n        \"symbols\": [\n          \"TestCaptionAudioEndpointAcceptsBeforeProviderIngestCompletes\",\n          \"TestCaptionAudioEndpointAcceptsMatchingJobGeneration\",\n",
+          "new": "      },\n      {\n        \"path\": \"internal/httpapi/server_caption_ingress_test.go\",\n        \"sha256\": \"0eed62b8de2db0c33d6b3f941f31aa1c35372c56337ce66fe9c2a3eda3ce3e90\",\n        \"symbols\": [\n          \"TestCaptionAudioEndpointAcceptsBeforeProviderIngestCompletes\",\n          \"TestCaptionAudioEndpointAcceptsMatchingJobGeneration\",\n"
+        }
+      ]
     }
   }
 }
