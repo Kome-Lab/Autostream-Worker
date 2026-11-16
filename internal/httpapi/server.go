@@ -20,6 +20,7 @@ import (
 	"github.com/example/autostream-worker/internal/events"
 	"github.com/example/autostream-worker/internal/ingesttoken"
 	"github.com/example/autostream-worker/internal/jobs"
+	"github.com/example/autostream-worker/internal/manualhold"
 	"github.com/example/autostream-worker/internal/observability"
 	"github.com/example/autostream-worker/internal/sceneappearance"
 	"github.com/example/autostream-worker/internal/version"
@@ -165,6 +166,9 @@ func NewServerWithRuntimeConfigAndUpdaterIdentity(serviceType string, manager *j
 	if _, err := updaterIdentity.ResolveFromEnv(); err != nil && !errors.Is(err, ErrUpdaterIdentityPending) {
 		panic(err)
 	}
+	if err := manager.ConfigureStartAdmission(); err != nil {
+		panic(err)
+	}
 	server := Server{
 		serviceType:     serviceType,
 		updaterIdentity: updaterIdentity,
@@ -173,6 +177,7 @@ func NewServerWithRuntimeConfigAndUpdaterIdentity(serviceType string, manager *j
 		runtimeConfig:   runtimeConfig,
 	}
 	mux := http.NewServeMux()
+	registerManualStartAdmissionRoutes(mux, manager.StartAdmission, server.authorized)
 	mux.HandleFunc("GET /health", server.health)
 	mux.HandleFunc("GET /updater/version", server.updaterVersion)
 	mux.HandleFunc("GET /status", server.status)
@@ -240,6 +245,28 @@ func (s Server) startJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_json"})
 		return
 	}
+	admissionCtx, admissionErr := manualhold.RequestContext(r)
+	if admissionErr != nil {
+		writeStartAdmissionError(w, admissionErr)
+		return
+	}
+	if err := manualhold.ValidateStart(admissionCtx, req.StreamID, req.ArchiveRunID); err != nil {
+		writeStartAdmissionError(w, err)
+		return
+	}
+	admissionCtx, lease, admissionErr := s.manager.StartAdmission.Enter(admissionCtx, req.StreamID)
+	if admissionErr != nil {
+		writeStartAdmissionError(w, admissionErr)
+		return
+	}
+	if lease != nil {
+		defer func() {
+			if !lease.Done() {
+				_ = lease.Finish(manualhold.ErrUnknown)
+			}
+		}()
+	}
+	r = r.WithContext(admissionCtx)
 	if s.runtimeConfig != nil {
 		cfg, err := s.runtimeConfig(r.Context())
 		if err != nil {
@@ -249,6 +276,10 @@ func (s Server) startJob(w http.ResponseWriter, r *http.Request) {
 		s.manager.ApplyRuntimeConfig(cfg)
 	}
 	if err := s.manager.Start(r.Context(), req); err != nil {
+		if errors.Is(err, manualhold.ErrRefused) || errors.Is(err, manualhold.ErrUnknown) {
+			writeStartAdmissionError(w, err)
+			return
+		}
 		writeRequestError(w, err)
 		return
 	}

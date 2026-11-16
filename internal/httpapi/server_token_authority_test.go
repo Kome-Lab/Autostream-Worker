@@ -75,7 +75,7 @@ func TestTokenVerifierReadsNodeRuntimeTokenAfterStartup(t *testing.T) {
 }
 
 func TestErrorDoesNotEchoBearerToken(t *testing.T) {
-	server := httptest.NewServer(NewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "secret-token"}))
+	server := httptest.NewServer(legacyNewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "secret-token"}))
 	defer server.Close()
 
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", strings.NewReader(`{"stream_id":""}`))
