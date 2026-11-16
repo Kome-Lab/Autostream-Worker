@@ -166,7 +166,10 @@ func msrServeProcess(t *testing.T, handler http.Handler) {
 	}
 }
 
-type msrActualVideoOutput struct{ calls atomic.Int32 }
+type msrActualVideoOutput struct {
+	calls atomic.Int32
+	stops atomic.Int32
+}
 
 func (v *msrActualVideoOutput) Start(ctx context.Context, _ jobs.StreamContext, _ jobs.VideoSceneConfig) error {
 	if err := msrSyntheticLaunch(ctx); err != nil {
@@ -175,7 +178,7 @@ func (v *msrActualVideoOutput) Start(ctx context.Context, _ jobs.StreamContext, 
 	v.calls.Add(1)
 	return nil
 }
-func (v *msrActualVideoOutput) Stop(context.Context, string) error { return nil }
+func (v *msrActualVideoOutput) Stop(context.Context, string) error { v.stops.Add(1); return nil }
 func msrWorkerHTTP(t *testing.T, guard *manualhold.Guard, video *msrActualVideoOutput, token string) http.Handler {
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", filepath.Join(t.TempDir(), "synthetic-pending-node.yml"))
 	manager, err := jobs.NewManagerWithStoppedTargetReceiptFile(encoder.NoopPublisher{}, observability.Client{}, filepath.Join(t.TempDir(), "stopped.json"))
@@ -191,6 +194,54 @@ func msrWorkerHTTP(t *testing.T, guard *manualhold.Guard, video *msrActualVideoO
 const msrWorkerStartBody = "{\"stream_id\":\"stream-test\",\"archive_run_id\":\"run-test\",\"stream_name\":\"Synthetic MSR\",\"encoder_profile_id\":\"synthetic-encoder-profile\",\"video_width\":854,\"video_height\":480,\"video_fps\":30,\"video_ingest_url\":\"srt://synthetic.invalid:10000\",\"video_ingest_passphrase\":\"synthetic-test-only-passphrase\",\"video_ingest_pbkeylen\":16}"
 
 func TestMSRWorkerActualHTTPFence(t *testing.T) {
+	t.Run("stop_waits_for_accepted_start", func(t *testing.T) {
+		barrier := filepath.Join(t.TempDir(), "launch")
+		t.Setenv("AUTOSTREAM_MSR_LAUNCH_BARRIER_FILE", barrier)
+		producer := msrTargetProducer("C06", "worker-test")
+		guard := msrTargetGuard(t, t.TempDir(), producer, manualhold.InspectorFunc(func(_ context.Context, r lifecycle.Record) (lifecycle.Record, error) { return r, nil }))
+		video := &msrActualVideoOutput{}
+		product := msrWorkerHTTP(t, guard, video, "synthetic-service-token")
+		stopArrived := make(chan struct{})
+		var once sync.Once
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Path == "/jobs/stream-test/stop" {
+				once.Do(func() { close(stopArrived) })
+			}
+			product.ServeHTTP(w, r)
+		}))
+		defer server.Close()
+		defer func() { _ = os.WriteFile(barrier+".release", []byte("release"), 0600) }()
+		start := msrTargetRecord(t, producer, "stream-test", 1, "accepted-before-stop", "automatic-start")
+		starting := msrAsyncTargetRequest(t, server.URL, "/jobs/start", msrWorkerStartBody, &start)
+		msrAwaitActualLaunchBarrier(t, barrier)
+		stopping := msrAsyncTargetRequest(t, server.URL, "/jobs/stream-test/stop", "{}", nil)
+		select {
+		case <-stopArrived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("actual Stop handler was not reached")
+		}
+		select {
+		case result := <-stopping:
+			t.Fatalf("Stop returned before accepted Start left actual VideoOutput boundary: %d %s %v", result.code, result.body, result.err)
+		case <-time.After(30 * time.Millisecond):
+		}
+		if err := os.WriteFile(barrier+".release", []byte("release"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		started := <-starting
+		if started.err != nil || started.code != http.StatusAccepted {
+			t.Fatalf("Start completion: %d %s %v", started.code, started.body, started.err)
+		}
+		stopped := <-stopping
+		if stopped.err != nil || stopped.code != http.StatusAccepted || !strings.Contains(string(stopped.body), "stopped") || video.calls.Load() != 1 || video.stops.Load() != 1 {
+			t.Fatalf("Stop after Start completion: %d %s %v launches=%d stops=%d", stopped.code, stopped.body, stopped.err, video.calls.Load(), video.stops.Load())
+		}
+		code, body := msrTargetRequest(t, server.URL, "/jobs/stream-test/stop", "synthetic-service-token", "{}", nil)
+		if code != http.StatusAccepted || !strings.Contains(string(body), "already_stopped") || video.calls.Load() != 1 || video.stops.Load() != 1 {
+			t.Fatalf("late Job passed Stop ACK or stop receipt changed: %d %s launches=%d stops=%d", code, body, video.calls.Load(), video.stops.Load())
+		}
+	})
+
 	producer := msrTargetProducer("C06", "worker-test")
 	var checks atomic.Int32
 	inspector := manualhold.InspectorFunc(func(_ context.Context, r lifecycle.Record) (lifecycle.Record, error) { checks.Add(1); return r, nil })
@@ -241,8 +292,12 @@ func TestMSRWorkerActualPrelaunchCurrentness(t *testing.T) {
 	defer server.Close()
 	start := msrTargetRecord(t, producer, "stream-test", 1, "start", "automatic-start")
 	code, body := msrTargetRequest(t, server.URL, "/jobs/start", "synthetic-service-token", msrWorkerStartBody, &start)
-	if code != 409 || video.calls.Load() != 0 || checks.Load() != 3 {
+	if code != http.StatusServiceUnavailable || !strings.Contains(string(body), "UNKNOWN") || video.calls.Load() != 0 || checks.Load() != 3 {
 		t.Fatalf("prelaunch fence: %d %s launches=%d checks=%d", code, body, video.calls.Load(), checks.Load())
+	}
+	observed, observation, inspectErr := guard.Inspect("stream-test", start.Header.Correlation.RequestID)
+	if inspectErr != nil || !manualhold.Equal(observed, start) || observation == nil || observation.Knowledge != lifecycle.KnowledgeUnknown || observation.Outcome.State != lifecycle.Unavailable || observation.Outcome.Value != nil {
+		t.Fatalf("late product-preparation rejection must remain UNKNOWN: %v %+v", inspectErr, observation)
 	}
 }
 func TestMSRTargetProcess(t *testing.T) {
@@ -272,3 +327,57 @@ func (msrBlankRenderer) RenderSize(width, height int, _ time.Time) (*image.RGBA,
 }
 func (msrBlankRenderer) AvatarRefreshInterval() time.Duration { return time.Hour }
 func (msrBlankRenderer) RefreshAvatars()                      {}
+
+type msrHTTPResult struct {
+	code int
+	body []byte
+	err  error
+}
+
+func msrAsyncTargetRequest(t *testing.T, baseURL, route, body string, record *lifecycle.Record) <-chan msrHTTPResult {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, baseURL+route, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer synthetic-service-token")
+	request.Header.Set("Content-Type", "application/json")
+	if record != nil {
+		encoded, err := manualhold.Encode(*record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set(manualhold.Header, encoded)
+	}
+	result := make(chan msrHTTPResult, 1)
+	go func() {
+		response, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+		if err != nil {
+			result <- msrHTTPResult{err: err}
+			return
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		result <- msrHTTPResult{code: response.StatusCode, body: body, err: err}
+	}()
+	return result
+}
+func msrAwaitActualLaunchBarrier(t *testing.T, barrier string) {
+	t.Helper()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(barrier + ".reached"); err == nil {
+			return
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		select {
+		case <-timeout.C:
+			t.Fatal("actual launch boundary not reached")
+		case <-ticker.C:
+		}
+	}
+}

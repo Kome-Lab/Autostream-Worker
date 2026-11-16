@@ -1,0 +1,5 @@
+# Required independent-process Stop/Start and Hold closure children.
+github.com/example/autostream-worker/internal/manualhold TestMSRTargetHoldWaitsForLaunchExclusionAcrossGuards/stop_joins_owned_lease
+github.com/example/autostream-worker/internal/manualhold TestMSRTargetProcessBarrier/stop_exclusion
+github.com/example/autostream-worker/internal/manualhold TestMSRTargetProcessBarrier/hold_close
+github.com/example/autostream-worker/internal/httpapi TestMSRWorkerActualHTTPFence/stop_waits_for_accepted_start

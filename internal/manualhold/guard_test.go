@@ -148,6 +148,40 @@ func TestMSRTargetManualStartPreservesHoldAndRequestCannotReplay(t *testing.T) {
 }
 
 func TestMSRTargetSecondLiveCheckAndUnknownRemainDistinct(t *testing.T) {
+	t.Run("product_preparation_entered", func(t *testing.T) {
+		var checks atomic.Int32
+		guard := newTestGuard(t, t.TempDir(), InspectorFunc(func(_ context.Context, r lifecycle.Record) (lifecycle.Record, error) {
+			if checks.Add(1) > 1 {
+				return lifecycle.Record{}, ErrRefused
+			}
+			return r, nil
+		}))
+		original := testRecord(t, 1, "product-preparation", "automatic-start")
+		lease, err := guard.Begin(t.Context(), "stream-test", &original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease.MarkEffectsPossible()
+		if err = lease.BeforeLaunch(t.Context()); !errors.Is(err, ErrRefused) {
+			t.Fatalf("late currentness rejection: %v", err)
+		}
+		if err = lease.Finish(err); !errors.Is(err, ErrUnknown) || !errors.Is(err, ErrRefused) {
+			t.Fatalf("possible product effects became unchanged: %v", err)
+		}
+		file, _ := guard.paths("stream-test")
+		before, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, observation, err := guard.Inspect("stream-test", original.Header.Correlation.RequestID)
+		if err != nil || !Equal(record, original) || observation == nil || observation.Knowledge != lifecycle.KnowledgeUnknown || observation.Outcome.State != lifecycle.Unavailable || observation.Outcome.Value != nil {
+			t.Fatalf("possible effects did not remain UNKNOWN: %v %+v", err, observation)
+		}
+		after, err := os.ReadFile(file)
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatal("Inspect changed possible-effects record")
+		}
+	})
 	var checks atomic.Int32
 	guard := newTestGuard(t, t.TempDir(), InspectorFunc(func(_ context.Context, r lifecycle.Record) (lifecycle.Record, error) {
 		if checks.Add(1) == 2 {
@@ -176,6 +210,31 @@ func TestMSRTargetSecondLiveCheckAndUnknownRemainDistinct(t *testing.T) {
 }
 
 func TestMSRTargetHoldWaitsForLaunchExclusionAcrossGuards(t *testing.T) {
+	t.Run("stop_joins_owned_lease", func(t *testing.T) {
+		guard := newTestGuard(t, t.TempDir(), echoInspector())
+		original := testRecord(t, 1, "internal-stop", "manual-start")
+		ctx, lease, err := guard.Enter(WithRecord(t.Context(), original), "stream-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		joined, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		if err = guard.WithStop(joined, "stream-test", func() error { calls++; return nil }); err != nil || calls != 1 {
+			t.Fatalf("owned Stop did not join: %v calls=%d", err, calls)
+		}
+		if err = lease.Finish(ErrRefused); !errors.Is(err, ErrUnknown) {
+			t.Fatal("joined Stop effects became unchanged")
+		}
+		state, err := guard.load("stream-test")
+		if err != nil || state.ClosedFrame != nil {
+			t.Fatalf("Stop created Hold: %v", err)
+		}
+		var legacy *Guard
+		if err = legacy.WithStop(t.Context(), "", func() error { calls++; return nil }); err != nil || calls != 2 {
+			t.Fatal("nil guard changed legacy Stop")
+		}
+	})
 	directory := t.TempDir()
 	first := newTestGuard(t, directory, echoInspector())
 	second := newTestGuard(t, directory, echoInspector())
@@ -325,7 +384,12 @@ func TestMSRTargetProcessBarrier(t *testing.T) {
 		}
 		guard := newTestGuard(t, directory, echoInspector())
 		closed := testRecord(t, 2, "process-close", "manual-stop")
-		if _, err = guard.Close(t.Context(), "stream-test", closed); err != nil {
+		if os.Getenv("AUTOSTREAM_MSR_GUARD_STOP") == "true" {
+			err = guard.WithStop(t.Context(), "stream-test", func() error { return nil })
+		} else {
+			_, err = guard.Close(t.Context(), "stream-test", closed)
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err = connection.Write([]byte{2}); err != nil {
@@ -333,6 +397,11 @@ func TestMSRTargetProcessBarrier(t *testing.T) {
 		}
 		return
 	}
+	t.Run("hold_close", func(t *testing.T) { runMSRProcessBarrier(t, false) })
+	t.Run("stop_exclusion", func(t *testing.T) { runMSRProcessBarrier(t, true) })
+}
+
+func runMSRProcessBarrier(t *testing.T, stopOnly bool) {
 	directory := t.TempDir()
 	guard := newTestGuard(t, directory, echoInspector())
 	start := testRecord(t, 1, "process-start", "automatic-start")
@@ -356,7 +425,7 @@ func TestMSRTargetProcessBarrier(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMSRTargetProcessBarrier$")
-	command.Env = append(os.Environ(), "AUTOSTREAM_MSR_GUARD_CHILD_DIR="+directory, "AUTOSTREAM_MSR_GUARD_BARRIER="+listener.Addr().String())
+	command.Env = append(os.Environ(), "AUTOSTREAM_MSR_GUARD_CHILD_DIR="+directory, "AUTOSTREAM_MSR_GUARD_BARRIER="+listener.Addr().String(), "AUTOSTREAM_MSR_GUARD_STOP="+fmt.Sprint(stopOnly))
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
@@ -388,6 +457,16 @@ func TestMSRTargetProcessBarrier(t *testing.T) {
 	}
 	if err = command.Wait(); err != nil {
 		t.Fatalf("child: %v %s", err, output.String())
+	}
+	if stopOnly {
+		state, err := guard.load("stream-test")
+		if err != nil || state.ClosedFrame != nil {
+			t.Fatalf("ordinary Stop created Hold: %v", err)
+		}
+		if _, err = guard.Begin(t.Context(), "stream-test", &start); !errors.Is(err, ErrRefused) {
+			t.Fatalf("completed Start replayed after Stop ACK: %v", err)
+		}
+		return
 	}
 	old := testRecord(t, 1, "late-process-start", "automatic-start")
 	if _, err = guard.Begin(t.Context(), "stream-test", &old); !errors.Is(err, ErrRefused) {

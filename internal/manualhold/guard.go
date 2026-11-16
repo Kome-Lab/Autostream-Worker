@@ -52,14 +52,15 @@ type journal struct {
 }
 
 type Lease struct {
-	guard         *Guard
-	streamID      string
-	record        lifecycle.Record
-	state         journal
-	index         int
-	release       func()
-	launchChecked bool
-	finished      bool
+	guard           *Guard
+	streamID        string
+	record          lifecycle.Record
+	state           journal
+	index           int
+	release         func()
+	launchChecked   bool
+	effectsPossible bool
+	finished        bool
 }
 
 type leaseContextKey struct{}
@@ -83,6 +84,43 @@ func (g *Guard) Enter(ctx context.Context, streamID string) (context.Context, *L
 }
 
 func (l *Lease) Done() bool { return l == nil || l.finished }
+
+// MarkEffectsPossible is called by trusted product composition before entering
+// runtime preparation, private effects, or target state changes. No-effect proof
+// is reserved for a guard-only rejection that never entered that product work.
+// The pending durable observation is already UNKNOWN; this is not a wire state.
+func (l *Lease) MarkEffectsPossible() {
+	if l != nil && !l.finished {
+		l.effectsPossible = true
+	}
+}
+
+// WithStop serializes an explicit existing Stop with the same target exclusion
+// as an accepted Start. It neither installs a closed frame nor creates a Hold.
+// An internal Stop may join only the private, still-owned same-stream lease.
+func (g *Guard) WithStop(ctx context.Context, streamID string, stop func() error) error {
+	if stop == nil {
+		return ErrUnknown
+	}
+	if g == nil {
+		return stop()
+	}
+	if ctx != nil {
+		if lease, ok := ctx.Value(leaseContextKey{}).(*Lease); ok {
+			if lease == nil || lease.guard != g || lease.streamID != streamID || lease.finished {
+				return ErrRefused
+			}
+			lease.MarkEffectsPossible()
+			return stop()
+		}
+	}
+	release, err := g.acquire(ctx, streamID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return stop()
+}
 
 // WithCurrent protects a later publication of an already-started preparation.
 // It never registers or re-executes Start and cannot reopen a closed lane.
@@ -557,7 +595,7 @@ func (l *Lease) Finish(cause error) error {
 	}
 	observation := pendingObservation(l.record, producer)
 	var value lifecycle.Outcome
-	if !l.launchChecked && cause != nil {
+	if !l.launchChecked && !l.effectsPossible && cause != nil {
 		value = lifecycle.NoEffectProven
 		observation.DetailRef = l.record.Header.RecordKey.RecordID
 	} else if l.launchChecked && cause == nil {
@@ -566,6 +604,9 @@ func (l *Lease) Finish(cause error) error {
 	if value != "" {
 		observation.Knowledge, observation.Presence = lifecycle.Known, lifecycle.Present
 		observation.Outcome = lifecycle.Fact[lifecycle.Outcome]{State: lifecycle.Observed, Value: &value, Observation: &lifecycle.ObservationContext{OwnerID: producer.ServiceID, FrameRef: l.record.Header.RecordKey.RecordID, Scope: lifecycle.ID(l.streamID), SourceRevision: l.record.Header.RecordRevision}}
+	}
+	if observation.Knowledge == lifecycle.KnowledgeUnknown {
+		cause = errors.Join(cause, ErrUnknown)
 	}
 	l.state.Entries[l.index].Outcome = observation
 	if l.guard.save(l.streamID, l.state) != nil {

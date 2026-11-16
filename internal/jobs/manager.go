@@ -158,6 +158,7 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) (resultErr er
 	if admissionErr != nil {
 		return admissionErr
 	}
+	lease.MarkEffectsPossible()
 	if lease != nil {
 		defer func() { resultErr = lease.Finish(resultErr) }()
 	}

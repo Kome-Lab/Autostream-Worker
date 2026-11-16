@@ -259,6 +259,7 @@ func (s Server) startJob(w http.ResponseWriter, r *http.Request) {
 		writeStartAdmissionError(w, admissionErr)
 		return
 	}
+	lease.MarkEffectsPossible()
 	if lease != nil {
 		defer func() {
 			if !lease.Done() {
@@ -292,7 +293,11 @@ func (s Server) stopJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	streamID := strings.TrimSpace(r.PathValue("id"))
-	if err := s.manager.Stop(r.Context(), streamID); err != nil {
+	if err := s.manager.StartAdmission.WithStop(r.Context(), streamID, func() error { return s.manager.Stop(r.Context(), streamID) }); err != nil {
+		if errors.Is(err, manualhold.ErrUnknown) || errors.Is(err, manualhold.ErrRefused) {
+			writeStartAdmissionError(w, err)
+			return
+		}
 		if errors.Is(err, jobs.ErrStreamAlreadyStopped) {
 			writeJSON(w, http.StatusAccepted, map[string]string{"status": "already_stopped"})
 			return
