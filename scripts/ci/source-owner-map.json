@@ -302,7 +302,7 @@
       },
       {
         "path": "internal/httpapi/server_caption_ingress_test.go",
-        "sha256": "5da2b9d4852b45f73c7fe4c28c227a95ee133692ebc9bff3012c13d4dc7d317d",
+        "sha256": "0eed62b8de2db0c33d6b3f941f31aa1c35372c56337ce66fe9c2a3eda3ce3e90",
         "symbols": [
           "TestCaptionAudioEndpointAcceptsBeforeProviderIngestCompletes",
           "TestCaptionAudioEndpointAcceptsMatchingJobGeneration",
@@ -318,7 +318,7 @@
       },
       {
         "path": "internal/httpapi/server_event_ingress_test.go",
-        "sha256": "93dd746c3650eba13f90704ff43ffb5875e7182007b47fe95cdd7c0cd70c5c89",
+        "sha256": "5513d31f26c409891e1192b6326d7e76bbede6ff9feb3eed93e9e108e5d3d2d0",
         "symbols": [
           "TestDiscordChatOverlayEventIsAcceptedAndForwarded",
           "TestNewServerFailsClosedOnInvalidListenerConfigRevision",
@@ -331,7 +331,7 @@
       },
       {
         "path": "internal/httpapi/server_listener_stop_test.go",
-        "sha256": "1821bd562d96492db55c9dc1cdf8ad3190e478a9e5e8a593cef423815839177f",
+        "sha256": "8da08ed0c8e80026653f7211349df84b22cab2de3e0e6f9f2f7d9b142e41f7ce",
         "symbols": [
           "TestStatusEndpointUsesAuthoritativeNodeConfigServiceID",
           "TestStopJobKeepsStoppedTargetIdempotentAfterWorkerRestart",
@@ -344,7 +344,7 @@
       },
       {
         "path": "internal/httpapi/server_runtime_assignment_test.go",
-        "sha256": "f4599211a73d3e999b929087f69fdaae4e76145afc8df35755b9d2bc960fab97",
+        "sha256": "59bcb46a71237805bf021b1c95972575af8d57bb8c5bb035bb56023c9b0ca934",
         "symbols": [
           "TestCaptionRuntimeSettingsKeepsSessionWhenRuntimeConfigRefreshFails",
           "TestCaptionRuntimeSettingsRefreshesConfigAndReplacesRunningSession",
@@ -374,7 +374,7 @@
       },
       {
         "path": "internal/httpapi/server_token_authority_test.go",
-        "sha256": "34e3ed19873db3e9876aa393dd611fa8ad75ecef5c6bbf36cb4038ff858fa10c",
+        "sha256": "535ee1ada14bfc5e217e3004badb57fd6589c4910e16abca94945078782b3ef9",
         "symbols": [
           "TestErrorDoesNotEchoBearerToken",
           "TestSHA256TokenVerifier",

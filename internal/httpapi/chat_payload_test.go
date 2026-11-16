@@ -53,7 +53,7 @@ func newChatPayloadHandler(t *testing.T) (http.Handler, *jobs.Manager, *chatPayl
 			t.Error(err)
 		}
 	})
-	return NewServer("worker", manager, TokenVerifier{PlainToken: "chat-payload-test-token"}), manager, renderer, publisher, now
+	return legacyNewServer("worker", manager, TokenVerifier{PlainToken: "chat-payload-test-token"}), manager, renderer, publisher, now
 }
 
 func canonicalHTTPChatPayload(messageID string) map[string]any {

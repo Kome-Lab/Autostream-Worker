@@ -11,6 +11,7 @@ import (
 	"github.com/example/autostream-worker/internal/control"
 	"github.com/example/autostream-worker/internal/encoder"
 	"github.com/example/autostream-worker/internal/events"
+	"github.com/example/autostream-worker/internal/manualhold"
 	"github.com/example/autostream-worker/internal/sceneappearance"
 )
 
@@ -49,6 +50,7 @@ const (
 )
 
 type StreamContext struct {
+	ArchiveRunID          string                    `json:"archive_run_id,omitempty"`
 	StreamID              string                    `json:"stream_id"`
 	StreamName            string                    `json:"stream_name,omitempty"`
 	EncoderRecorderURL    string                    `json:"encoder_recorder_url,omitempty"`
@@ -66,8 +68,9 @@ type StreamContext struct {
 }
 
 type Manager struct {
-	publisher encoder.Publisher
-	reporter  Reporter
+	StartAdmission *manualhold.Guard
+	publisher      encoder.Publisher
+	reporter       Reporter
 
 	lifecycleMu sync.Mutex
 	mu          sync.Mutex
@@ -87,6 +90,11 @@ type Manager struct {
 	videoOutput              VideoOutput
 	jobGeneration            uint64
 	stopping                 bool
+	lifecycleParticipant     *workerLifecycleParticipant
+	eventWritesInFlight      int
+	legacyDeliveryBorrows    int
+	legacyWriterAdmitted     bool
+	lifecycleIncarnation     string
 	deliveryCtx              context.Context
 	deliveryCancel           context.CancelFunc
 	deliveryWake             chan struct{}
@@ -142,7 +150,18 @@ func newManager(publisher encoder.Publisher, reporter Reporter, stoppedTargetRec
 	}
 }
 
-func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
+func (m *Manager) Start(ctx context.Context, stream StreamContext) (resultErr error) {
+	if err := manualhold.ValidateStart(ctx, stream.StreamID, stream.ArchiveRunID); err != nil {
+		return err
+	}
+	ctx, lease, admissionErr := m.StartAdmission.Enter(ctx, stream.StreamID)
+	if admissionErr != nil {
+		return admissionErr
+	}
+	lease.MarkEffectsPossible()
+	if lease != nil {
+		defer func() { resultErr = lease.Finish(resultErr) }()
+	}
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
 
@@ -161,6 +180,10 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	}
 
 	m.mu.Lock()
+	if m.lifecycleParticipant != nil {
+		m.mu.Unlock()
+		return workerUnconnected("EXPLICIT_NEW_JOB_PARTICIPANT_REQUIRED")
+	}
 	if !m.streamAssignedLocked(stream.StreamID) {
 		m.mu.Unlock()
 		return errors.New("stream is not assigned to this worker service as primary")
@@ -220,6 +243,10 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		}
 		apiKey := []byte(secret.Value)
 		secret.Value = ""
+		if err := lease.BeforeLaunch(ctx); err != nil {
+			zeroBytes(apiKey)
+			return err
+		}
 		captionSession, err = factory.New(config, apiKey, m.captionTranscriptHandler(stream.StreamID, nextGeneration, nextCaptionSessionGeneration))
 		zeroBytes(apiKey)
 		if err != nil || captionSession == nil {
@@ -228,6 +255,10 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 		}
 	}
 
+	if err := lease.BeforeLaunch(ctx); err != nil {
+		closeCaptionSession(captionSession)
+		return err
+	}
 	m.mu.Lock()
 	if !m.streamAssignedLocked(stream.StreamID) {
 		m.mu.Unlock()
@@ -246,6 +277,9 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	}
 	m.current = stream
 	m.jobGeneration++
+	// This marker belongs to the newly admitted job. Cleanup/rollback never
+	// clears it, and an older outstanding delivery keeps its separate borrow.
+	m.legacyWriterAdmitted = false
 	generation := m.jobGeneration
 	m.captionSessionGeneration = nextCaptionSessionGeneration
 	m.startEventDeliveryLocked()
@@ -317,10 +351,17 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 	if videoRequested {
 		videoStartConfig := videoConfig
 		videoStartConfig.Generation = generation
-		if err := videoOutput.Start(ctx, stream, videoStartConfig); err != nil {
+		videoErr := lease.BeforeLaunch(ctx)
+		videoAttempted := videoErr == nil
+		if videoErr == nil {
+			videoErr = videoOutput.Start(ctx, stream, videoStartConfig)
+		}
+		if err := videoErr; err != nil {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cleanupCancel()
-			_ = videoOutput.Stop(cleanupCtx, stream.StreamID)
+			if videoAttempted {
+				_ = videoOutput.Stop(cleanupCtx, stream.StreamID)
+			}
 			m.mu.Lock()
 			if m.current.StreamID == stream.StreamID {
 				m.current = StreamContext{}
@@ -341,6 +382,9 @@ func (m *Manager) Start(ctx context.Context, stream StreamContext) error {
 				_ = captionSession.Close(cleanupCtx)
 			}
 			m.report(ctx, stream.StreamID, "worker.video.start_failed", "failed", nil)
+			if errors.Is(err, manualhold.ErrRefused) || errors.Is(err, manualhold.ErrUnknown) {
+				return err
+			}
 			return ErrVideoOutputUnavailable
 		}
 	}

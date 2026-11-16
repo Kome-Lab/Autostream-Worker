@@ -27,11 +27,11 @@ func TestNewServerFailsClosedOnInvalidListenerConfigRevision(t *testing.T) {
 			t.Fatal("NewServer must reject an invalid listener config_revision")
 		}
 	}()
-	_ = NewServer(control.ServiceType, nil, TokenVerifier{})
+	_ = legacyNewServer(control.ServiceType, nil, TokenVerifier{})
 }
 
 func TestProtectedEndpointsRejectMissingToken(t *testing.T) {
-	server := httptest.NewServer(NewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "expected"}))
+	server := httptest.NewServer(legacyNewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "expected"}))
 	defer server.Close()
 
 	res, err := http.Post(server.URL+"/jobs/start", "application/json", strings.NewReader(`{}`))
@@ -45,7 +45,7 @@ func TestProtectedEndpointsRejectMissingToken(t *testing.T) {
 }
 
 func TestStartAndGenerateCurrentTimeEvent(t *testing.T) {
-	server := httptest.NewServer(NewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "expected"}))
+	server := httptest.NewServer(legacyNewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "expected"}))
 	defer server.Close()
 
 	post := func(path, body string) *http.Response {
@@ -76,7 +76,7 @@ func TestStartAndGenerateCurrentTimeEvent(t *testing.T) {
 
 func TestDiscordChatOverlayEventIsAcceptedAndForwarded(t *testing.T) {
 	publisher := &capturePublisher{}
-	server := httptest.NewServer(NewServer("worker", jobs.NewManager(publisher, observability.Client{}), TokenVerifier{PlainToken: "expected"}))
+	server := httptest.NewServer(legacyNewServer("worker", jobs.NewManager(publisher, observability.Client{}), TokenVerifier{PlainToken: "expected"}))
 	defer server.Close()
 
 	post := func(path, body string) *http.Response {
@@ -126,7 +126,7 @@ func TestWorkerEventEndpointAcceptsSignedDiscordBotToken(t *testing.T) {
 	const signingKey = "test-signing-key"
 	publisher := &capturePublisher{}
 	manager := jobs.NewManager(publisher, observability.Client{})
-	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{PlainToken: "expected", IngestTokenSigningKey: signingKey}))
+	server := httptest.NewServer(legacyNewServer("worker", manager, TokenVerifier{PlainToken: "expected", IngestTokenSigningKey: signingKey}))
 	defer server.Close()
 
 	startReq, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", strings.NewReader(`{"stream_id":"stream-01","stream_name":"Chat Test"}`))
@@ -219,7 +219,7 @@ func TestWorkerEventEndpointRejectsOldJobGenerationAfterRearm(t *testing.T) {
 	if newGeneration == oldGeneration {
 		t.Fatalf("rearm did not advance job generation: old=%d new=%d", oldGeneration, newGeneration)
 	}
-	handler := NewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
+	handler := legacyNewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
 	request := httptest.NewRequest(http.MethodPost, "/streams/stream-01/events/participants", strings.NewReader(`{"job_generation":`+strconv.FormatUint(oldGeneration, 10)+`,"participants":[]}`))
 	request.Header.Set("Authorization", "Bearer service-token")
 	request.Header.Set("Content-Type", "application/json")

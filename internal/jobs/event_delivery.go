@@ -17,12 +17,17 @@ const (
 )
 
 type pendingWorkerEvent struct {
-	event     encoder.Event
-	key       string
-	attempts  int
-	nextTryAt time.Time
-	queuedAt  time.Time
+	event          encoder.Event
+	key            string
+	attempts       int
+	nextTryAt      time.Time
+	queuedAt       time.Time
+	deliveryBorrow *legacyEventDeliveryBorrow
 }
+
+// The private borrow spans dequeue through every delivery exit, including
+// the handoff before publisherMu. It is not admission or execution authority.
+type legacyEventDeliveryBorrow struct{ released bool }
 
 func (m *Manager) startEventDeliveryLocked() {
 	if m.deliveryCancel != nil {
@@ -197,6 +202,11 @@ func (m *Manager) nextPendingWorkerEvent() (pendingWorkerEvent, bool, time.Durat
 		}
 	}
 	if selected.key != "" {
+		selected.deliveryBorrow = &legacyEventDeliveryBorrow{}
+		m.legacyDeliveryBorrows++
+		if selected.event.StreamID == m.current.StreamID && selected.event.Generation == m.jobGeneration {
+			m.legacyWriterAdmitted = true
+		}
 		delete(m.pendingEvents, selected.key)
 		return selected, true, 0
 	}
@@ -207,6 +217,7 @@ func (m *Manager) nextPendingWorkerEvent() (pendingWorkerEvent, bool, time.Durat
 }
 
 func (m *Manager) deliverPendingWorkerEvent(ctx context.Context, pending pendingWorkerEvent) {
+	defer m.releaseLegacyDeliveryBorrow(pending.deliveryBorrow)
 	if !m.isCurrentPendingEvent(pending) {
 		return
 	}
@@ -237,10 +248,25 @@ func (m *Manager) deliverPendingWorkerEvent(ctx context.Context, pending pending
 	m.mu.Lock()
 	if m.current.StreamID == pending.event.StreamID && m.jobGeneration == pending.event.Generation && m.deliveryCancel != nil {
 		if _, newer := m.pendingEvents[pending.key]; !newer {
+			// The deferred release retains this delivery's token. Queued work
+			// does not retain an active borrow or expose its mutable release bit.
+			pending.deliveryBorrow = nil
 			m.pendingEvents[pending.key] = pending
 		}
 	}
 	m.mu.Unlock()
+}
+
+func (m *Manager) releaseLegacyDeliveryBorrow(borrow *legacyEventDeliveryBorrow) {
+	if borrow == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !borrow.released {
+		borrow.released = true
+		m.legacyDeliveryBorrows--
+	}
 }
 
 func (m *Manager) isCurrentPendingEvent(pending pendingWorkerEvent) bool {

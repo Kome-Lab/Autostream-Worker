@@ -65,7 +65,7 @@ func TestCaptionAudioVerifierRequiresStrictSignedClaims(t *testing.T) {
 func TestCaptionAudioEndpointAcceptsMatchingJobGeneration(t *testing.T) {
 	const signingKey = "caption-signing-key"
 	manager, captionSession := captionReadyManager(t)
-	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	server := httptest.NewServer(legacyNewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
 	defer server.Close()
 	token, err := ingesttoken.Issue(signingKey, ingesttoken.Claims{
 		StreamID:    "stream-01",
@@ -119,7 +119,7 @@ func TestCaptionAudioEndpointRequiresNonzeroJobGeneration(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			const signingKey = "caption-generation-signing-key"
 			manager, _ := captionReadyManager(t)
-			server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+			server := httptest.NewServer(legacyNewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
 			defer server.Close()
 			res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", signedCaptionAudioAuthorization(t, signingKey, "stream-01"), test.body)
 			defer res.Body.Close()
@@ -140,7 +140,7 @@ func TestCaptionAudioEndpointRequiresNonzeroJobGeneration(t *testing.T) {
 func TestCaptionAudioEndpointRequiresNonzeroConnectionGeneration(t *testing.T) {
 	const signingKey = "caption-connection-generation-signing-key"
 	manager, _ := captionReadyManager(t)
-	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	server := httptest.NewServer(legacyNewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
 	defer server.Close()
 	body := `{"stream_id":"stream-01","source":"discord","packets":[{"ssrc":42,"user_id":"user-42","job_generation":1,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ=="}]}`
 	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", signedCaptionAudioAuthorization(t, signingKey, "stream-01"), body)
@@ -160,7 +160,7 @@ func TestCaptionAudioEndpointRequiresNonzeroConnectionGeneration(t *testing.T) {
 func TestCaptionAudioEndpointRejectsOlderConnectionGeneration(t *testing.T) {
 	const signingKey = "caption-stale-connection-generation-signing-key"
 	manager, _ := captionReadyManager(t)
-	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	server := httptest.NewServer(legacyNewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
 	defer server.Close()
 	authorization := signedCaptionAudioAuthorization(t, signingKey, "stream-01")
 	newerBody := strings.Replace(validCaptionAudioBody(), `"connection_generation":1`, `"connection_generation":2`, 1)
@@ -205,7 +205,7 @@ func TestCaptionAudioEndpointAcceptsBeforeProviderIngestCompletes(t *testing.T) 
 		_ = manager.Close(context.Background())
 	})
 
-	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	server := httptest.NewServer(legacyNewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
 	defer func() {
 		select {
 		case <-session.release:
@@ -251,7 +251,7 @@ func TestCaptionAudioEndpointAcceptsBeforeProviderIngestCompletes(t *testing.T) 
 
 func TestCaptionAudioEndpointRejectsUnknownFieldsAndOversizedBodies(t *testing.T) {
 	const signingKey = "caption-validation-signing-key"
-	server := httptest.NewServer(NewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{IngestTokenSigningKey: signingKey}))
+	server := httptest.NewServer(legacyNewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{IngestTokenSigningKey: signingKey}))
 	defer server.Close()
 	authorization := signedCaptionAudioAuthorization(t, signingKey, "stream-01")
 	validPacket := `{"ssrc":42,"sequence":7,"timestamp":960,"received_at":"2026-07-14T00:00:00Z","opus_base64":"AQ=="}`
@@ -292,7 +292,7 @@ func TestCaptionAudioEndpointReturnsConflictWhenCaptionProfileIsNotSelected(t *t
 	if err := manager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-01"}); err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
+	server := httptest.NewServer(legacyNewServer("worker", manager, TokenVerifier{IngestTokenSigningKey: signingKey}))
 	defer server.Close()
 
 	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", signedCaptionAudioAuthorization(t, signingKey, "stream-01"), validCaptionAudioBody())
@@ -310,7 +310,7 @@ func TestCaptionAudioEndpointReturnsConflictWhenCaptionProfileIsNotSelected(t *t
 }
 
 func TestCaptionAudioEndpointRejectsGenericServiceToken(t *testing.T) {
-	server := httptest.NewServer(NewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "service-token", IngestTokenSigningKey: "caption-signing-key"}))
+	server := httptest.NewServer(legacyNewServer("worker", jobs.NewManager(encoder.NoopPublisher{}, observability.Client{}), TokenVerifier{PlainToken: "service-token", IngestTokenSigningKey: "caption-signing-key"}))
 	defer server.Close()
 
 	res := postJSON(t, server.URL+"/streams/stream-01/audio/opus", "Bearer service-token", validCaptionAudioBody())

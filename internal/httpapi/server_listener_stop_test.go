@@ -26,7 +26,7 @@ func TestUpdaterVersionEndpointIsUnauthenticatedAndReturnsIdentityBoundProbe(t *
 	writeNodeConfigForVerifierTestWithIdentity(t, configPath, control.ServiceType, "worker-probe-01", 7)
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
 
-	server := httptest.NewServer(NewServer(control.ServiceType, nil, TokenVerifier{PlainToken: "expected"}))
+	server := httptest.NewServer(legacyNewServer(control.ServiceType, nil, TokenVerifier{PlainToken: "expected"}))
 	defer server.Close()
 
 	res, err := http.Get(server.URL + "/updater/version")
@@ -77,7 +77,7 @@ func TestStatusEndpointUsesAuthoritativeNodeConfigServiceID(t *testing.T) {
 	writeNodeConfigForVerifierTestWithIdentity(t, configPath, control.ServiceType, "worker-status-01", 7)
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
 
-	server := httptest.NewServer(NewServer(control.ServiceType, nil, TokenVerifier{}))
+	server := httptest.NewServer(legacyNewServer(control.ServiceType, nil, TokenVerifier{}))
 	defer server.Close()
 	res, err := http.Get(server.URL + "/status")
 	if err != nil {
@@ -104,7 +104,7 @@ func TestStopJobKeepsStoppedTargetIdempotentWithoutStoppingSuccessor(t *testing.
 	if err := manager.Stop(t.Context(), "stream-a"); err != nil {
 		t.Fatal(err)
 	}
-	handler := NewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
+	handler := legacyNewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
 	stop := func(streamID string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, "/jobs/"+streamID+"/stop", nil)
@@ -157,7 +157,7 @@ func TestStopJobKeepsStoppedTargetIdempotentAfterWorkerRestart(t *testing.T) {
 	if err := restartedManager.Start(t.Context(), jobs.StreamContext{StreamID: "stream-b"}); err != nil {
 		t.Fatal(err)
 	}
-	handler := NewServer("worker", restartedManager, TokenVerifier{PlainToken: "service-token"})
+	handler := legacyNewServer("worker", restartedManager, TokenVerifier{PlainToken: "service-token"})
 	stop := func(streamID string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, "/jobs/"+streamID+"/stop", nil)
@@ -191,7 +191,7 @@ func TestStopJobReturnsSafeReceiptPersistenceFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := NewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
+	handler := legacyNewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
 	req := httptest.NewRequest(http.MethodPost, "/jobs/stream-a/stop", nil)
 	req.Header.Set("Authorization", "Bearer service-token")
 	res := httptest.NewRecorder()

@@ -24,7 +24,7 @@ func TestUpdaterVersionPendingThenBindsAuthoritativeIdentityAndRejectsDrift(t *t
 	t.Setenv("CREDENTIALS_DIRECTORY", credentialDir)
 
 	latch := NewUpdaterIdentityLatch(control.ServiceType)
-	handler := NewServerWithRuntimeConfigAndUpdaterIdentity(control.ServiceType, nil, TokenVerifier{}, nil, latch)
+	handler := legacyNewServerWithRuntimeConfigAndUpdaterIdentity(control.ServiceType, nil, TokenVerifier{}, nil, latch)
 	assertUpdaterIdentityStatus(t, handler, http.StatusServiceUnavailable, "")
 
 	writeUpdaterIdentityNodeConfig(t, configPath, credentialPath, "worker-authoritative", control.ServiceType, 13)

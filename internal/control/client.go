@@ -193,6 +193,7 @@ func isLocalDevHost(host string) bool {
 
 func serviceCapabilities(runtimeCapabilities RuntimeCapabilities) map[string]any {
 	capabilities := map[string]any{
+		"manual_auto_start_hold_v1":     true,
 		"overlay_events":                true,
 		"caption_events":                true,
 		"caption_audio_ingest":          true,

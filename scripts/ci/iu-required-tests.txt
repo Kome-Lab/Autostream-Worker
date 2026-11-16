@@ -1,0 +1,8 @@
+# Reviewed WS3 Worker actual Caption writer and late-callback roots.
+github.com/example/autostream-worker/internal/jobs TestIUWS3WorkerActualCaptionWriter
+github.com/example/autostream-worker/internal/jobs TestIUWS3WorkerCutRejectsLateCallback
+github.com/example/autostream-worker/internal/jobs TestIUWS3WorkerBusyBorrowNotQueueEmpty
+github.com/example/autostream-worker/internal/jobs TestIUWS3WorkerGenerationAndScope
+github.com/example/autostream-worker/internal/jobs TestIUWS3WorkerWitnessUnknownRemainsHeld
+github.com/example/autostream-worker/internal/jobs TestIUWS3WorkerUnsupportedWritersRefused
+github.com/example/autostream-worker/internal/jobs TestIUWS3WorkerProviderACKLossNoRetry

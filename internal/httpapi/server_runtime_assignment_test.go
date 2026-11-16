@@ -24,7 +24,7 @@ func TestJobStartFailsClosedWhenCaptionSecretResolutionFails(t *testing.T) {
 		return control.RuntimeSecret{}, errors.New("resolve failed with dg-secret-must-not-leak")
 	}), nil)
 	runtimeConfig := captionRuntimeConfigForHTTP()
-	server := httptest.NewServer(NewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "service-token"}, func(context.Context) (control.RuntimeConfig, error) {
+	server := httptest.NewServer(legacyNewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "service-token"}, func(context.Context) (control.RuntimeConfig, error) {
 		return runtimeConfig, nil
 	}))
 	defer server.Close()
@@ -65,7 +65,7 @@ func TestCaptionRuntimeSettingsRefreshesConfigAndReplacesRunningSession(t *testi
 	updatedConfig := captionRuntimeConfigForHTTP()
 	updatedConfig.Profiles["caption"][0].Config["language"] = "en"
 	providerCalls := 0
-	server := httptest.NewServer(NewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "service-token"}, func(context.Context) (control.RuntimeConfig, error) {
+	server := httptest.NewServer(legacyNewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "service-token"}, func(context.Context) (control.RuntimeConfig, error) {
 		providerCalls++
 		return updatedConfig, nil
 	}))
@@ -95,7 +95,7 @@ func TestCaptionRuntimeSettingsRefreshesConfigAndReplacesRunningSession(t *testi
 
 func TestCaptionRuntimeSettingsKeepsSessionWhenRuntimeConfigRefreshFails(t *testing.T) {
 	manager, session := captionReadyManager(t)
-	server := httptest.NewServer(NewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "service-token"}, func(context.Context) (control.RuntimeConfig, error) {
+	server := httptest.NewServer(legacyNewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "service-token"}, func(context.Context) (control.RuntimeConfig, error) {
 		return control.RuntimeConfig{}, errors.New("upstream detail with secret-token")
 	}))
 	defer server.Close()
@@ -131,7 +131,7 @@ func TestStartRejectsUnassignedStreamWhenRuntimePolicyIsEnforced(t *testing.T) {
 		Enforce:        true,
 		PrimaryStreams: map[string]bool{"stream-01": true},
 	})
-	server := httptest.NewServer(NewServer("worker", manager, TokenVerifier{PlainToken: "expected"}))
+	server := httptest.NewServer(legacyNewServer("worker", manager, TokenVerifier{PlainToken: "expected"}))
 	defer server.Close()
 
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", strings.NewReader(`{"stream_id":"stream-02","stream_name":"Wrong"}`))
@@ -166,7 +166,7 @@ func TestStartRefreshesRuntimeConfigBeforeAssignmentCheck(t *testing.T) {
 			},
 		}, nil
 	}
-	server := httptest.NewServer(NewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "expected"}, provider))
+	server := httptest.NewServer(legacyNewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "expected"}, provider))
 	defer server.Close()
 
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", strings.NewReader(`{"stream_id":"stream-02","stream_name":"Fresh"}`))
@@ -200,7 +200,7 @@ func TestStartFailsClosedWhenRuntimeConfigRefreshFails(t *testing.T) {
 	provider := func(context.Context) (control.RuntimeConfig, error) {
 		return control.RuntimeConfig{}, errors.New("upstream unavailable with token secret-token")
 	}
-	server := httptest.NewServer(NewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "expected"}, provider))
+	server := httptest.NewServer(legacyNewServerWithRuntimeConfig("worker", manager, TokenVerifier{PlainToken: "expected"}, provider))
 	defer server.Close()
 
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/jobs/start", strings.NewReader(`{"stream_id":"stream-01","stream_name":"Should not start"}`))

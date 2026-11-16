@@ -13,7 +13,7 @@ import (
 
 func TestStartJobDecodesOptionalReadySceneAppearanceAndRejectsURLFields(t *testing.T) {
 	manager := jobs.NewManager(nil, observability.Client{})
-	handler := NewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
+	handler := legacyNewServer("worker", manager, TokenVerifier{PlainToken: "service-token"})
 	valid := `{
 		"stream_id":"stream-01",
 		"scene_appearance":{
